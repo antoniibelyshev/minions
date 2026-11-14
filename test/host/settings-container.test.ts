@@ -4,6 +4,7 @@
 // `settings set` alone only records the value (the running container keeps its limits until the upgrade).
 import { readFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
@@ -17,14 +18,14 @@ vi.mock('../../src/plugin/generate.js', async () => {
   };
 });
 
-const { runInit, refreshForUpgrade, syncContainerLimits } = await import('../../src/host/install.js');
+const { refreshForUpgrade, syncContainerLimits } = await import('../../src/host/install.js');
 const { projectPaths } = await import('../../src/core/paths.js');
 const { loadEffectiveConfig, loadProjectJson } = await import('../../src/host/project.js');
 const { Compose } = await import('../../src/host/docker.js');
 const { runUpgrade } = await import('../../src/host/upgrade.js');
 const S = await import('../../src/host/settings.js');
 const SC = await import('../../src/host/settings-cli.js');
-const { makeRepo, tempDir, withHome, dockerUp } = await import('./fixtures.js');
+const { initFromTemplate, tempDir, withHome } = await import('./fixtures.js');
 type ProjectJson = import('../../src/host/project.js').ProjectJson;
 type RunResult = import('../../src/core/exec.js').RunResult;
 
@@ -37,8 +38,7 @@ afterEach(() => {
 });
 
 async function install(): Promise<ProjectJson> {
-  const r = await runInit({ path: makeRepo(env.root), yes: true, visibility: 'private', dockerProbe: dockerUp });
-  return loadProjectJson(r.plan.projectId);
+  return loadProjectJson((await initFromTemplate(env.root)).projectId);
 }
 
 const idleRuntime: import('../../src/host/settings-cli.js').SettingsRuntime = {

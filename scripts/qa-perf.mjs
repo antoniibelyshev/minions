@@ -53,15 +53,15 @@ try {
   const helper = join(root, 'helper.mjs');
   await build({
     stdin: {
-      contents: `export { profileDefaults } from './src/config/profiles.ts'; export { writeBacklogConfig } from './src/backlog/factory.ts';`,
+      contents: `export { modeDefaults } from './src/config/modes.ts'; export { writeBacklogConfig } from './src/backlog/factory.ts';`,
       resolveDir: repo, loader: 'ts',
     },
     bundle: true, platform: 'node', format: 'esm', outfile: helper, external: ['node:*'], logLevel: 'error',
     define: { __MINIONS_VERSION__: '"0.0.0"' },
   });
-  const { profileDefaults, writeBacklogConfig } = await import(helper);
-  const ctx = { hasGitHub: false, baseBranch: 'main', identity: { name: 'QA', email: 'qa@example.com' }, projectId: '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f', packageVersion: '0.1.0' };
-  writeFileSync(config, JSON.stringify(profileDefaults('project-owner', ctx).config));
+  const { modeDefaults, writeBacklogConfig } = await import(helper);
+  const ctx = { baseBranch: 'main', identity: { name: 'QA', email: 'qa@example.com' }, projectId: '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f', packageVersion: '0.1.0' };
+  writeFileSync(config, JSON.stringify(modeDefaults('independent', ctx)));
   mkdirSync(state, { recursive: true });
   await writeBacklogConfig(join(state, 'backlog'));
   mkdirSync(join(workspace, 'worktrees'), { recursive: true });

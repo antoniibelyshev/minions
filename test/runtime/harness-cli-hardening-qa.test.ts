@@ -16,7 +16,7 @@ const CODEX = { models: { default: 'gpt-6.1-sol', allowed: ['gpt-6.1-sol', 'gpt-
 const PILOT = { description: 'Second-opinion review on Codex.', promptText: 'Review the head.', contract: 'gate', harness: 'codex' };
 const gate = (over: Record<string, unknown> = {}) => ({ description: 'A gate.', promptText: 'Judge.', contract: 'gate', ...over });
 const pilotConfig = (over: Record<string, unknown> = {}) => ({
-  ...defaults('project-owner'),
+  ...defaults('independent'),
   harnesses: { codex: CODEX, network: { tcpConnectPorts: [443] } },
   roles: { 'codex-reviewer': PILOT },
   workflows: { pilot: ['engineer', 'codex-reviewer'] },
@@ -102,26 +102,26 @@ describe.runIf(onPath)('task-14.11 through the CLI', () => {
   });
 
   it('harnesses.default codex moves an existing gate: work next succeeds for a read-only gate and lists a warning (json), none for Claude-only', async () => {
-    writeConfig({ ...defaults('project-owner'), harnesses: { default: 'codex', codex: CODEX, network: { tcpConnectPorts: [443] } }, roles: { judge: gate() } });
+    writeConfig({ ...defaults('independent'), harnesses: { default: 'codex', codex: CODEX, network: { tcpConnectPorts: [443] } }, roles: { judge: gate() } });
     const r = await cli(['work', 'next']);
     expect(r.code, r.out).toBe(0);
     const d = body(r.out).data as { warnings?: string[] };
     expect(d.warnings?.some((w) => /harnesses\.default moves the gate role judge/.test(w)), r.out).toBe(true);
-    writeConfig({ ...defaults('project-owner'), roles: { judge: gate() } });
+    writeConfig({ ...defaults('independent'), roles: { judge: gate() } });
     const c = await cli(['work', 'next']);
     expect(c.code, c.out).toBe(0);
     expect(body(c.out).data).not.toHaveProperty('warnings');
   });
 
   it('harnesses.default codex with a writable existing gate is refused naming harnesses.default', async () => {
-    writeConfig({ ...defaults('project-owner'), harnesses: { default: 'codex', codex: CODEX, network: { tcpConnectPorts: [443] } }, roles: { judge: gate({ worktree: 'branch', edits: 'any' }) } });
+    writeConfig({ ...defaults('independent'), harnesses: { default: 'codex', codex: CODEX, network: { tcpConnectPorts: [443] } }, roles: { judge: gate({ worktree: 'branch', edits: 'any' }) } });
     const r = await cli(['work', 'next']);
     expect(r.code, r.out).toBe(2);
     expect(body(r.out).error?.message).toMatch(/harnesses\.default puts the gate role judge on harness codex/);
   });
 
   it('a process role without its harnesses.<id> block cannot reach work next through a real config (refused up front, never a throw from suggestModel)', async () => {
-    writeConfig({ ...defaults('project-owner'), roles: { judge: gate({ harness: 'codex' }) }, workflows: { pilot: ['engineer', 'judge'] } });
+    writeConfig({ ...defaults('independent'), roles: { judge: gate({ harness: 'codex' }) }, workflows: { pilot: ['engineer', 'judge'] } });
     const r = await cli(['work', 'next']);
     expect(r.code, r.out).toBe(2);
     expect(body(r.out).error?.code).toBe('INVALID_CONFIG');

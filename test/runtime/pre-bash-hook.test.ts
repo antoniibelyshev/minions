@@ -2,8 +2,8 @@
 // `minions work run|claim|release` when agent_id is set; the coordinator is allowed; the hook fails closed.
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { coordinatorOnlyWorkCommand, preBashHook, PRE_BASH_HOOK_COMMAND, runHook } from '../../src/runtime/hooks.js';
-import { FAKE_MINIONS, runHookCommand } from '../helpers.js';
+import { coordinatorOnlyWorkCommand, preBashHook, preFileHook, PRE_BASH_HOOK_COMMAND, PRE_FILE_READ_HOOK_COMMAND, runHook } from '../../src/runtime/hooks.js';
+import { stateGuard } from '../../src/runtime/state-guard.js';
 import { scanShell } from '../../src/runtime/shell-scan.js';
 
 const template = JSON.parse(readFileSync(new URL('../../templates/plugin/hooks/hooks.json', import.meta.url), 'utf8')) as {
@@ -18,6 +18,7 @@ describe('coordinatorOnlyWorkCommand', () => {
     'minions work run lease-1',
     'minions work claim task-1 --json',
     'minions work release lease-1 --reason x',
+    'minions work integrate --json',
     'cd /x && minions --json work claim task-1',
     '/usr/local/bin/minions work run lease-1',
     'ls; minions work release lease-1',
@@ -28,7 +29,7 @@ describe('coordinatorOnlyWorkCommand', () => {
     'MINIONS_X=1 minions work run x',
     'true || minions work run x &',
   ])('matches %s', (cmd) => {
-    expect(coordinatorOnlyWorkCommand(cmd)).toMatch(/^minions work (run|claim|release)$/);
+    expect(coordinatorOnlyWorkCommand(cmd)).toMatch(/^minions work (run|claim|release|integrate)$/);
   });
 
   it.each([
@@ -80,53 +81,10 @@ describe('preBashHook', () => {
 describe('the plugin hooks.json Bash entry', () => {
   const entry = template.hooks.PreToolUse.find((h) => h.matcher === 'Bash')!;
   const command = entry.hooks[0]!.command;
-  const subCall = JSON.stringify(bash('minions work claim task-1', sub));
 
   it('is the documented command, with an entry timeout above the wrapper timeout', () => {
     expect(command).toBe(PRE_BASH_HOOK_COMMAND);
     expect(entry.hooks[0]!.timeout).toBeGreaterThan(20);
-  });
-
-  it('a subagent call naming minions blocks (exit 2) when minions is missing, crashes, is killed or fails after an allow', () => {
-    expect(runHookCommand(command, null, subCall).status).toBe(2);
-    expect(runHookCommand(command, FAKE_MINIONS.crash, subCall).status).toBe(2);
-    expect(runHookCommand(command, FAKE_MINIONS.killed, subCall).status).toBe(2);
-    expect(runHookCommand(command, FAKE_MINIONS.noNode, subCall).status).toBe(2);
-    expect(runHookCommand(command, FAKE_MINIONS.allowThenFail, subCall).status).toBe(2);
-    const denied = runHookCommand(command, FAKE_MINIONS.deny, subCall);
-    expect(denied.status).toBe(0);
-    expect(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
-  });
-
-  it('a hang is killed by the wrapper and blocks', () => {
-    const fast = command.replace('timeout 20 ', 'timeout 1 ');
-    expect(fast).not.toBe(command);
-    expect(runHookCommand(fast, '#!/bin/sh\nsleep 30\n', subCall).status).toBe(2);
-  });
-
-  it('node never starts for the coordinator\'s calls or for subagent calls that do not mention minions', () => {
-    // A missing binary would exit 2 if the wrapper ran it.
-    expect(runHookCommand(command, null, JSON.stringify(bash('minions work claim task-1')))).toMatchObject({ status: 0, stdout: '' });
-    expect(runHookCommand(command, null, JSON.stringify(bash('npm test', sub)))).toMatchObject({ status: 0, stdout: '' });
-    // The worker's own agent_type (minions:<role>) and a "minions:" label alone do not start it either.
-    expect(runHookCommand(command, null, JSON.stringify(bash('gh issue list --label minions:authorized', sub)))).toMatchObject({ status: 0, stdout: '' });
-  });
-
-  it('a subagent call naming the entry script (cli.js) reaches minions too', () => {
-    const direct = JSON.stringify(bash('node ./dist/cli.js work release lease-1', sub));
-    expect(runHookCommand(command, null, direct).status).toBe(2);
-    expect(JSON.parse(runHookCommand(command, FAKE_MINIONS.deny, direct).stdout).hookSpecificOutput.permissionDecision).toBe('deny');
-    expect(runHookCommand(command, null, JSON.stringify(bash('node ./dist/clixjs', sub)))).toMatchObject({ status: 0, stdout: '' });
-  });
-
-  it('a grep failure (missing or broken) blocks rather than skipping the check', () => {
-    const noGrep = command.replace("grep -Eq", '/nonexistent/grep -Eq');
-    expect(runHookCommand(noGrep, FAKE_MINIONS.allow, JSON.stringify(bash('npm test', sub))).status).toBe(2);
-  });
-
-  it('passes the hook input to minions unchanged', () => {
-    const echo = '#!/bin/sh\ncat >&2\nexit 0\n';
-    expect(runHookCommand(command, echo, subCall).stderr).toBe(subCall);
   });
 });
 
@@ -385,5 +343,44 @@ describe('coordinatorOnlyWorkCommand: arithmetic, heredocs and pipes (task-14.13
     'echo $(( 1 < 2 )) ; cat <<EOF\nok\nEOF',
   ])('allows %j', (cmd) => {
     expect(coordinatorOnlyWorkCommand(cmd)).toBeNull();
+  });
+});
+
+// Task-96: the live Claude run carries the runtime's Claude credential, so it is coordinator-only, and the mounted
+// secrets dir is protected from worker tool calls like the state dir.
+describe('coordinator live-run and the secrets dir (task-96)', () => {
+  const guard = stateGuard({ state: '/state', tmp: '/home/node/.cache/tmp', secretsDir: '/opt/minions/secrets' });
+  const read = (file_path: string) => ({ hook_event_name: 'PreToolUse', tool_name: 'Read', tool_input: { file_path }, cwd: '/workspace/worktrees/t', ...sub });
+
+  it.each(['minions coordinator live-run -- -p', 'minions --json coordinator live-run --dry-run', 'cd /x && minions coordinator --keep-dir live-run'])('denies %j to a worker', (cmd) => {
+    expect(coordinatorOnlyWorkCommand(cmd)).toBe('minions coordinator live-run');
+    expect(decision(preBashHook(bash(cmd, sub), guard))?.permissionDecision).toBe('deny');
+  });
+
+  // Session verbs that move messages between sessions (handover, send) are coordinator-only too.
+  it.each([
+    ['minions coordinator handover thread:1 --json', 'handover'],
+    ['minions --json coordinator handover thread:1', 'handover'],
+    ['minions coordinator send general --json', 'send'],
+    ["cd /x && minions coordinator send task:task-1 <<'MSG'\nhi\nMSG", 'send'],
+    ['minions coordinator send general --json', 'send'],
+  ])('denies %j to a worker', (cmd, verb) => {
+    expect(coordinatorOnlyWorkCommand(cmd)).toBe(`minions coordinator ${verb}`);
+    expect(decision(preBashHook(bash(cmd, sub), guard))?.permissionDecision).toBe('deny');
+    expect(preBashHook(bash(cmd, {}), guard)).toEqual({ reason: 'allow: Bash from the coordinator' });
+  });
+
+  it('allows the coordinator and other coordinator subcommands', () => {
+    expect(preBashHook(bash('minions coordinator live-run -- -p', {}), guard)).toEqual({ reason: 'allow: Bash from the coordinator' });
+    expect(coordinatorOnlyWorkCommand('minions coordinator status')).toBeNull();
+  });
+
+  it('denies a worker reading the headless token, by Bash or the Read tool; the hook filters forward such calls', () => {
+    expect(decision(preBashHook(bash('cat /opt/minions/secrets/claude-headless-token', sub), guard))?.permissionDecision).toBe('deny');
+    expect(decision(preFileHook(read('/opt/minions/secrets/claude-headless-token'), guard))?.permissionDecision).toBe('deny');
+    expect(decision(preFileHook(read('/workspace/worktrees/t/src/a.ts'), guard))).toBeNull();
+    expect(PRE_BASH_HOOK_COMMAND).toContain('/secrets');
+    expect(PRE_FILE_READ_HOOK_COMMAND).toContain('/secrets');
+    expect(stateGuard().roots.some((r) => r.endsWith('/secrets'))).toBe(true); // the default guard (runtimePaths) protects it
   });
 });

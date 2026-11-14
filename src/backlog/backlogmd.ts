@@ -1,7 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
-import { run } from '../core/exec.js';
+import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { exists, sha256 } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
 import { AUTHORIZED_LABEL, cycleIfAdded, filterReady } from './ready.js';
@@ -14,7 +14,7 @@ export interface BacklogMdOptions {
   /** CLI binary. Default: env MINIONS_BACKLOG_BIN, else `backlog` on PATH. */
   bin?: string;
   idempotency: IdempotencyStore;
-  /** Profile allows starting ready tasks without the minions:authorized label. */
+  /** The config allows starting ready tasks without the minions:authorized label (intake.startReady). */
   startReady?: boolean;
   timeoutMs?: number;
   /** Max concurrent `task view` calls in listings (only for tasks the file reader falls back on). */
@@ -31,16 +31,16 @@ export interface BacklogMdOptions {
    * a failed probe, lists through `task view`.
    */
   cliVersion?: string | null;
-  /** Provenance of a task whose meta block is missing, malformed or has no valid provenance (see toTask). */
-  provenanceFallback?: ProvenanceFallback;
+  /**
+   * Runs one Backlog.md CLI call (default: core/exec `run`, a real subprocess). Unit tests inject an in-process
+   * fake CLI so the adapter's argument mapping, error mapping and listing paths run without spawning (task-137.2.3).
+   */
+  exec?: BacklogExec;
 }
 
-/**
- * Provenance for a task without a usable meta provenance; undefined keeps DEFAULT_PROVENANCE. The runtime
- * maps tasks that GitHub intake tracks to `external-requirement`, so a lost meta block never upgrades an
- * imported issue to the most trusted value.
- */
-export type ProvenanceFallback = (taskId: string) => Provenance | undefined;
+/** Same contract as core/exec `run` with `allowFailure: true`: resolves with the exit code, never rejects on failure. */
+export type BacklogExec = (cmd: string, args: string[], opts: RunOptions) => Promise<RunResult>;
+
 
 export const TASK_STATUSES: readonly TaskStatus[] = ['idea', 'ready', 'implementing', 'testing', 'reviewing',
   'changes-requested', 'awaiting-human', 'awaiting-ci', 'merging', 'done', 'delivered', 'blocked', 'cancelled'];
@@ -51,7 +51,7 @@ const DEFAULT_PROVENANCE: Provenance = 'user-decision';
 
 export interface MinionsMeta {
   provenance?: Provenance; branch?: string | null; externalLinks?: string[];
-  commits?: string[]; prUrl?: string | null; workflow?: string; [k: string]: unknown;
+  commits?: string[]; workflow?: string; [k: string]: unknown;
 }
 
 const META_OPEN = '<!-- minions:meta ';
@@ -163,20 +163,28 @@ function mapPriority(p: string | null | undefined): Task['priority'] {
   return v === 'high' || v === 'medium' || v === 'low' ? v : null;
 }
 
-export function toTask(raw: RawTask, opts: { startReady?: boolean; provenanceFallback?: ProvenanceFallback } = {}): Task {
+/** Upper bound (characters) of `Task.notes`; older notes beyond it are cut with a marker. */
+export const NOTES_MAX_CHARS = 8000;
+
+/**
+ * Keeps the most recent `max` characters of the notes (Backlog.md appends each note at the end, separated by a
+ * blank line, so the tail is the newest). The cut moves forward to a line start when one is close, and a
+ * marker line says how much was left out. Empty or missing notes are null.
+ */
+export function boundNotes(text: unknown, max = NOTES_MAX_CHARS): string | null {
+  if (typeof text !== 'string' || !text.trim()) return null;
+  const t = text.trim();
+  if (t.length <= max) return t;
+  let start = t.length - max;
+  const nl = t.indexOf('\n', start);
+  if (nl !== -1 && nl - start < 200) start = nl + 1;
+  return `[... ${start} earlier characters of notes omitted ...]\n${t.slice(start)}`;
+}
+
+export function toTask(raw: RawTask, opts: { startReady?: boolean; notes?: boolean } = {}): Task {
   const { user, meta } = parseDescription(raw.description);
   const id = normalizeId(raw.id);
-  let provenance: Provenance;
-  if (PROVENANCES.includes(meta.provenance as Provenance)) {
-    provenance = meta.provenance as Provenance;
-  } else {
-    try {
-      provenance = opts.provenanceFallback?.(id) ?? DEFAULT_PROVENANCE;
-    } catch {
-      // If the fallback throws, use the default provenance
-      provenance = DEFAULT_PROVENANCE;
-    }
-  }
+  const provenance: Provenance = PROVENANCES.includes(meta.provenance as Provenance) ? meta.provenance as Provenance : DEFAULT_PROVENANCE;
   const labels = raw.labels ?? [];
   const strArr = (v: unknown) => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
   return {
@@ -194,11 +202,11 @@ export function toTask(raw: RawTask, opts: { startReady?: boolean; provenanceFal
     authorized: labels.includes(AUTHORIZED_LABEL) || !!opts.startReady,
     branch: typeof meta.branch === 'string' ? meta.branch : null,
     commits: strArr(meta.commits),
-    prUrl: typeof meta.prUrl === 'string' ? meta.prUrl : null,
     provenance,
     version: taskVersion(raw),
     milestone: raw.milestone ?? null,
     ...(typeof meta.workflow === 'string' && meta.workflow ? { workflow: meta.workflow } : {}),
+    ...(opts.notes ? { notes: boundNotes(raw.implementationNotes) } : {}),
   };
 }
 
@@ -213,8 +221,8 @@ export class BacklogMdAdapter implements BacklogAdapter {
   private readonly startReady: boolean;
   private readonly timeoutMs: number;
   private readonly concurrency: number;
-  private readonly provenanceFallback?: ProvenanceFallback;
   private readonly readFiles: boolean;
+  private readonly exec: BacklogExec;
   private initialized = false;
   /** Cached `backlog --version` (trimmed; null when the probe failed), asked at most once per instance. */
   private version?: Promise<string | null>;
@@ -228,8 +236,8 @@ export class BacklogMdAdapter implements BacklogAdapter {
     this.startReady = !!opts.startReady;
     this.timeoutMs = opts.timeoutMs ?? 30_000;
     this.concurrency = Math.max(1, opts.concurrency ?? 4);
-    this.provenanceFallback = opts.provenanceFallback;
     this.readFiles = opts.readFiles ?? true;
+    this.exec = opts.exec ?? run;
     if (opts.cliVersion !== undefined) this.version = Promise.resolve(opts.cliVersion);
   }
 
@@ -253,7 +261,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
       this.initialized = true;
     }
     this.spawnCount++;
-    const r = await run(this.bin, args, {
+    const r = await this.exec(this.bin, args, {
       cwd: this.root, allowFailure: true, timeoutMs: this.timeoutMs,
       env: { ...process.env, BACKLOG_CWD: this.root, NO_COLOR: '1', FORCE_COLOR: '0' },
     });
@@ -322,7 +330,7 @@ export class BacklogMdAdapter implements BacklogAdapter {
     return out;
   }
 
-  private task(raw: RawTask): Task { return toTask(raw, { startReady: this.startReady, provenanceFallback: this.provenanceFallback }); }
+  private task(raw: RawTask, notes = false): Task { return toTask(raw, { startReady: this.startReady, notes }); }
 
   /** Views ids with bounded concurrency; failed lookups are undefined when tolerant. */
   private async viewMany(ids: string[], tolerant: boolean): Promise<(RawTask | undefined)[]> {
@@ -350,18 +358,19 @@ export class BacklogMdAdapter implements BacklogAdapter {
     return raws.map((r) => this.task(r!));
   }
 
-  async listReady(limit: number, leasedIds: Set<string>, scope: ScopeFilter): Promise<Task[]> {
+  async listReady(limit: number, leasedIds: Set<string>, scope: ScopeFilter, completed?: ReadonlySet<TaskStatus>): Promise<Task[]> {
     if (limit <= 0) return [];
     const list = await this.listRaw();
     const summary = new Map(list.map((t) => [normalizeId(t.id), this.task(t)]));
     // Only candidates need full details (dependencies); dependency status comes from the list.
     const candidates = list.filter((t) => mapStatus(t.status) === 'ready');
     const viewed = (await this.details(candidates, true)).filter((r): r is RawTask => !!r).map((r) => this.task(r));
-    return filterReady(viewed, { leased: new Set([...leasedIds].map(normalizeId)), scope, lookup: (id) => summary.get(id) }, limit);
+    return filterReady(viewed, { leased: new Set([...leasedIds].map(normalizeId)), scope, lookup: (id) => summary.get(id), ...(completed ? { completed } : {}) }, limit);
   }
 
+  /** One task, with its bounded notes (listings leave notes out). */
   async getTask(id: string): Promise<Task> {
-    return this.task(await this.viewRaw(id));
+    return this.task(await this.viewRaw(id), true);
   }
 
   async createTask(input: CreateTaskInput): Promise<{ task: Task; created: boolean }> {
@@ -425,13 +434,11 @@ export class BacklogMdAdapter implements BacklogAdapter {
     }
     const descChanged = patch.description !== undefined && patch.description.trim() !== cur.description;
     const branchChanged = 'branch' in patch && patch.branch !== undefined && patch.branch !== cur.branch;
-    const prUrlChanged = 'prUrl' in patch && patch.prUrl !== undefined && patch.prUrl !== cur.prUrl;
     const workflowChanged = patch.workflow !== undefined && (patch.workflow ?? undefined) !== cur.workflow;
-    if (descChanged || branchChanged || prUrlChanged || workflowChanged) {
+    if (descChanged || branchChanged || workflowChanged) {
       const parsed = parseDescription(raw.description);
       const meta: MinionsMeta = { provenance: cur.provenance, ...parsed.meta };
       if (branchChanged) meta.branch = patch.branch ?? null;
-      if (prUrlChanged) meta.prUrl = patch.prUrl ?? null;
       if (workflowChanged) { if (patch.workflow) meta.workflow = patch.workflow; else delete meta.workflow; }
       const desc = descChanged ? composeDescription(patch.description!, meta) : replaceMeta(raw.description ?? '', meta);
       args.push(`--description=${desc}`);

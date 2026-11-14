@@ -19,7 +19,7 @@ const CODEX = { models: { default: 'gpt-6.1-sol', allowed: ['gpt-6.1-sol', 'gpt-
 const PILOT = { description: 'Second-opinion review on Codex.', promptText: 'Review the head.', contract: 'gate', harness: 'codex' };
 const gate = (over: Record<string, unknown> = {}) => ({ description: 'A gate.', promptText: 'Judge.', contract: 'gate', ...over });
 const pilotConfig = (over: Record<string, unknown> = {}) => ({
-  ...defaults('project-owner'),
+  ...defaults('independent'),
   harnesses: { codex: CODEX, network: { tcpConnectPorts: [443] } },
   roles: { 'codex-reviewer': PILOT },
   workflows: { pilot: ['engineer', 'codex-reviewer'] },
@@ -120,7 +120,7 @@ describe.runIf(onPath)('work next / claim through the CLI with a real config fil
     expect(e.code, e.out).toBe(0);
     const eng = body(e.out).data as { leaseId: string; worktree: string; branch: string; harness: string; allowedModels: string[] };
     expect(eng.harness).toBe('claude');
-    expect(eng.allowedModels).toEqual(defaults('project-owner').models.allowed);
+    expect(eng.allowedModels).toEqual(defaults('independent').models.allowed);
     const head = commitFile(eng.worktree, 'a.txt', 'pilot');
     const resultFile = join(state, 'eng-result.json');
     writeFileSync(resultFile, JSON.stringify({

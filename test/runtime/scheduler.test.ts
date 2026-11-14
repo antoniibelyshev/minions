@@ -1,9 +1,11 @@
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { MinionsError } from '../../src/core/errors.js';
 import type { TaskBrief } from '../../src/runtime/scheduler.js';
 import { commitFile, gitSync, makeEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const code = async (p: Promise<unknown>) => {
   try { await p; } catch (e) { return (e as MinionsError).code; }
@@ -211,21 +213,27 @@ describe('scheduler record', () => {
     await env.sched.record(b.leaseId, result({ branch: b.branch, headSha: head }), { correction: true });
     await testerPass(env, 'task-1');
 
-    // a new commit after testing: tester evidence for the old head no longer counts
-    const newHead = commitFile(b.worktree, 'late.txt', 'late change');
-    const rev = await env.sched.claim('task-1', 'reviewer');
-    const rr = await env.sched.record(rev.leaseId, result({ branch: rev.branch, headSha: newHead, verdict: 'approve' }));
-    expect(rr).toMatchObject({ valid: true, approved: false, to: 'testing' });
-    expect(rr.message).toMatch(/no passing tester evidence/);
-    expect(env.backlog.status('task-1')).toBe('testing');
-
     // reviewer whose branch moved during review is stale
-    await testerPass(env, 'task-1');
     const rev2 = await env.sched.claim('task-1', 'reviewer');
     const moved = commitFile(b.worktree, 'during.txt', 'x');
     const r2 = await env.sched.record(rev2.leaseId, result({ branch: rev2.branch, headSha: moved, verdict: 'approve' }));
     expect(r2.valid).toBe(false);
     expect(r2.errors!.join()).toMatch(/review started at/);
+  });
+
+  it('a complete engineer result needs passing typecheck + unit-tier evidence; the tester keeps its own rules (task-137.3)', async () => {
+    const env = makeEnv((c) => { c.verification.commands = ['npm run typecheck', 'npm test']; });
+    env.backlog.add({ id: 'task-1' });
+    const e = await env.sched.claim('task-1', 'engineer');
+    const head = commitFile(e.worktree, 'a.txt', 'work');
+    const missing = await env.sched.record(e.leaseId, result({ branch: e.branch, headSha: head, checks: [{ command: 'npm run typecheck', outcome: 'pass' }] }));
+    expect(missing).toMatchObject({ valid: false, correctionAllowed: true });
+    expect(missing.errors!.join()).toMatch(/needs a passing test run/);
+    const unit = [{ command: 'npm run typecheck', outcome: 'pass' }, { command: 'npm run test:unit', outcome: 'pass' }];
+    expect(await env.sched.record(e.leaseId, result({ branch: e.branch, headSha: head, checks: unit }), { correction: true })).toMatchObject({ valid: true, to: 'testing' });
+    // Verifiers and gates are not held to the engineer's evidence rule (a reviewer runs no tests).
+    const t = await env.sched.claim('task-1', 'tester');
+    expect(await env.sched.record(t.leaseId, result({ branch: t.branch, headSha: t.expectedHead, checks: [] }))).toMatchObject({ valid: true, to: 'reviewing' });
   });
 
   it('a tester may add commits but not rewrite the head it was given; complete with failing checks is invalid', async () => {

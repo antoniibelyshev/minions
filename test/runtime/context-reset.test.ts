@@ -5,7 +5,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { RunResult } from '../../src/core/exec.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { validateConfig } from '../../src/config/resolve.js';
@@ -23,6 +23,8 @@ import { runtimePaths } from '../../src/runtime/paths.js';
 import { runDir, runRecordPath, withOpenRuns } from '../../src/runtime/runner/record.js';
 import { defaults } from '../helpers.js';
 import { commitFile, makeDefaultEnv, result, tmp, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 /** The installed official Telegram plugin's server source (any cached version), or null when it is not installed. */
 const TELEGRAM_SERVER = ((): string | null => {
@@ -165,7 +167,7 @@ describe('settings (config defaults keep existing configs valid)', () => {
     const pm = validateConfig({ ...legacy, coordinator: { permissionMode: 'acceptEdits' } }, 'x');
     expect(pm.coordinator).toEqual({ permissionMode: 'acceptEdits' });
     expect(contextResetSettings(pm).enabled).toBe(true);
-    for (const p of ['personal-work', 'supervised'] as const) expect(contextResetSettings(defaults(p)).enabled).toBe(true);
+    for (const p of ['independent', 'supervised'] as const) expect(contextResetSettings(defaults(p)).enabled).toBe(true);
     expect(contextResetSettings(withReset({ enabled: false }))).toMatchObject({ enabled: false });
   });
 
@@ -542,5 +544,34 @@ describe('edge cases (tester, task-45)', () => {
     expect(existsSync(join(dir, 'l.log'))).toBe(false); // refused before anything was opened
     scheduleDetachedRestart(deps, { recover: true, force: true });
     expect(calls[0]).toEqual(['coordinator', 'restart', '--recover', '--force']);
+  });
+});
+
+describe('gateway launch and dispatcher hand-offs (runtime health)', () => {
+  it('records and releases of dispatcher leases are not the coordinator\'s hand-offs', () => {
+    const db = freshDb();
+    session(db);
+    addLease(db, 'lease-d1', 'task-1', 'completed');
+    db.exec("UPDATE leases SET holder = 'dispatcher' WHERE id = 'lease-d1'");
+    for (let i = 0; i < 12; i++) db.addEvent(i % 2 ? 'record' : 'release', 'task-1', { leaseId: 'lease-d1', status: 'completed', to: 'done' });
+    const c = contextResetCheck({ db, config: defaults(), session: null });
+    expect(c.session.handoffs).toBe(0);
+    expect(c.session.delivered).toEqual([]);
+    expect(c.due).toBe(false);
+    handoffs(db, 2);
+    expect(contextResetCheck({ db, config: defaults(), session: null }).session.handoffs).toBe(2);
+  });
+
+  it('status in a gateway launch reports that sessions reset themselves, not a main-session reset due', async () => {
+    const env: Env = makeDefaultEnv();
+    session(env.db);
+    handoffs(env.db, 51);
+    noteTranscript(env.db, { transcript_path: '/tmp/t-1.jsonl', session_id: 's1' }, new Date(Date.now() - 1000), { key: 'thread:1', kind: 'thread', taskId: null });
+    const single = await collectStatus({ db: env.db, config: env.config, backlog: async () => env.backlog });
+    expect(humanStatus(single)).toMatch(/context reset: due \(51\/10 hand-offs, context unknown\)/);
+    const gw = await collectStatus({ db: env.db, config: env.config, backlog: async () => env.backlog, gatewayLaunch: async () => true });
+    expect(gw.contextReset).toMatchObject({ due: false, managedBy: 'sessions', sessions: { tracked: 1, due: [] } });
+    expect(humanStatus(gw)).toMatch(/context reset: coordinator sessions reset themselves \(1 tracked, none due\)/);
+    expect(humanStatus(gw)).not.toMatch(/hand-offs/);
   });
 });

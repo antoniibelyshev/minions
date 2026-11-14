@@ -22,24 +22,14 @@ export const defaultsPath = () => join(hostRoot(), 'defaults.json');
 export const credentialStoreDir = () => join(hostRoot(), 'credentials');
 export const credentialStoreFile = (projectId: string, name: string) => join(credentialStoreDir(), projectId, name);
 export const projectDir = (projectId: string) => join(hostRoot(), 'projects', projectId);
-/** Host manager state (docs/design/host-manager.md): journal, lock, owner pairing. Host-only, never mounted. */
+/** Host-only, never mounted: the CLI backups `minions upgrade` keeps (src/host/cli-backup.ts). */
 export const managerDir = () => join(hostRoot(), 'manager');
-export function managerPaths() {
-  const dir = managerDir();
-  return {
-    dir,
-    /** Owner pairing of the manager bot (numeric user id and private chat id), 0600. */
-    accessJson: join(dir, 'access.json'),
-    /** Non-secret reference to the stored manager bot token (backend, locator, bot id), 0600. Never the token. */
-    credentialJson: join(dir, 'credential.json'),
-    /** The installed supervisor service (kind, unit file path, its sha256), 0600. Written by setup. */
-    serviceJson: join(dir, 'service.json'),
-    /** The running manager's heartbeat ({pid, start, transport, botId, lastPollAt}), 0600. */
-    stateJson: join(dir, 'state.json'),
-    /** stdout/stderr of the launchd agent (systemd uses the journal). */
-    logFile: join(dir, 'manager.log'),
-  };
-}
+
+/**
+ * File name of the headless Claude token in the secrets dir: a `claude setup-token` OAuth token (or an Anthropic API
+ * key) the owner stores with `minions auth set login --headless-token`, for headless runs in a fresh CLAUDE_CONFIG_DIR.
+ */
+export const CLAUDE_HEADLESS_TOKEN_FILE = 'claude-headless-token';
 
 export function projectPaths(projectId: string) {
   const dir = projectDir(projectId);
@@ -56,20 +46,19 @@ export function projectPaths(projectId: string) {
     /** Public half of the host-held approval signing key (read-only for agents; see src/host/approvals.ts). */
     approvalPublicKey: join(dir, 'runtime', 'approval-public-key.pem'),
     pluginDir: join(dir, 'plugin'),
-    /** Host-side plugin of the setup assistant (`minions setup assist`), regenerated on every launch. */
-    assistantPluginDir: join(dir, 'assistant-plugin'),
     exportsDir: join(dir, 'exports'),
     /** Host-only credential references (never mounted). */
     credentialsJson: join(dir, 'credentials.json'),
     /**
      * Host-provisioned secret files (dir 0700, files 0600), bind-mounted read-only as a directory at
-     * /opt/minions/secrets: the Claude key copy plus materialized GitHub/Telegram tokens and the Codex key.
+     * /opt/minions/secrets: the Claude key copy plus the materialized Telegram token and Codex key.
      */
     secretsDir: join(dir, 'secrets'),
     apiKeyFile: join(dir, 'secrets', 'anthropic-api-key'),
-    githubTokenFile: join(dir, 'secrets', 'github-token'),
     telegramTokenFile: join(dir, 'secrets', 'telegram-bot-token'),
     codexKeyFile: join(dir, 'secrets', 'codex-api-key'),
+    /** Headless Claude token (`claude setup-token`, login method) for `minions coordinator live-run`; materialized like the others. */
+    claudeHeadlessTokenFile: join(dir, 'secrets', CLAUDE_HEADLESS_TOKEN_FILE),
     /** Non-secret record of the last key refresh (time, redacted error). */
     authStateJson: join(dir, 'auth-state.json'),
     logsDir: join(dir, 'logs'),
@@ -102,10 +91,9 @@ export function hostRuntimePaths(projectId: string) {
     exports: join(root, 'transfer', 'exports'),
     /** Logs written by unsandboxed hook processes (MINIONS_LOG_DIR); outside the agent-writable dirs. */
     logs: join(root, 'logs'),
-    /** PATH shims: `minions` (pins the runtime environment) and the `gh` token wrapper. */
+    /** PATH shim: `minions` (pins the runtime environment). */
     bin: join(root, 'bin'),
     minionsShim: join(root, 'bin', 'minions'),
-    ghShim: join(root, 'bin', 'gh'),
     /**
      * Dedicated tmux server socket name (`tmux -L`), so the user's own tmux server is never touched.
      * tmux keeps it in its private per-user directory (/tmp/tmux-<uid>, 0700, ownership-checked);
@@ -131,12 +119,13 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
     coordinatorPrompt: p('/opt/minions/plugin/coordinator.md'),
     configDir: p('/opt/minions/config'),
     secretsDir: p('/opt/minions/secrets'),
-    githubTokenFile: p('/opt/minions/secrets/github-token'),
     telegramTokenFile: p('/opt/minions/secrets/telegram-bot-token'),
     /** OpenAI API key for Codex process workers; read only by the process runner (agent-runtimes D5). */
     codexKeyFile: p('/opt/minions/secrets/codex-api-key'),
     /** Host-provisioned Claude key (api-key/helper methods), read by the in-container apiKeyHelper. */
     apiKeyFile: p('/opt/minions/secrets/anthropic-api-key'),
+    /** Headless Claude token (login method), read only by `minions coordinator live-run`, passed to its claude in env. */
+    claudeHeadlessTokenFile: p(`/opt/minions/secrets/${CLAUDE_HEADLESS_TOKEN_FILE}`),
     configJson: p('/opt/minions/config/config.json'),
     /** Public key that verifies host-signed publication approvals (the private key never enters the container). */
     approvalPublicKey: p('/opt/minions/config/approval-public-key.pem'),
@@ -164,11 +153,6 @@ export function containerPaths(root = process.env.MINIONS_CONTAINER_ROOT ?? '') 
 }
 export const CONTAINER = containerPaths('');
 
-/**
- * In-container path of the GitHub token (read-only). The directory is bind-mounted, not the file,
- * so atomic host-side replacements (new inode) stay visible to a running container.
- */
-export const GITHUB_TOKEN_CONTAINER_PATH = CONTAINER.githubTokenFile;
 /** In-container path of the Telegram bot token (read-only; read only by `minions coordinator run`). */
 export const TELEGRAM_TOKEN_CONTAINER_PATH = CONTAINER.telegramTokenFile;
 
@@ -177,6 +161,30 @@ export const shortId = (projectId: string) => projectId.slice(0, 8).toLowerCase(
 export const composeProjectName = (projectId: string) => `minions-${shortId(projectId)}`;
 export function volumeNames(projectId: string) {
   const b = composeProjectName(projectId);
-  return { workspace: `${b}-workspace`, state: `${b}-state`, claude: `${b}-claude`, cache: `${b}-cache` };
+  return { workspace: `${b}-workspace`, state: `${b}-state`, claude: `${b}-claude`, cache: `${b}-cache`, tools: `${b}-tools` };
+}
+
+/**
+ * Docker runtime: the persistent tools volume (docs/design/autonomy.md Decision 14). Agents install toolchains into it
+ * without root; the image and compose.yaml set these locations, and the worker and verification envs pass them on.
+ */
+export const TOOLS_DIR = '/opt/tools';
+export const TOOLS_ENV = {
+  CARGO_HOME: `${TOOLS_DIR}/cargo`,
+  RUSTUP_HOME: `${TOOLS_DIR}/rustup`,
+  GOPATH: `${TOOLS_DIR}/go`,
+  UV_INSTALL_DIR: `${TOOLS_DIR}/bin`,
+  UV_TOOL_DIR: `${TOOLS_DIR}/uv/tools`,
+  UV_TOOL_BIN_DIR: `${TOOLS_DIR}/bin`,
+  UV_PYTHON_INSTALL_DIR: `${TOOLS_DIR}/uv/python`,
+} as const;
+/** PATH entries of the tools volume. They come after the system directories, so an installed tool never shadows a system one. */
+export const TOOLS_PATH = [`${TOOLS_DIR}/bin`, `${TOOLS_DIR}/cargo/bin`, `${TOOLS_DIR}/go/bin`, `${TOOLS_DIR}/goroot/bin`] as const;
+/** The container PATH: the base image's, then the tools volume (docker/Dockerfile sets the same value). */
+export const CONTAINER_PATH = ['/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin', ...TOOLS_PATH].join(':');
+/** `path` with the missing TOOLS_PATH entries appended. */
+export function withToolsPath(path: string): string {
+  const have = path.split(':').filter(Boolean);
+  return [...have, ...TOOLS_PATH.filter((d) => !have.includes(d))].join(':');
 }
 export const imageTag = (packageVersion: string) => `minions-runtime:${packageVersion}`;

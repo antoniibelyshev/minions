@@ -1,7 +1,9 @@
 import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import type { RuntimeDb } from './db.js';
-import { sessionStates, totalOf, weightedMTok, type CoordinatorSessionState, type SessionEndTrigger, type UsageComponents } from './coordinator-usage.js';
+import { routineSettings } from './routine.js';
+import { localDayStart } from './zoned-time.js';
+import { sessionStates, totalOf, weightedMTok, type CoordinatorRole, type CoordinatorSessionState, type SessionEndTrigger, type UsageComponents } from './coordinator-usage.js';
 
 /**
  * Spend monitoring (task-32): a durable usage tally and an owner budget, kept in the runtime DB without a
@@ -236,6 +238,28 @@ function figures(entries: KeyTally[], attempts: number, billing: Billing, fallba
   return { tokens, attempts, estimatedUsd: Math.round(usd * 100) / 100 };
 }
 
+/**
+ * Per coordinator session key (`thread:<id>`, `task:<id>`, `general`): its own measured tokens (every claude session it
+ * ran, resets included) and, for a task session, its task's workers. USD only with API billing.
+ */
+export function sessionSpend(db: RuntimeDb, billing: Billing, fallbackModel: string | null = null): Map<string, { own: SpendFigures; workers: SpendFigures }> {
+  const rows = usageRows(db);
+  const keyOf = new Map(rows.filter((r) => r.data.scope === 'session').map((r) => [r.data.key, (r.data as UsageEventData & { sessionKey?: unknown }).sessionKey]));
+  const own = new Map<string, KeyTally[]>();
+  const leases = new Map<string, KeyTally[]>();
+  for (const t of tally(rows)) {
+    if (t.scope === 'session') {
+      const k = keyOf.get(t.key);
+      if (typeof k === 'string') own.set(k, [...(own.get(k) ?? []), t]);
+    } else if (t.taskId) leases.set(`task:${t.taskId}`, [...(leases.get(`task:${t.taskId}`) ?? []), t]);
+  }
+  const out = new Map<string, { own: SpendFigures; workers: SpendFigures }>();
+  for (const k of new Set([...own.keys(), ...leases.keys()])) {
+    out.set(k, { own: figures(own.get(k) ?? [], 0, billing, fallbackModel), workers: figures(leases.get(k) ?? [], 0, billing, fallbackModel) });
+  }
+  return out;
+}
+
 const attemptsSince = (db: RuntimeDb, since?: string, taskId?: string): number => {
   const where: string[] = []; const p: string[] = [];
   if (since) { where.push('started_at >= ?'); p.push(since); }
@@ -264,6 +288,8 @@ export interface SpendReport {
   /** The coordinator sessions' own totals: measured from the transcript by the Stop hook, or set by hand. */
   coordinator: SpendFigures & { baseline: CoordinatorBaseline };
   budget: BudgetStatus | null;
+  /** The owner's spend caps (null when none is set). */
+  caps: SpendCaps | null;
   /** Shortcut for budget.percent (null without a budget). */
   percent: number | null;
   notes: string[];
@@ -294,6 +320,8 @@ export interface CoordinatorBaseline {
   tokensPerOwnerMessage: number | null;
   /** Tokens recovered sessions spent before their first claim or Telegram reply. */
   resetOverhead: { recoveredSessions: number; tokens: number; perRecovery: number | null };
+  /** Sessions the routine pass started with the wake prompt (task-68.2) and their tokens (part of `tokens`). */
+  wakes: { sessions: number; tokens: number; perWake: number | null };
   /** Measured coordinator tokens / all tokens since `since` (0..1; null when nothing is counted). */
   share: number | null;
   /** API-key billing: USD with the components weighted (cache read 0.1x, cache write 1.25x, output 5x). */
@@ -301,7 +329,14 @@ export interface CoordinatorBaseline {
   /** API-key billing: the coordinator's share of the estimated USD since `since`. */
   usdShare?: number | null;
   model: string | null;
+  /**
+   * Tokens per role (phase 6 of the design): the single coordinator, the router, task and general sessions. Present
+   * only once a session state carries a role other than `coordinator` (without sessions the baseline is unchanged).
+   */
+  perRole?: Partial<Record<CoordinatorRole, RoleBaseline>>;
 }
+
+export interface RoleBaseline { sessions: number; open: number; tokens: number; turns: number; estimatedUsd?: number }
 
 const ratio = (a: number, b: number) => (b > 0 ? Math.round(a / b) : null);
 
@@ -323,10 +358,17 @@ export function coordinatorBaseline(ctx: { db: RuntimeDb; billing: Billing; fall
   const endedBy: Partial<Record<SessionEndTrigger, number>> = {};
   const resetTriggers: Record<string, number> = {};
   let turns = 0; let contextSum = 0; let maxContext = 0; let ownerMessages = 0; let recovered = 0; let overhead = 0; let usd = 0;
+  let woken = 0; let wakeTokens = 0;
+  const perRole: Partial<Record<CoordinatorRole, RoleBaseline & { usd: number }>> = {};
   for (const s of states) {
+    const role = (perRole[s.role] ??= { sessions: 0, open: 0, tokens: 0, turns: 0, usd: 0 });
+    role.sessions++; if (!s.ended) role.open++;
+    role.tokens += totalOf(s.components); role.turns += s.turns;
+    role.usd += weightedMTok(s.components) * (usdPerMTok(s.model) ?? usdPerMTok(ctx.fallbackModel) ?? 0);
     for (const k of COMPONENT_KEYS) components[k] += s.components[k];
     turns += s.turns; contextSum += s.contextSum; maxContext = Math.max(maxContext, s.maxContext); ownerMessages += s.ownerMessages;
     if (s.recovered) { recovered++; overhead += s.overhead; }
+    if (s.woken) { woken++; wakeTokens += totalOf(s.components); }
     if (s.ended) {
       endedBy[s.ended.trigger] = (endedBy[s.ended.trigger] ?? 0) + 1;
       if (s.ended.trigger === 'context-reset') for (const t of (s.ended.detail ?? 'requested').split(',')) resetTriggers[t] = (resetTriggers[t] ?? 0) + 1;
@@ -350,13 +392,16 @@ export function coordinatorBaseline(ctx: { db: RuntimeDb; billing: Billing; fall
     ownerMessages, deliveredTasks: delivered,
     tokensPerDeliveredTask: ratio(tokens, delivered), tokensPerOwnerMessage: ratio(tokens, ownerMessages),
     resetOverhead: { recoveredSessions: recovered, tokens: overhead, perRecovery: ratio(overhead, recovered) },
+    wakes: { sessions: woken, tokens: wakeTokens, perWake: ratio(wakeTokens, woken) },
     share,
     ...(ctx.billing === 'api-key' ? { estimatedUsd: Math.round(usd * 100) / 100, usdShare } : {}),
     model: [...states].reverse().find((s) => s.model)?.model ?? null,
+    ...(states.some((s) => s.role !== 'coordinator') ? { perRole: Object.fromEntries(Object.entries(perRole).map(([r, { usd, ...v }]) =>
+      [r, { ...v, ...(ctx.billing === 'api-key' ? { estimatedUsd: Math.round(usd * 100) / 100 } : {}) }])) } : {}),
   };
 }
 
-export interface SpendContext { db: RuntimeDb; billing?: Billing; config?: Pick<MinionsConfig, 'models'>; now?: Date }
+export interface SpendContext { db: RuntimeDb; billing?: Billing; config?: Pick<MinionsConfig, 'models'> & Partial<Pick<MinionsConfig, 'budgets' | 'routine'>>; now?: Date }
 
 export function readBudget(db: RuntimeDb): Budget | null {
   const v = db.getControl('budget');
@@ -386,6 +431,14 @@ export function currentBudget(ctx: SpendContext): BudgetStatus | null {
   return b ? budgetStatus(ctx, b, usageRows(ctx.db)) : null;
 }
 
+/**
+ * Spend since an instant (any window, not the UTC day): tokens (and the USD estimate under API-key billing) and
+ * attempts started since `since`. The morning digest uses it for the window since the previous digest.
+ */
+export function spendSince(ctx: SpendContext, since: string): SpendFigures {
+  return figures(tally(usageRows(ctx.db), since), attemptsSince(ctx.db, since), ctx.billing ?? billingOf(), ctx.config?.models.default ?? null);
+}
+
 /** The spend block of `minions status --json` (and `minions work spend`). */
 export function spendReport(ctx: SpendContext): SpendReport {
   const now = ctx.now ?? new Date();
@@ -409,7 +462,8 @@ export function spendReport(ctx: SpendContext): SpendReport {
     today: { ...figures(tally(rows, day), attemptsSince(ctx.db, day), billing, fallback), since: day },
     perTask: perTask.filter((t) => t.tokens > 0 || t.attempts > 0),
     coordinator: { ...figures(all.filter((e) => e.scope === 'session'), 0, billing, fallback), baseline: coordinatorBaseline({ db: ctx.db, billing, fallbackModel: ctx.config?.models.coordinator ?? fallback, rows }) },
-    budget, percent: budget?.percent ?? null, notes,
+    budget, caps: anyCap(ctx.config) ? spendCaps({ ...ctx, billing, now }) : null,
+    percent: budget?.percent ?? null, notes,
   };
 }
 
@@ -444,13 +498,129 @@ export function describeBudget(s: BudgetStatus): string {
   return `${fmt(s.used, s.unit)} of ${fmt(s.limit, s.unit)} ${windowText(s)} (${s.percent}%; budget "${s.text}")`;
 }
 
-/** Refuses a new claim when the budget is used up. Running leases are never touched. */
-export function assertBudgetAllowsStart(ctx: SpendContext): void {
+/**
+ * The owner's spend caps (`budgets.*`; docs/design/autonomy.md Decisions 13 and 15). USD caps count the estimate and are
+ * enforced only with API-key billing (a subscription has no USD figure); token caps count the recorded tokens and are
+ * enforced on any billing. The daily caps count everything (coordinator sessions and workers) since local midnight in
+ * routine.timezone (the digest's day); the per-task caps count the task's workers over all its attempts.
+ */
+export interface SpendCaps {
+  /** The USD caps are enforced (API-key billing). Token caps always are. */
+  enforced: boolean;
+  /** The cap day: its start (local midnight) and zone. */
+  timezone: string; dayStart: string;
+  day: { capUsd: number | null; usedUsd: number; capTokens: number | null; tokens: number; usdReached: boolean; tokensReached: boolean; exhausted: boolean };
+  /**
+   * The per-task caps; with a task id, that task's worker spend. `atCap`: tasks whose workers reached a cap (USD shown
+   * even when not enforced), with their spend in `atCapUsd` / `atCapTokens`; `blocked`: those an enforced cap stops.
+   */
+  task: {
+    capUsd: number | null; capTokens: number | null; taskId?: string; usedUsd?: number; usedTokens?: number; exhausted: boolean;
+    atCap: string[]; atCapUsd: Record<string, number>; atCapTokens: Record<string, number>; blocked: string[];
+  };
+}
+
+/** The configured caps, every unset one null. */
+export const capsOf = (cfg: SpendContext['config']) => {
+  const b = cfg?.budgets;
+  return { dailyUsd: b?.dailyUsd ?? null, taskUsd: b?.taskUsd ?? null, dailyTokens: b?.dailyTokens ?? null, taskTokens: b?.taskTokens ?? null };
+};
+const anyCap = (cfg: SpendContext['config']) => Object.values(capsOf(cfg)).some((v) => v !== null);
+
+export function spendCaps(ctx: SpendContext, taskId?: string): SpendCaps {
+  const now = ctx.now ?? new Date();
+  const fallback = ctx.config?.models.default ?? null;
+  const caps = capsOf(ctx.config);
+  const enforced = (ctx.billing ?? billingOf()) === 'api-key';
+  const { timezone } = routineSettings({ routine: ctx.config?.routine });
+  const dayStart = localDayStart(now, timezone);
+  const rows = usageRows(ctx.db);
+  const usd = (e: KeyTally[]) => figures(e, 0, 'api-key', fallback).estimatedUsd ?? 0;
+  const tokens = (e: KeyTally[]) => e.reduce((a, x) => a + x.tokens, 0);
+  const today = tally(rows, dayStart);
+  const dayUsd = usd(today);
+  const dayTokens = tokens(today);
+  const perTask = new Map<string, KeyTally[]>();
+  for (const e of tally(rows).filter((x) => x.scope === 'lease' && x.taskId)) perTask.set(e.taskId!, [...(perTask.get(e.taskId!) ?? []), e]);
+  const taskUsd = (id: string) => usd(perTask.get(id) ?? []);
+  const taskTokens = (id: string) => tokens(perTask.get(id) ?? []);
+  const usdAt = (id: string) => caps.taskUsd !== null && taskUsd(id) >= caps.taskUsd;
+  const tokensAt = (id: string) => caps.taskTokens !== null && taskTokens(id) >= caps.taskTokens;
+  const atCap = [...perTask.keys()].filter((id) => usdAt(id) || tokensAt(id)).sort();
+  const blocked = atCap.filter((id) => (enforced && usdAt(id)) || tokensAt(id));
+  const usdReached = caps.dailyUsd !== null && dayUsd >= caps.dailyUsd;
+  const tokensReached = caps.dailyTokens !== null && dayTokens >= caps.dailyTokens;
+  return {
+    enforced, timezone, dayStart,
+    day: { capUsd: caps.dailyUsd, usedUsd: dayUsd, capTokens: caps.dailyTokens, tokens: dayTokens, usdReached, tokensReached, exhausted: (enforced && usdReached) || tokensReached },
+    task: {
+      capUsd: caps.taskUsd, capTokens: caps.taskTokens,
+      ...(taskId !== undefined ? { taskId, usedUsd: taskUsd(taskId), usedTokens: taskTokens(taskId) } : {}),
+      exhausted: taskId !== undefined && ((enforced && usdAt(taskId)) || tokensAt(taskId)),
+      atCap, atCapUsd: Object.fromEntries(atCap.map((id) => [id, taskUsd(id)])), atCapTokens: Object.fromEntries(atCap.map((id) => [id, taskTokens(id)])), blocked,
+    },
+  };
+}
+
+/** Compact token count: 950, 135k, 4.2M. */
+export const shortTokens = (n: number) => (n >= 1e6 ? `${Math.round(n / 1e5) / 10}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n));
+
+const CAP_HINT = 'Record returning workers and tell the owner; the owner changes the caps with /budget in Telegram or `minions settings set budgets.<key>` (the coordinator cannot).';
+
+/** What reached the daily caps, in words ("~$6.00 of $5 (estimated)", "21M of 20M tokens"). */
+export function dayCapText(c: SpendCaps): string {
+  const parts = [
+    ...(c.day.tokensReached ? [`${shortTokens(c.day.tokens)} of ${shortTokens(c.day.capTokens!)} tokens`] : []),
+    ...(c.enforced && c.day.usdReached ? [`~$${c.day.usedUsd.toFixed(2)} of $${c.day.capUsd} (estimated)`] : []),
+  ];
+  return `${parts.join(', ')} today (since ${c.dayStart}, ${c.timezone} midnight)`;
+}
+
+/** What reached a task's caps, in words. */
+export function taskCapText(c: SpendCaps, taskId: string): string {
+  const tok = c.task.atCapTokens[taskId] ?? c.task.usedTokens ?? 0;
+  const usd = c.task.atCapUsd[taskId] ?? c.task.usedUsd ?? 0;
+  return [
+    ...(c.task.capTokens !== null && tok >= c.task.capTokens ? [`${shortTokens(tok)} of ${shortTokens(c.task.capTokens)} tokens`] : []),
+    ...(c.enforced && c.task.capUsd !== null && usd >= c.task.capUsd ? [`~$${usd.toFixed(2)} of $${c.task.capUsd} (estimated)`] : []),
+  ].join(', ');
+}
+
+/**
+ * Refuses a new claim when the budget is used up, or (with a task id) when the owner's daily or per-task cap is
+ * reached. Running leases are never touched.
+ */
+export function assertBudgetAllowsStart(ctx: SpendContext, taskId?: string): void {
   const s = currentBudget(ctx);
-  if (!s?.exhausted) return;
-  throw new MinionsError('POLICY_DENIED', `Budget reached: ${describeBudget(s)}. New starts are refused; running workers continue.`,
-    'Record returning workers and report to the owner; starts resume when the owner raises the budget (`minions work spend --budget "<amount>"`) or clears it (`--budget off`).',
-    { budget: s });
+  if (s?.exhausted) {
+    throw new MinionsError('POLICY_DENIED', `Budget reached: ${describeBudget(s)}. New starts are refused; running workers continue.`,
+      'Record returning workers and report to the owner; starts resume when the owner raises the budget (`minions work spend --budget "<amount>"`) or clears it (`--budget off`).',
+      { budget: s });
+  }
+  if (!anyCap(ctx.config)) return;
+  const c = spendCaps(ctx, taskId);
+  if (c.day.exhausted) {
+    throw new MinionsError('POLICY_DENIED', `Daily spend cap reached: ${dayCapText(c)}. New starts are refused; running workers continue.`, CAP_HINT, { caps: c });
+  }
+  if (c.task.exhausted) {
+    throw new MinionsError('POLICY_DENIED', `Per-task spend cap reached for ${taskId}: ${taskCapText(c, taskId!)}. Its next stage is refused.`, CAP_HINT, { caps: c });
+  }
+}
+
+/**
+ * The 50% / 80% warnings of the enforced daily caps (highest reached first, null below 50% or at the cap): the
+ * dispatcher queues one owner notice per threshold, cap value and day.
+ */
+export function dayCapWarning(c: SpendCaps): { threshold: 50 | 80; key: string; text: string } | null {
+  if (c.day.exhausted) return null;
+  const shares: { what: string; key: string; share: number }[] = [
+    ...(c.day.capTokens !== null ? [{ what: `${shortTokens(c.day.tokens)} of ${shortTokens(c.day.capTokens)} tokens`, key: `tokens:${c.day.capTokens}`, share: c.day.tokens / c.day.capTokens }] : []),
+    ...(c.enforced && c.day.capUsd !== null ? [{ what: `~$${c.day.usedUsd.toFixed(2)} of $${c.day.capUsd} (estimated)`, key: `usd:${c.day.capUsd}`, share: c.day.usedUsd / c.day.capUsd }] : []),
+  ].sort((a, b) => b.share - a.share);
+  const top = shares[0];
+  if (!top || top.share < 0.5) return null;
+  const threshold = top.share >= 0.8 ? 80 : 50;
+  return { threshold, key: `${top.key}:${threshold}`, text: `Daily spend cap ${threshold}% reached: ${top.what} today (${c.timezone}). At the cap new stages wait; /budget day <amount> changes it.` };
 }
 
 export interface BudgetNotice extends BudgetStatus {
@@ -485,8 +655,36 @@ export function humanSpend(r: SpendReport): string {
   return [
     `spend (${r.billing}): total ${tok(r.total)}; today ${tok(r.today)}`,
     `coordinator: ${c.tokens.toLocaleString('en-US')} tokens${usd(c)}; workers: ${Math.max(0, r.total.tokens - c.tokens).toLocaleString('en-US')} tokens`,
-    r.budget ? `budget: ${describeBudget(r.budget)}${r.budget.exhausted ? ' - new starts refused' : ''}` : 'budget: none',
+    ...(r.caps ? [humanCaps(r.caps)] : []),
+    ...(r.budget ? [`budget: ${describeBudget(r.budget)}${r.budget.exhausted ? ' - new starts refused' : ''}`] : r.caps ? [] : ['budget: none']),
   ].join('\n');
+}
+
+const capUsd = (n: number | null) => (n === null ? 'off' : `$${n}`);
+
+function humanCaps(c: SpendCaps): string {
+  const tokenCaps = c.day.capTokens !== null || c.task.capTokens !== null;
+  const usdCaps = c.day.capUsd !== null || c.task.capUsd !== null;
+  if (!tokenCaps) {
+    // USD caps only: the line as before.
+    const day = `daily ~$${c.day.usedUsd.toFixed(2)} of ${capUsd(c.day.capUsd)}${c.day.exhausted ? ' (reached: new stages wait)' : ''}`;
+    const reached = c.task.atCap.map((id) => `${id} ~$${c.task.atCapUsd[id]!.toFixed(2)}`).join(', ');
+    const task = `per-task ${capUsd(c.task.capUsd)}${reached ? ` (reached: ${reached})` : ''}`;
+    return `spend caps: ${day}; ${task}${c.enforced ? '' : ' (not enforced: subscription billing)'}`;
+  }
+  const dayCaps = [
+    ...(c.day.capTokens !== null ? [`${shortTokens(c.day.tokens)} of ${shortTokens(c.day.capTokens)} tokens`] : []),
+    ...(c.day.capUsd !== null ? [`~$${c.day.usedUsd.toFixed(2)} of $${c.day.capUsd}`] : []),
+  ];
+  const day = `daily ${dayCaps.length ? dayCaps.join(', ') : 'off'}${c.day.exhausted ? ' (reached: new stages wait)' : ''}`;
+  const taskCaps = [...(c.task.capTokens !== null ? [`${shortTokens(c.task.capTokens)} tokens`] : []), ...(c.task.capUsd !== null ? [`$${c.task.capUsd}`] : [])];
+  const reached = c.task.atCap.map((id) => [id,
+    ...(c.task.capTokens !== null ? [`${shortTokens(c.task.atCapTokens[id]!)} tokens`] : []),
+    ...(c.task.capUsd !== null ? [`~$${c.task.atCapUsd[id]!.toFixed(2)}`] : []),
+  ].join(' ')).join(', ');
+  const task = `per-task ${taskCaps.length ? taskCaps.join(', ') : 'off'}${reached ? ` (reached: ${reached})` : ''}`;
+  const note = c.enforced || !usdCaps ? 'enforced' : 'token caps enforced; USD not enforced: subscription billing';
+  return `spend caps (day from ${c.timezone} midnight): ${day}; ${task} (${note})`;
 }
 
 const k = (n: number | null) => (n === null ? '-' : n >= 10_000 ? `${Math.round(n / 1000)}k` : n.toLocaleString('en-US'));
@@ -500,6 +698,7 @@ export function humanBaseline(b: CoordinatorBaseline): string {
   return [
     `coordinator baseline since ${b.since}: ${b.sessions} session(s) (${b.open} open; ended: ${ended}${resets ? `; resets by trigger: ${resets}` : ''}), ${b.turns.total} turns (${b.turns.perSession ?? '-'}/session)`,
     `  context/turn mean ${k(b.contextPerTurn.mean)}, max ${k(b.contextPerTurn.max)}; tokens/delivered task ${k(b.tokensPerDeliveredTask)} (${b.deliveredTasks} delivered); tokens/owner message ${k(b.tokensPerOwnerMessage)} (${b.ownerMessages})`,
-    `  reset overhead ${k(b.resetOverhead.perRecovery)}/recovery (${b.resetOverhead.recoveredSessions} recovered); coordinator share ${pct(b.share)} of tokens${b.estimatedUsd !== undefined ? `, ~$${b.estimatedUsd.toFixed(2)} weighted est. (${pct(b.usdShare)} of USD)` : ''}`,
+    ...(b.perRole ? [`  per role: ${Object.entries(b.perRole).map(([r, v]) => `${r} ${k(v.tokens)} tokens (${v.sessions} session(s), ${v.turns} turns${v.estimatedUsd !== undefined ? `, ~$${v.estimatedUsd.toFixed(2)}` : ''})`).join('; ')}`] : []),
+    `  reset overhead ${k(b.resetOverhead.perRecovery)}/recovery (${b.resetOverhead.recoveredSessions} recovered); routine wakes ${b.wakes.sessions} (${k(b.wakes.perWake)}/wake); coordinator share ${pct(b.share)} of tokens${b.estimatedUsd !== undefined ? `, ~$${b.estimatedUsd.toFixed(2)} weighted est. (${pct(b.usdShare)} of USD)` : ''}`,
   ].join('\n');
 }

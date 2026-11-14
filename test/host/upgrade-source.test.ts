@@ -2,6 +2,7 @@
 // installed-CLI check/reinstall with a fake npm (nothing is installed into any real global prefix).
 import { existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
+import { gunzipSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { sourceFingerprint } from '../../scripts/source-fingerprint.mjs';
 import { run, type RunOptions, type RunResult } from '../../src/core/exec.js';
@@ -10,7 +11,8 @@ import { Compose } from '../../src/host/docker.js';
 import type { ExportResult } from '../../src/host/transfer.js';
 import { formatUpgrade, runUpgrade, type UpgradeResult } from '../../src/host/upgrade.js';
 import { backupInstalledCli, listCliBackups } from '../../src/host/cli-backup.js';
-import { applyCli, checkCli, isMinionsCheckout, runSourcePhase, syncFromContainer, syncFromOrigin, upgradeSourceMode, type SourcePhaseOptions } from '../../src/host/upgrade-source.js';
+import { shellQuote } from '../../src/host/setup.js';
+import { applyCli, checkCli, isMinionsCheckout, runSourcePhase, syncFromContainer, upgradeSourceMode, type SourcePhaseOptions } from '../../src/host/upgrade-source.js';
 import { git, makeRepo, tempDir, withHome } from './fixtures.js';
 
 const ID = '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f';
@@ -33,7 +35,7 @@ function syncRepo() {
   git(repo, 'update-ref', 'refs/remotes/minions/main', ahead);
   git(repo, 'branch', '-q', '-D', 'tmp');
   let exports = 0;
-  const exportRepo = async (): Promise<ExportResult> => { exports++; return { bundle: 'b', refs: ['refs/heads/main'], changes: [{ ref: 'refs/remotes/minions/main', from: base, to: ahead }] }; };
+  const exportRepo = async (): Promise<ExportResult> => { exports++; return { bundle: 'b', refs: ['refs/heads/main'], changes: [{ ref: 'refs/remotes/minions/main', from: base, to: ahead }], tasks: [] }; };
   return { repo, base, ahead, exportRepo, exports: () => exports };
 }
 const head = (repo: string, ref = 'refs/heads/main') => git(repo, 'rev-parse', ref);
@@ -192,7 +194,7 @@ describe('--from-container sync', () => {
 
 // ---------------------------------------------------------------- cli
 
-interface NpmWorld { globalRoot: string; checkout: string; calls: string[]; fail?: 'install' | 'build' | 'backup'; lsResolved?: string }
+interface NpmWorld { globalRoot: string; checkout: string; calls: string[]; fail?: 'install' | 'build'; lsResolved?: string }
 
 /** Minions checkout with sources and (optionally) build deps. */
 function checkout(version = '0.2.0', deps = true): string {
@@ -232,14 +234,6 @@ function fakeNpm(w: NpmWorld) {
       expect(o?.cwd).toBe(w.checkout);
       stampDist(w.checkout, version, sourceFingerprint(w.checkout), kind);
       return { code: 0, stdout: '', stderr: '' };
-    }
-    if (args[0] === 'pack' && args.includes('--ignore-scripts')) {
-      // The backup of the current install (src/host/cli-backup.ts): packed from the global install, scripts off.
-      expect(args[1]).toBe(join(w.globalRoot, 'minions'));
-      if (w.fail === 'backup') return { code: 1, stdout: '', stderr: 'ENOSPC' };
-      const v = (JSON.parse(readFileSync(join(args[1]!, 'package.json'), 'utf8')) as { version: string }).version;
-      writeFileSync(join(args[args.indexOf('--pack-destination') + 1]!, `minions-${v}.tgz`), `installed ${v}`);
-      return { code: 0, stdout: `minions-${v}.tgz\n`, stderr: '' };
     }
     if (args[0] === 'pack') {
       expect(o?.cwd).toBe(w.checkout);
@@ -282,6 +276,24 @@ describe('installed CLI check', () => {
     expect(mutatingNpm(w.calls)).toEqual([]);
   });
 
+  it('host runtime: a linked install into an agent-writable dir is never rebuilt in place (manual packed reinstall, nothing runs)', async () => {
+    const c = checkout();
+    stampDist(c, '0.2.0', 'old0000000000000', 'source');
+    symlinkSync(c, join(g, 'minions'));
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [], lsResolved: `file:${c}` };
+    const spawned: string[] = [];
+    const p = await runSourcePhase<UpgradeResult>(phaseBase({
+      checkout: c, runner: fakeNpm(w), rebuildCli: true, agentWritable: [c],
+      spawnCli: async (cli) => { spawned.push(cli); return { code: 1, stdout: '', stderr: '' }; },
+    }));
+    expect(p.cli).toMatchObject({ action: 'manual', differs: true });
+    expect(p.cli!.reason).toMatch(/inside the agent-writable/);
+    expect(p.cli!.command).toMatch(/npm pack && npm uninstall -g minions && npm install -g/);
+    expect(p.stop).not.toBeNull();
+    expect(mutatingNpm(w.calls)).toEqual([]);
+    expect(spawned).toEqual([]);
+  });
+
   it('rebuilds a linked install of the checkout, then continues the upgrade on the new CLI', async () => {
     const c = checkout();
     stampDist(c, '0.2.0', 'old0000000000000', 'source');
@@ -309,12 +321,13 @@ describe('installed CLI check', () => {
       spawnCli: async () => ({ code: 0, stdout: JSON.stringify({ ok: true, data: childResult() }), stderr: '' }),
     }));
     expect(p.cli).toMatchObject({ action: 'reinstall', reason: 'installed 0.1.0 != checkout 0.2.0' });
-    expect(mutatingNpm(w.calls).map((l) => l.split(' ').slice(0, 2).join(' '))).toEqual(['npm ci', 'npm pack', 'npm pack', 'npm install']);
+    expect(mutatingNpm(w.calls).map((l) => l.split(' ').slice(0, 2).join(' '))).toEqual(['npm ci', 'npm pack', 'npm install']);
     expect(p.cli!.installed.version).toBe('0.2.0');
     // The install it replaced was kept first (task-53.7).
     const backups = await listCliBackups();
     expect(backups.map((b) => b.version)).toEqual(['0.1.0']);
-    expect(readFileSync(backups[0]!.file, 'utf8')).toBe('installed 0.1.0');
+    // The backup is the install directory itself, archived under package/ (no npm pack: src/host/cli-backup.ts).
+    expect(gunzipSync(readFileSync(backups[0]!.file)).toString('latin1')).toContain('"version":"0.1.0"');
     expect(statSync(backups[0]!.file).mode & 0o777).toBe(0o600);
     expect(backups[0]!.file.startsWith(join(home.home, 'manager', 'cli-backup'))).toBe(true);
     expect(p.steps).toEqual([expect.objectContaining({ id: 'cli', status: 'done' })]);
@@ -330,7 +343,7 @@ describe('installed CLI check', () => {
     expect(p.cli!.installed.kind).toBe('git');
     expect(p.stop).toEqual({
       reason: 'installed 0.1.0 != checkout 0.2.0',
-      command: `cd ${c} && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ./minions-0.2.0.tgz`,
+      command: `cd ${shellQuote(c)} && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ./minions-0.2.0.tgz`,
       rerun: 'minions upgrade --timeout 60',
     });
     expect(p.steps[0]).toMatchObject({ id: 'cli', status: 'failed' });
@@ -354,7 +367,7 @@ describe('installed CLI check', () => {
     const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
     const p = await runSourcePhase(phaseBase({ checkout: c, runner: fakeNpm(w), spawnCli: async () => { throw new Error('must not spawn'); } }));
     expect(p.cli!.installed.kind).toBe('unknown');
-    expect(p.stop?.command).toBe(`cd ${c} && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ./minions-0.2.0.tgz`);
+    expect(p.stop?.command).toBe(`cd ${shellQuote(c)} && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ./minions-0.2.0.tgz`);
     expect(mutatingNpm(w.calls)).toEqual([]);
   });
 
@@ -443,9 +456,11 @@ describe('installed CLI check', () => {
   it('a backup that cannot be made stops the reinstall: npm install -g never runs', async () => {
     const c = checkout('0.2.0', false);
     realInstall(g, '0.1.0', 'old0000000000000', 'packed');
-    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [], fail: 'backup' };
+    const w: NpmWorld = { globalRoot: g, checkout: c, calls: [] };
+    mkdirSync(join(home.home, 'manager'), { recursive: true });
+    writeFileSync(join(home.home, 'manager', 'cli-backup'), 'not a directory'); // the backup cannot be written
     const p = await runSourcePhase(phaseBase({ checkout: c, runner: fakeNpm(w), rebuildCli: true, spawnCli: async () => { throw new Error('must not spawn'); } }));
-    expect(p.stop?.reason).toMatch(/backing up the current CLI failed, so nothing was installed: npm pack of the current CLI failed: ENOSPC/);
+    expect(p.stop?.reason).toMatch(/backing up the current CLI failed, so nothing was installed: /);
     expect(w.calls.some((l) => l.startsWith('npm install'))).toBe(false);
     expect(await listCliBackups()).toEqual([]);
   });
@@ -513,7 +528,7 @@ describe('installed CLI check', () => {
     symlinkSync(repo, join(g, 'minions'));
     const w: NpmWorld = { globalRoot: g, checkout: repo, calls: [], lsResolved: `file:${repo}` };
     const logs: string[] = [];
-    const exportRepo = async (): Promise<ExportResult> => ({ bundle: 'b', refs: ['refs/heads/main'], changes: [{ ref: 'refs/remotes/minions/main', from: base, to: ahead }] });
+    const exportRepo = async (): Promise<ExportResult> => ({ bundle: 'b', refs: ['refs/heads/main'], changes: [{ ref: 'refs/remotes/minions/main', from: base, to: ahead }], tasks: [] });
     const p = await runSourcePhase<UpgradeResult>(phaseBase({
       checkout: repo, runner: fakeNpm(w), log: (m) => logs.push(m), rebuildCli: true,
       sync: { repo, branch: 'main', baseBranch: 'main', exportRepo, runner: run },
@@ -632,164 +647,11 @@ describe('installed CLI check', () => {
   });
 });
 
-// ---------------------------------------------------------------- GitHub delivery: origin/<base>
-
-describe('GitHub delivery: the CLI comes from the reviewed origin/<base> commit', () => {
-  let g: string;
-  beforeEach(() => { g = tempDir('minions-global-'); });
-
-  /** Minions checkout as a git repo on main, pushed to a bare origin; `merge` lands a PR on origin/main. */
-  function originCheckout() {
-    const c = checkout();
-    writeFileSync(join(c, '.gitignore'), 'node_modules/\ndist/\n*.tgz\n');
-    git(c, 'init', '-q', '-b', 'main');
-    for (const [k, v] of [['user.name', 'Ada'], ['user.email', 'ada@example.com'], ['commit.gpgsign', 'false']]) git(c, 'config', k!, v!);
-    git(c, 'add', '.');
-    git(c, 'commit', '-q', '-m', 'init');
-    const bare = join(tempDir('minions-origin-'), 'origin.git');
-    git(home.root, 'init', '-q', '--bare', bare);
-    git(c, 'remote', 'add', 'origin', bare);
-    git(c, 'push', '-q', 'origin', 'main');
-    const gh = join(tempDir('minions-gh-'), 'gh');
-    git(home.root, 'clone', '-q', '-b', 'main', bare, gh);
-    for (const [k, v] of [['user.name', 'GitHub'], ['user.email', 'gh@example.com'], ['commit.gpgsign', 'false']]) git(gh, 'config', k!, v!);
-    const merge = (file: string) => {
-      mkdirSync(join(gh, 'src'), { recursive: true });
-      writeFileSync(join(gh, 'src', file), `export const x = '${file}';\n`);
-      git(gh, 'add', '.');
-      git(gh, 'commit', '-q', '-m', `Merge pull request: ${file}`);
-      git(gh, 'push', '-q', 'origin', 'main');
-      return git(gh, 'rev-parse', 'HEAD');
-    };
-    return { c, bare, merge, base: git(c, 'rev-parse', 'HEAD') };
-  }
-  const origin = (o: ReturnType<typeof originCheckout>) => ({ repo: o.c, baseBranch: 'main', remote: o.bare, runner: run });
-
-  it('fetches origin, fast-forwards the checked-out base, and builds that reviewed commit in the same run (--rebuild-cli)', async () => {
-    const o = originCheckout();
-    const merged = o.merge('feature.ts');
-    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
-    const w: NpmWorld = { globalRoot: g, checkout: o.c, calls: [] };
-    const p = await runSourcePhase<UpgradeResult>(phaseBase({
-      checkout: o.c, origin: origin(o), runner: fakeNpm(w), rebuildCli: true,
-      spawnCli: async () => ({ code: 0, stdout: JSON.stringify({ ok: true, data: childResult() }) + '\n', stderr: '' }),
-    }));
-    expect(p.sync).toMatchObject({ source: 'origin', action: 'fast-forward', method: 'merge --ff-only', applied: true, from: o.base, to: merged, target: 'refs/remotes/origin/main' });
-    expect(head(o.c)).toBe(merged);
-    expect(readFileSync(join(o.c, 'src', 'feature.ts'), 'utf8')).toContain('feature.ts');
-    expect(mutatingNpm(w.calls).map((l) => l.split(' ').slice(0, 2).join(' '))).toEqual(['npm pack', 'npm pack', 'npm install']);
-    expect(p.stop).toBeNull();
-    expect(p.steps.map((s) => s.id)).toEqual(['sync', 'cli']);
-  });
-
-  it('stops before building when the checkout is not exactly origin/<base> (local commits, other branch, dirty tree)', async () => {
-    const cases: [string, (o: ReturnType<typeof originCheckout>) => void, RegExp][] = [
-      ['local commit', (o) => { writeFileSync(join(o.c, 'src', 'local.ts'), 'export {};\n'); git(o.c, 'add', '.'); git(o.c, 'commit', '-q', '-m', 'local merge'); }, /is at [0-9a-f]{12}, not the reviewed origin\/main commit/],
-      ['other branch', (o) => { git(o.c, 'checkout', '-q', '-b', 'feature'); writeFileSync(join(o.c, 'src', 'f.ts'), 'export {};\n'); git(o.c, 'add', '.'); git(o.c, 'commit', '-q', '-m', 'wip'); }, /not the reviewed origin\/main commit/],
-      ['untracked file', (o) => { writeFileSync(join(o.c, 'src', 'scratch.ts'), 'export {};\n'); }, /uncommitted or untracked changes.*not the reviewed origin\/main commit/],
-    ];
-    for (const [name, mutate, re] of cases) {
-      home.cleanup(); home = withHome();
-      const gg = tempDir('minions-global-');
-      const o = originCheckout();
-      mutate(o);
-      realInstall(gg, '0.1.0', 'old0000000000000', 'packed');
-      const w: NpmWorld = { globalRoot: gg, checkout: o.c, calls: [] };
-      const p = await runSourcePhase(phaseBase({ checkout: o.c, origin: origin(o), runner: fakeNpm(w), rebuildCli: true, spawnCli: async () => { throw new Error('must not spawn'); } }));
-      expect(mutatingNpm(w.calls), name).toEqual([]);
-      expect(p.ok, name).toBe(false);
-      expect(p.stop?.reason, name).toMatch(re);
-      expect(p.stop?.reason, name).toMatch(/with GitHub delivery the CLI is built only from origin\/main/);
-      expect(p.stop?.command, name).toMatch(/git merge --ff-only origin\/main/);
-    }
-  });
-
-  it('base not checked out (checkout on another branch): the base moves by update-ref, but the CLI is not built from the other branch', async () => {
-    const o = originCheckout();
-    git(o.c, 'checkout', '-q', '-b', 'feature');
-    const merged = o.merge('feature.ts');
-    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
-    const w: NpmWorld = { globalRoot: g, checkout: o.c, calls: [] };
-    const p = await runSourcePhase(phaseBase({ checkout: o.c, origin: origin(o), runner: fakeNpm(w), rebuildCli: true, spawnCli: async () => { throw new Error('must not spawn'); } }));
-    expect(p.sync).toMatchObject({ source: 'origin', action: 'fast-forward', method: 'update-ref', applied: true, from: o.base, to: merged, worktree: null });
-    expect(git(o.c, 'rev-parse', 'refs/heads/main')).toBe(merged);
-    expect(head(o.c, 'HEAD')).toBe(o.base);
-    expect(git(o.c, 'rev-parse', '--abbrev-ref', 'HEAD')).toBe('feature');
-    expect(mutatingNpm(w.calls)).toEqual([]);
-    expect(p.ok).toBe(false);
-    expect(p.stop?.reason).toMatch(/not the reviewed origin\/main commit/);
-    expect(p.stop?.command).toMatch(/git switch main/);
-  });
-
-  it('a diverged base refuses the whole upgrade; nothing is merged', async () => {
-    const o = originCheckout();
-    writeFileSync(join(o.c, 'src', 'local.ts'), 'export {};\n');
-    git(o.c, 'add', '.');
-    git(o.c, 'commit', '-q', '-m', 'local');
-    const local = head(o.c);
-    o.merge('remote.ts');
-    const e = await reason(runSourcePhase(phaseBase({ checkout: o.c, origin: origin(o) })));
-    expect(e.code).toBe('CONFLICT');
-    expect(e.message).toMatch(/upgrade \(origin\/main\): main .* and refs\/remotes\/origin\/main .* have diverged/);
-    expect(head(o.c)).toBe(local);
-    expect(git(o.c, 'rev-list', '--merges', '--count', 'main')).toBe('0');
-  });
-
-  it('a failed fetch refuses with NETWORK_RETRYABLE and changes nothing', async () => {
-    const o = originCheckout();
-    const e = await reason(syncFromOrigin({ repo: o.c, baseBranch: 'main', remote: join(home.root, 'missing.git') }));
-    expect(e.code).toBe('NETWORK_RETRYABLE');
-    expect(e.message).toMatch(/fetching main from origin failed/);
-    expect(head(o.c)).toBe(o.base);
-  });
-
-  it('dry run: no fetch and no ref change; the plan builds after the planned fast-forward', async () => {
-    const o = originCheckout();
-    git(o.c, 'fetch', '-q', 'origin');
-    const merged = o.merge('later.ts'); // not fetched yet: the dry run must not see it
-    const p = await runSourcePhase(phaseBase({ dryRun: true, checkout: o.c, origin: origin(o) }));
-    expect(p.sync).toMatchObject({ source: 'origin', action: 'up-to-date' });
-    expect(git(o.c, 'rev-parse', 'refs/remotes/origin/main')).not.toBe(merged);
-    expect(head(o.c)).toBe(o.base);
-  });
-
-  it('dry run with a planned origin fast-forward and --rebuild-cli plans the build (only container commits wait a run)', async () => {
-    const o = originCheckout();
-    o.merge('reviewed.ts');
-    git(o.c, 'fetch', '-q', 'origin');
-    realInstall(g, '0.1.0', 'old0000000000000', 'packed');
-    const w: NpmWorld = { globalRoot: g, checkout: o.c, calls: [] };
-    const logs: string[] = [];
-    const p = await runSourcePhase(phaseBase({ dryRun: true, checkout: o.c, origin: origin(o), runner: fakeNpm(w), rebuildCli: true, log: (m) => logs.push(m) }));
-    expect(p.sync).toMatchObject({ source: 'origin', action: 'fast-forward', applied: false });
-    expect(p.ok).toBe(true);
-    expect(p.stop).toBeNull();
-    const cli = p.steps.find((s) => s.id === 'cli');
-    expect(cli?.status).toBe('planned');
-    expect(cli?.detail).not.toMatch(/would stop|from the container/);
-    expect(logs.join('\n')).not.toMatch(/fetched from the container/);
-    expect(mutatingNpm(w.calls)).toEqual([]);
-    expect(head(o.c)).toBe(o.base);
-  });
-
-  it('upgradeSourceMode: --from-container is local-delivery only; GitHub delivery always takes origin', () => {
-    expect(upgradeSourceMode({ githubDelivery: false, fromContainer: true, checkout: null, baseBranch: 'main' })).toBe('container');
-    expect(upgradeSourceMode({ githubDelivery: false, fromContainer: false, checkout: '/c', baseBranch: 'main' })).toBe('checkout');
-    expect(upgradeSourceMode({ githubDelivery: false, fromContainer: false, checkout: null, baseBranch: 'main' })).toBe('none');
-    expect(upgradeSourceMode({ githubDelivery: true, fromContainer: false, checkout: '/c', baseBranch: 'main' })).toBe('origin');
-    expect(upgradeSourceMode({ githubDelivery: true, fromContainer: false, checkout: null, baseBranch: 'main' })).toBe('none');
-    let err: MinionsError | null = null;
-    try { upgradeSourceMode({ githubDelivery: true, fromContainer: true, checkout: '/c', baseBranch: 'trunk' }); } catch (e) { err = e as MinionsError; }
-    expect(err?.code).toBe('PRECONDITION');
-    expect(err?.message).toMatch(/--from-container is available with local delivery only.*origin\/trunk is the single source of truth/);
-  });
-
-  it('never combines the container sync with the origin source', async () => {
-    const o = originCheckout();
-    const s = syncRepo();
-    const e = await reason(runSourcePhase(phaseBase({ checkout: o.c, origin: origin(o), sync: { repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo } })));
-    expect(e.code).toBe('PRECONDITION');
-    expect(s.exports()).toBe(0);
+describe('upgradeSourceMode', () => {
+  it('--from-container takes the container; otherwise the checkout, or nothing outside a minions checkout', () => {
+    expect(upgradeSourceMode({ fromContainer: true, checkout: null })).toBe('container');
+    expect(upgradeSourceMode({ fromContainer: false, checkout: '/c' })).toBe('checkout');
+    expect(upgradeSourceMode({ fromContainer: false, checkout: null })).toBe('none');
   });
 });
 

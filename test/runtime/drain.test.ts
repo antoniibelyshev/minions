@@ -1,14 +1,16 @@
 // Drain (task-3.7): the durable request behind `minions upgrade` winding workers down, the worker
-// PreToolUse hook that acts on it, and how drain partials are recorded and resumed. Temp state only.
-import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+// PreToolUse hook that acts on it, and how drain partials are recorded and resumed. Temp state only. The shell
+// gate of the plugin hook (a real `sh`) is in drain-hook-gate.test.ts (integration tier).
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import { collectStatus, humanStatus, pauseControl } from '../../src/runtime/commands.js';
-import { clearDrain, DRAIN_HOOK_COMMAND, requestDrain } from '../../src/runtime/drain.js';
+import { clearDrain, requestDrain } from '../../src/runtime/drain.js';
 import { DRAIN_GRACE_CALLS, drainHook, drainSafeBash, runHook } from '../../src/runtime/hooks.js';
 import { MinionsError } from '../../src/core/errors.js';
 import { commitFile, makeEnv, result, tmp, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 beforeAll(() => { process.env.MINIONS_STATE_DIR = tmp('minions-drain-state-'); });
 
@@ -163,63 +165,9 @@ describe('drain hook (PreToolUse, every tool)', () => {
       expect(drainSafeBash(bad), bad).toBe(false);
     }
   });
-
-  it('the plugin gate runs minions only while the flag file exists (no node start otherwise)', () => {
-    const dir = tmp('minions-drain-gate-');
-    const bin = join(dir, 'bin');
-    const state = join(dir, 'state');
-    mkdirSync(bin); mkdirSync(join(state, 'run'), { recursive: true });
-    writeFileSync(join(bin, 'minions'), `#!/bin/sh\necho "called $*" >> ${join(dir, 'calls')}\n`);
-    chmodSync(join(bin, 'minions'), 0o755);
-    const run = () => execFileSync('sh', ['-c', DRAIN_HOOK_COMMAND], { env: { PATH: `${bin}:/usr/bin:/bin`, MINIONS_STATE_DIR: state }, encoding: 'utf8' });
-    run();
-    expect(existsSync(join(dir, 'calls'))).toBe(false);
-    writeFileSync(join(state, 'run', 'drain'), '{}');
-    run();
-    expect(readFileSync(join(dir, 'calls'), 'utf8')).toBe('called hook drain\n');
-  });
 });
 
-describe('drain hook gate and phases (tester additions)', () => {
-  const gateEnv = () => {
-    const dir = tmp('minions-drain-gate2-');
-    const state = join(dir, 'state');
-    mkdirSync(join(state, 'run'), { recursive: true });
-    return { dir, state };
-  };
-  const runGate = (env: Record<string, string>) => {
-    try {
-      execFileSync('sh', ['-c', DRAIN_HOOK_COMMAND], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
-      return 0;
-    } catch (e) { return (e as { status: number }).status; }
-  };
-
-  it('the gate never exits 2 (the only blocking PreToolUse exit code), even with a missing or broken minions binary', () => {
-    const { dir, state } = gateEnv();
-    const empty = join(dir, 'empty-bin');
-    const broken = join(dir, 'broken-bin');
-    mkdirSync(empty); mkdirSync(broken);
-    writeFileSync(join(broken, 'minions'), '#!/bin/sh\necho boom >&2\nexit 1\n');
-    chmodSync(join(broken, 'minions'), 0o755);
-    // No flag: exit 0 without looking for minions at all.
-    expect(runGate({ PATH: `${empty}:/usr/bin:/bin`, MINIONS_STATE_DIR: state })).toBe(0);
-    writeFileSync(join(state, 'run', 'drain'), '{}');
-    // Flag present: a missing binary is 127 and a crashing one 1; both are non-blocking hook errors.
-    expect(runGate({ PATH: `${empty}:/usr/bin:/bin`, MINIONS_STATE_DIR: state })).toBe(127);
-    expect(runGate({ PATH: `${broken}:/usr/bin:/bin`, MINIONS_STATE_DIR: state })).toBe(1);
-  });
-
-  it('the hooks.json command string keeps the ${MINIONS_STATE_DIR:-/state} default for the shell (no JSON escaping)', () => {
-    const json = JSON.parse(readFileSync(new URL('../../templates/plugin/hooks/hooks.json', import.meta.url), 'utf8')) as
-      { hooks: { PreToolUse: { matcher: string; hooks: { command: string }[] }[] } };
-    const entry = json.hooks.PreToolUse.find((h) => h.matcher === '*');
-    expect(entry?.hooks[0]?.command).toBe(DRAIN_HOOK_COMMAND);
-    expect(DRAIN_HOOK_COMMAND).toContain('"${MINIONS_STATE_DIR:-/state}/run/drain"');
-    // Shell expansion of the default, without touching the real /state.
-    const expanded = execFileSync('sh', ['-c', 'echo ${MINIONS_STATE_DIR:-/state}/run/drain'], { env: { PATH: '/usr/bin:/bin' }, encoding: 'utf8' });
-    expect(expanded.trim()).toBe('/state/run/drain');
-  });
-
+describe('drain hook phases (tester additions)', () => {
   it('testers get their own notice; the Handback tool and TodoWrite stay allowed after the grace', async () => {
     const env = makeEnv();
     env.backlog.add({ id: 'task-1' });
@@ -252,8 +200,8 @@ describe('drain hook gate and phases (tester additions)', () => {
   it('drainSafeBash: the real worker finish and commit forms pass (templates and Claude Code)', () => {
     // The finish command exactly as templates/plugin/_partials/result-contract.md renders it.
     const template = readFileSync(new URL('../../templates/plugin/_partials/result-contract.md', import.meta.url), 'utf8');
-    const submit = /```bash\n([\s\S]*?)\n```/.exec(template)![1]!.replace('<leaseId>', 'lease-1').replace('{{workerRole}}', 'engineer').replace('{ ...WorkerResult JSON... }', longResult);
-    expect(submit.startsWith("minions work submit lease-1 --role engineer --json <<'RESULT'\n")).toBe(true);
+    const submit = /```bash\n([\s\S]*?)\n```/.exec(template)![1]!.replace('<worktree>', '/w').replace('<leaseId>', 'lease-1').replace('{{workerRole}}', 'engineer').replace('{ ...WorkerResult JSON... }', longResult);
+    expect(submit.startsWith("cd /w && minions work submit lease-1 --role engineer --json <<'RESULT'\n")).toBe(true);
     // The brief command from worker-common.md.
     const common = readFileSync(new URL('../../templates/plugin/_partials/worker-common.md', import.meta.url), 'utf8');
     const brief = /^cd <worktree> && minions work brief .*$/m.exec(common)![0].replace('<worktree>', '/w').replace('<leaseId>', 'lease-1').replace('{{workerRole}}', 'tester');
@@ -484,22 +432,6 @@ describe('drain hook gate and phases (tester additions)', () => {
       "git -C '$(touch /tmp/p)' status", "git commit -m '--amend'", ' git status', 'git status ',
     ]) expect(drainSafeBash(ok), JSON.stringify(ok)).toBe(true);
   });
-
-  it('the gate handles a state dir with a space: exit 0 without the flag, runs minions with it', () => {
-    const { dir } = gateEnv();
-    const state = join(dir, 'state with space');
-    mkdirSync(join(state, 'run'), { recursive: true });
-    const bin = join(dir, 'bin');
-    mkdirSync(bin);
-    writeFileSync(join(bin, 'minions'), `#!/bin/sh\necho "called $*" >> "${join(dir, 'calls')}"\n`);
-    chmodSync(join(bin, 'minions'), 0o755);
-    const env = { PATH: `${bin}:/usr/bin:/bin`, MINIONS_STATE_DIR: state };
-    expect(runGate(env)).toBe(0);
-    expect(existsSync(join(dir, 'calls'))).toBe(false);
-    writeFileSync(join(state, 'run', 'drain'), '{}');
-    expect(runGate(env)).toBe(0);
-    expect(readFileSync(join(dir, 'calls'), 'utf8')).toBe('called hook drain\n');
-  });
 });
 
 describe('drain partials (record + re-dispatch)', () => {
@@ -549,7 +481,7 @@ describe('drain partials (record + re-dispatch)', () => {
   });
 
   it('a reviewer drain partial keeps the task in reviewing; the rerun review gets the resume note', async () => {
-    const env = makeEnv((c) => { c.verification.testerRequired = false; });
+    const env = makeEnv((c) => { delete c.workflows; });
     env.backlog.add({ id: 'task-1' });
     const e = await env.sched.claim('task-1', 'engineer');
     const head = commitFile(e.worktree, 'a.txt', 'x');

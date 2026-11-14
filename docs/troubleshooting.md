@@ -39,8 +39,13 @@ minions import --state ~/backups/proj.tar.gz
 
 The archive is validated on the host and again in the runtime (manifest, checksums, allowed paths,
 regular files only, DB integrity and schema) before anything changes. The restore is refused
-(`CONFLICT`) while a worker lease is active or a live coordinator holds the project lock: let the
-workers finish or cancel them (`minions work cancel --all`), then rerun; or pass `--force`. Before a forced restore run `minions pause --starts`: a still-running
+(`CONFLICT`) while a worker lease is active, a live coordinator holds the project lock, or the session
+supervisor (`minions coordinator supervise`) or autopilot dispatcher (`minions work dispatch`) runs: let the
+workers finish or cancel them (`minions work cancel --all`), then rerun; or pass `--force`. A forced
+restore stops a running supervisor and dispatcher (SIGTERM, only the process its lock names, checked by pid
+and start time) right before it swaps the database in; the coordinator starts them again on the restored
+state. One that does not exit in time keeps its lock row in the restored DB and exits by itself once it
+notices the database file was replaced. Before a forced restore run `minions pause --starts`: a still-running
 coordinator could otherwise claim new leases before the restart.
 
 Leases the backup has marked active are released by the restore (no worker holds them in this
@@ -51,6 +56,10 @@ coordinator can start). Then run `minions settings restart`: it restarts the coo
 recovery prompt (`/minions:recover`), which re-dispatches the released tasks. The replaced state is
 moved to `<state>/pre-restore/<time>/` inside the runtime; the newest three copies are kept, older ones
 are removed. The archive copies in the runtime import and export dirs are removed after use.
+Open upgrade requests in the backup were made for the runtime that wrote it (for example a container
+recreate for new apt packages): restored into the other runtime (Docker to host, or back) they are
+marked `rejected` as obsolete; from an older backup that does not record its runtime they are marked
+`expired`. Check with `minions settings requests --all`.
 
 ## Docker is not running
 
@@ -106,6 +115,28 @@ reason is recorded in `<state>/coordinator-exit.json`; restarts done for context
 `<state>/logs/context-reset.log`. If `minions start` says another coordinator holds the project lock,
 attach to it with `minions start` instead of launching a second one.
 
+## Orphaned supervisor or dispatcher after a state restore
+
+Symptoms (host runtime): `minions doctor` warns `helpers.orphans: N orphaned helper process(es)`; `ps`
+shows more than one `minions coordinator supervise` or `minions work dispatch` for the project, some of
+them days old; sessions or autopilot workers act on state that no longer matches `minions status`.
+
+A state restore (`minions import --state`) moves the live database to `<state>/pre-restore/<time>/` and
+swaps the backup in. A supervisor or dispatcher that was running keeps the old database file open and
+still sees itself as the lock holder there. Current versions refuse the restore while either runs (or stop
+them with `--force`), and both exit by themselves once they notice the database file was replaced. Older
+versions, or a helper started between the stop and the swap, can leave such a pair running. Doctor lists
+each process whose working directory is this project's state dir but which does not hold its lock in the
+current database, with the command to stop it; it never stops anything itself:
+
+```sh
+minions doctor                               # helpers.orphans: the pids and the exact kill command
+ps -o pid,lstart,command -p <pid>,<pid>      # confirm they are the old `coordinator supervise` / `work dispatch`
+kill <pid> <pid>                             # SIGTERM: they stop their sessions and workers first
+```
+
+The lock holders keep running; the coordinator starts a helper again by itself when its lock is missing or stale.
+
 ## A lease is stuck
 
 Symptoms: `minions status` shows a worker on a task for far longer than its turn limit, the task never
@@ -143,22 +174,18 @@ minions status --check        # telegram, telegram.credential, telegram.bot, tel
   `minions settings restart` (or `minions down && minions start`). Never start an interactive `claude`
   in the container: it takes over the bot.
 
-## Token problems (GitHub or Telegram)
+## Token problems (Telegram)
 
-Symptoms: push or pull-request delivery fails with an authentication error, `minions work publish`
-reports a credential error, `minions status` lists "credential mounts changed or missing" under
-restart-required, the bot does not start.
+Symptoms: `minions status` lists "credential mounts changed or missing" under restart-required, the bot
+does not start.
 
 ```sh
-minions auth github                     # store a new fine-grained token (prompted without echo; --stdin to pipe it)
-minions auth github --remove            # delete a revoked token
 minions auth telegram                   # store a new bot token (BotFather /token or /revoke)
 minions upgrade                         # mount the new token copies and restart the coordinator
                                         # (host runtime: minions down && minions start)
-minions work publish <taskId>           # retry a failed publication (idempotent)
 ```
 
-`minions setup github` walks through the remote, base branch and token again. Tokens are stored only on
+Tokens are stored only on
 the host (Keychain or a 0600 file) and copied into the runtime's read-only secrets mount at start and
 on `minions upgrade`; they never enter the state volume or a state backup.
 
@@ -178,6 +205,46 @@ upgrade prints the exact command (or rerun with `--rebuild-cli` in a minions che
 Host runtime: upgrades are `minions down && minions start` after installing the new CLI. If the state
 is damaged after an upgrade, restore the backup you took before it (`minions import --state <file>`),
 then `minions settings restart`.
+
+## The verification gate fails under load
+
+The coordinator verifies each merge on the merged tree (`git merge --no-ff
+--no-commit`, then the verification commands) while engineers and testers run their own suites in the
+same container. Two kinds of failure come from that load, not from the change:
+
+- **Timeouts.** A test that passes alone fails on its time limit. Raise the test runner's default
+  timeout moderately and make tests that assert wall-clock bounds deterministic (inject the clock or
+  the budget, wait on events instead of fixed sleeps). Do not add blanket retries: they hide real
+  failures.
+- **The process limit.** The container's `pids_limit` (`container.pidsLimit`, default 512) counts
+  threads, not just processes. When it is reached the suite crashes rather than fails: `failed to
+  create new OS thread ... errno=11`, `spawn ... EAGAIN`, `cannot fork()`, a test runner `EPIPE`.
+  Check with `cat /sys/fs/cgroup/pids.current /sys/fs/cgroup/pids.max` inside the container. Bound the
+  suite's own concurrency so that the gate and two worker suites fit together, or raise the limit on
+  the host with `minions settings set container.pidsLimit <n>` (applied when the container is
+  recreated).
+
+This repository's own `vitest.config.ts` does both: a 20 s default test timeout, at most 4 test
+workers (`MINIONS_TEST_MAX_WORKERS` overrides it), and fewer threads per spawned process
+(`--v8-pool-size=1` in `NODE_OPTIONS`, `UV_THREADPOOL_SIZE=2`, and `BUN_JSC_useConcurrentJIT=0` for the
+Bun-built `backlog` CLI). One full `npm test` peaks near 120 threads that way, down from about 190 with
+vitest's per-core default, so three suites fit next to the coordinator and its workers.
+`npm test` runs two vitest projects: `npm run test:unit` (no subprocesses; any spawn fails the run) and
+`npm run test:integration` (the files listed in `test/tiers.ts`, which run git, the CLI, `backlog`, and
+other children). Workers follow one testing rule: engineers run the typecheck and the unit tier (targeted
+files while iterating), reviewers run no tests, task testers run targeted checks, and only the local
+integration gate (and QA sweeps) run the integration tier or the full suite. Nobody reruns tests on the
+base branch for a baseline. `minions work record` refuses a `complete` engineer result that reports a
+failing check, a skipped verification command, or no passing test run.
+
+The integration tier is kept small (task-137): on 2026-11-14 it was 60 files, 736 tests and 147 s of summed
+test time, down from 162 files, 3246 tests and 736 s on 2026-10-30. What stays there runs real processes
+end to end: the Docker image and container, the built CLI and its git-URL install, the real Backlog.md CLI,
+host setup, upgrade and the host runtime's processes, the coordinator lock and permission mode, the
+worker runner and the local integration gate over real git, the sandbox and harness runners, coordinator
+sessions and the supervisor, the hook shell entry points, the Telegram channel launch, and the dev
+self-update script. `test/tiers.test.ts` caps the list at 65 entries: write a new test as a unit test on
+the in-memory git fakes (`test/host/fs-git.ts`, `test/runtime/fake-git.ts`) unless it needs a real process.
 
 ## Still stuck
 

@@ -1,0 +1,431 @@
+// The autopilot dispatcher (docs/design/autonomy.md Decision 1): stages move dev -> review -> delivered without the
+// coordinator; decisions park the task (a hold) and reach the coordinator.
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { describe, expect, it, vi } from 'vitest';
+import type { MinionsConfig } from '../../src/config/schema.js';
+import { DISPATCH_HOLDER, Dispatcher, clearHold, readHolds, workerPrompt, type DispatchHold, type DispatcherDeps, type LaunchInput, type WorkerExit, type WorkerHandle } from '../../src/runtime/dispatcher.js';
+import { claimWithBrief, submitResult, type HandoffPaths } from '../../src/runtime/handoff.js';
+import { Scheduler, VERIFY_FULL_LABEL } from '../../src/runtime/scheduler.js';
+import { asWorkerInput, preBashHook, stopHook, WORKER_LEASE_ENV } from '../../src/runtime/hooks.js';
+import { parseStreamLine, summarizeWorkerLog, workerEnv } from '../../src/runtime/dispatch-launch.js';
+import { collectWakeReasons } from '../../src/runtime/routine.js';
+import type { VerifyResult } from '../../src/runtime/integrator.js';
+import { pending } from '../../src/runtime/outbox.js';
+import { PERIODIC_META, type VerifyRun } from '../../src/runtime/verify-step.js';
+import { commitFile, makeDefaultEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
+
+const paths = (env: Env): HandoffPaths & { state: string } => ({ briefs: join(env.root, 'state', 'briefs'), results: join(env.root, 'state', 'results'), state: join(env.root, 'state') });
+
+/** What a fake worker does for a role: commit (producers) and submit `over`, or submit nothing. */
+type Script = (i: LaunchInput) => Record<string, unknown> | null;
+
+const exit = (over: Partial<WorkerExit> = {}): WorkerExit => ({ code: 0, signal: null, stopped: null, tokens: 1000, model: 'sonnet', sessionId: 'sess-1', stderrTail: '', spawnError: null, ...over });
+
+function setup(script: Script, mutate?: (c: MinionsConfig) => void, exitOf: (i: LaunchInput) => WorkerExit = () => exit(), extra: Partial<DispatcherDeps> = {}) {
+  const env = makeDefaultEnv((c) => { mutate?.(c); });
+  const launches: LaunchInput[] = [];
+  const notified: DispatchHold[] = [];
+  const launch = async (i: LaunchInput): Promise<WorkerHandle> => {
+    launches.push(i);
+    const over = script(i);
+    if (over) {
+      const head = i.claim.role === 'engineer' ? commitFile(i.claim.worktree, `${i.claim.leaseId}-${launches.length}.txt`, 'work') : env.db.lease(i.claim.leaseId)!.head_sha ?? i.claim.expectedHead;
+      await submitResult(env.db, paths(env), i.claim.leaseId, JSON.stringify(result({ branch: i.claim.branch, headSha: head, ...over })), { role: i.claim.role, cwd: i.claim.worktree });
+    }
+    return { done: Promise.resolve(exitOf(i)), pid: () => 4242, sessionId: () => 'sess-1' };
+  };
+  const disp = new Dispatcher({
+    db: env.db, paths: paths(env), config: async () => structuredClone(env.config),
+    // As in production: a scheduler on each pass's fresh config.
+    scheduler: async (cfg) => new Scheduler({ db: env.db, backlog: env.backlog, config: cfg, layout: env.layout, handoff: paths(env) }), launch,
+    taskStatus: async (_s, id) => (await env.backlog.getTask(id)).status, notify: (h) => { notified.push(h); }, ...extra,
+  });
+  return { env, disp, launches, notified };
+}
+
+/** Passes until nothing starts (each started worker's exit is recorded before the next pass). */
+async function drive(disp: Dispatcher, max = 10): Promise<number> {
+  let started = 0;
+  for (let i = 0; i < max; i++) {
+    const r = await disp.pass();
+    await disp.settled();
+    if (!r.started.length && !r.verifying) break;
+    started += r.started.length;
+  }
+  return started;
+}
+
+describe('dispatcher: the automatic flow', () => {
+  it('takes a ready task through engineer and reviewer to delivered without the coordinator', async () => {
+    const { env, disp, launches, notified } = setup((i) => (i.claim.role === 'reviewer' ? { verdict: 'approve' } : {}));
+    env.backlog.add({ id: 'task-1' });
+    expect(await drive(disp)).toBe(2);
+    expect(launches.map((l) => `${l.stage.taskId}:${l.stage.role}`)).toEqual(['task-1:engineer', 'task-1:reviewer']);
+    expect(launches[0]!.stage.agentType).toBe('minions:engineer');
+    expect((await env.backlog.getTask('task-1')).status).toBe('delivered');
+    expect(env.db.all<{ holder: string }>('SELECT holder FROM leases').every((l) => l.holder === DISPATCH_HOLDER)).toBe(true);
+    expect(notified).toEqual([]);
+    expect(readHolds(env.db)).toEqual({});
+  });
+
+  it('a workflow change applies to the next stage: dropping the tester while the engineer runs', async () => {
+    let env!: Env;
+    const { env: e, disp, launches } = setup((i) => {
+      if (i.claim.role === 'engineer') env.config.workflows = { default: ['engineer', 'reviewer'] }; // `minions control set ...`
+      return i.claim.role === 'reviewer' ? { verdict: 'approve' } : {};
+    }, (c) => { c.workflows = { default: ['engineer', 'tester', 'reviewer'] }; });
+    env = e;
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer']);
+    expect((await env.backlog.getTask('task-1')).status).toBe('delivered');
+  });
+
+  it('a task already waiting for a removed stage moves on to the next one', async () => {
+    let env!: Env;
+    const { env: e, disp, launches } = setup((i) => (i.claim.role === 'reviewer' ? { verdict: 'approve' } : {}), (c) => { c.workflows = { default: ['engineer', 'tester', 'reviewer'] }; });
+    env = e;
+    env.backlog.add({ id: 'task-1' });
+    await disp.pass(); await disp.settled(); // engineer -> testing
+    expect((await env.backlog.getTask('task-1')).status).toBe('testing');
+    env.config.workflows = { default: ['engineer', 'reviewer'] };
+    await drive(disp);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer']);
+    expect((await env.backlog.getTask('task-1')).status).toBe('delivered');
+  });
+
+  it('the flow decides whether the work lands: with local integration on, a flow without merge stops at delivered', async () => {
+    const { env, disp } = setup((i) => (i.claim.role === 'reviewer' ? { verdict: 'approve' } : {}), (c) => {
+      c.delivery.merge = 'auto-when-eligible'; c.verification.commands = ['npm test'];
+      c.workflows = { review: ['engineer', 'reviewer', 'ci'], land: ['engineer', 'reviewer', 'ci', 'merge'] };
+    });
+    env.backlog.add({ id: 'task-1', workflow: 'review' } as never);
+    env.backlog.add({ id: 'task-2', workflow: 'land' } as never);
+    env.config.execution.maxActiveTasks = 2; env.config.execution.maxEngineers = 2;
+    await drive(disp);
+    expect((await env.backlog.getTask('task-1')).status).toBe('delivered');
+    expect((await env.backlog.getTask('task-2')).status).toBe('merging');
+  });
+
+  it('runs a repair cycle on its own: reviewer request-changes -> engineer -> reviewer', async () => {
+    let reviews = 0;
+    const { env, disp, launches } = setup((i) => {
+      if (i.claim.role !== 'reviewer') return {};
+      return ++reviews === 1 ? { status: 'needs_changes', verdict: 'request-changes', findings: ['add a test'] } : { verdict: 'approve' };
+    });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer', 'engineer', 'reviewer']);
+    expect((await env.backlog.getTask('task-1')).status).toBe('delivered');
+  });
+
+  it('a worker that ends without a result parks the task for the coordinator and frees the lease', async () => {
+    const { env, disp, notified } = setup(() => null);
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(env.db.activeLeases()).toEqual([]);
+    expect(readHolds(env.db)['task-1']).toMatchObject({ kind: 'no-result', leaseId: expect.stringMatching(/^lease-/) });
+    expect(notified.map((h) => h.kind)).toEqual(['no-result']);
+    // Held: never claimed again until the coordinator acts.
+    expect((await disp.pass()).started).toEqual([]);
+    expect(collectWakeReasons(env.db)).toEqual([expect.objectContaining({ kind: 'dispatch-decision', taskId: 'task-1' })]);
+    expect(clearHold(env.db, 'task-1', 'handled')).toBe(true);
+    expect((await disp.pass()).started.map((s) => s.taskId)).toEqual(['task-1']);
+  });
+
+  it('a worker stopped for a drain is released without a decision; the stage stays runnable', async () => {
+    const { env, disp, notified } = setup(() => null, undefined, () => exit({ stopped: 'drain', code: null, signal: 'SIGINT' }));
+    env.backlog.add({ id: 'task-1' });
+    await disp.pass(); await disp.settled();
+    expect(env.db.activeLeases()).toEqual([]);
+    expect(readHolds(env.db)).toEqual({});
+    expect(notified).toEqual([]);
+  });
+
+  it('a failure while recording never leaves the lease active: it is released and the task held', async () => {
+    const { env, disp } = setup(() => ({}));
+    env.backlog.add({ id: 'task-1' });
+    let n = 0;
+    // The pass reads the config once; the exit handling's first read fails.
+    (disp as unknown as { d: { config: () => Promise<MinionsConfig> } }).d.config = async () => { if (n++ === 1) throw new Error('config unreadable'); return structuredClone(env.config); };
+    await disp.pass();
+    await disp.settled();
+    expect(env.db.activeLeases()).toEqual([]);
+    expect(readHolds(env.db)['task-1']).toMatchObject({ kind: 'no-result' });
+  });
+
+  it('a hold clears itself when the coordinator changes the task status', async () => {
+    const { env, disp } = setup((i) => (i.claim.role === 'engineer' ? { status: 'blocked', findings: ['needs a key'] } : { verdict: 'approve' }));
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    const h = readHolds(env.db)['task-1'];
+    expect(h?.kind).toBe('blocked');
+    const t = await env.backlog.getTask('task-1');
+    await env.backlog.updateTask('task-1', t.version, { status: 'ready' }); // the coordinator unblocked it
+    const r = await disp.pass();
+    expect(r.cleared).toEqual(['task-1']);
+  });
+
+  it('an invalid result gets one automatic correction on the same lease, with the errors', async () => {
+    let n = 0;
+    const { env, disp, launches } = setup((i) => {
+      if (i.claim.role === 'reviewer') return { verdict: 'approve' };
+      n++;
+      return n === 1 ? { checks: [{ command: 'npm test', outcome: 'fail' }] } : {};
+    });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(launches[1]).toMatchObject({ correction: { resume: 'sess-1' } });
+    expect(launches[1]!.claim.leaseId).toBe(launches[0]!.claim.leaseId);
+    expect(launches[1]!.correction!.errors.length).toBeGreaterThan(0);
+    expect(workerPrompt(launches[1]!.claim, launches[1]!.correction)).toMatch(/rejected[\s\S]*only correction/);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'engineer', 'reviewer']);
+  });
+
+  it('recovers a previous dispatcher\'s lease: a submitted result is recorded, one without is released', async () => {
+    const { env, disp } = setup((i) => (i.claim.role === 'reviewer' ? { verdict: 'approve' } : {}), (c) => { c.execution.maxActiveTasks = 2; c.execution.maxEngineers = 2; });
+    env.backlog.add({ id: 'task-1' });
+    env.backlog.add({ id: 'task-2' });
+    const a = await claimWithBrief(env.sched, paths(env), 'task-1', undefined, { holder: DISPATCH_HOLDER });
+    const head = commitFile(a.worktree, 'x.txt', 'x');
+    await submitResult(env.db, paths(env), a.leaseId, JSON.stringify(result({ branch: a.branch, headSha: head })), { role: a.role, cwd: a.worktree });
+    const b = await claimWithBrief(env.sched, paths(env), 'task-2', undefined, { holder: DISPATCH_HOLDER });
+    const r = await disp.recover();
+    expect(r).toEqual({ recorded: [a.leaseId], released: [b.leaseId], adopted: [] });
+    expect((await env.backlog.getTask('task-1')).status).toBe('reviewing');
+    expect(env.db.activeLeases()).toEqual([]);
+  });
+});
+
+describe('dispatcher: the verify step and periodic verification (docs/design/autonomy.md Decision 12)', () => {
+  /** A fake verifier: answers each run from `answer` and records it. */
+  function verifier(answer: (r: VerifyRun) => VerifyResult = () => ({ state: 'passed' })) {
+    const runs: VerifyRun[] = [];
+    return { runs, verify: async (r: VerifyRun) => { runs.push(r); return answer(r); } };
+  }
+  const approve: Script = (i) => (i.claim.role === 'reviewer' ? { verdict: 'approve' } : {});
+  const unit = (c: MinionsConfig) => { c.verification.commands = ['npm run test:unit']; };
+
+  it('verifies the engineer head before the reviewer starts; green records the tree and the reviewer runs on that head', async () => {
+    const v = verifier();
+    const { env, disp, launches } = setup(approve, unit, undefined, { verify: v.verify });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer']);
+    const head = env.db.leases({ taskId: 'task-1', all: true })[0]!.head_sha!;
+    expect(v.runs).toEqual([expect.objectContaining({ key: 'task-1', head, commands: ['npm run test:unit'] })]);
+    expect(launches[1]!.claim.expectedHead).toBe(head);
+    const ev = env.db.evidenceFor('task-1', head, 'verify');
+    expect(ev).toEqual([expect.objectContaining({ outcome: 'pass' })]);
+    expect(JSON.parse(ev[0]!.details_json!)).toMatchObject({ tree: expect.stringMatching(/^[0-9a-f]{40}$/), commands: ['npm run test:unit'] });
+    expect((await env.backlog.getTask('task-1')).status).toBe('delivered');
+  });
+
+  it('a task at its per-task spend cap is still verified; its reviewer waits and the owner is told once', async () => {
+    vi.stubEnv('MINIONS_AUTH_METHOD', 'api-key');
+    try {
+      const v = verifier();
+      // 3M sonnet tokens: ~$9 at the input rate, over the $5 cap.
+      const { env, disp, launches } = setup(approve, (c) => { unit(c); c.budgets = { dailyUsd: null, taskUsd: 5 }; }, () => exit({ tokens: 3_000_000 }), { verify: v.verify });
+      env.backlog.add({ id: 'task-1' });
+      await drive(disp);
+      await disp.pass(); await disp.settled();
+      expect(launches.map((l) => l.stage.role)).toEqual(['engineer']);
+      expect(v.runs.map((r) => r.key)).toEqual(['task-1']);
+      const notices = pending(env.db, { includeWaiting: true }).filter((n) => n.key.startsWith('budget-cap:'));
+      expect(notices.map((n) => [n.key, n.taskId])).toEqual([['budget-cap:task:task-1:5', 'task-1']]);
+      expect(notices[0]!.text).toMatch(/^task-1 reached the per-task spend cap: ~\$9\.00 of \$5 \(estimated\)\. Its reviewer stage waits/);
+      env.config.budgets = { dailyUsd: null, taskUsd: 20 }; // the owner's /budget task 20
+      await drive(disp);
+      expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer']);
+      expect(v.runs).toHaveLength(1);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('per-task token cap on a subscription: the stage waits, the owner is told and the task is held for the coordinator once', async () => {
+    const v = verifier();
+    const { env, disp, launches, notified } = setup(approve, (c) => { unit(c); c.budgets = { dailyUsd: null, taskUsd: null, taskTokens: 2_000_000 }; }, () => exit({ tokens: 3_000_000 }), { verify: v.verify });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    await disp.pass(); await disp.settled();
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer']);
+    expect(v.runs.map((r) => r.key)).toEqual(['task-1']); // verification spends no tokens: still runs
+    const notices = pending(env.db, { includeWaiting: true }).filter((n) => n.key.startsWith('budget-cap:'));
+    expect(notices.map((n) => [n.key, n.taskId])).toEqual([['budget-cap:task:task-1:tokens:2000000', 'task-1']]);
+    expect(notices[0]!.text).toMatch(/^task-1 reached the per-task spend cap: 3M of 2M tokens\. Its reviewer stage waits/);
+    expect(notified.map((h) => [h.taskId, h.kind])).toEqual([['task-1', 'budget-cap']]);
+    expect(readHolds(env.db)['task-1']).toMatchObject({ kind: 'budget-cap', message: expect.stringContaining('ask the owner for a higher cap') });
+    // The coordinator resumes it without a higher cap: the stage still waits and the task is not held again.
+    clearHold(env.db, 'task-1', 'test');
+    await disp.pass(); await disp.settled();
+    expect(launches).toHaveLength(1);
+    expect(notified).toHaveLength(1);
+    expect(readHolds(env.db)).toEqual({});
+    // The owner raises the cap: the stage runs.
+    env.config.budgets = { dailyUsd: null, taskUsd: null, taskTokens: 10_000_000 };
+    await drive(disp);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer']);
+  });
+
+  it('a cap hold clears itself when the owner raises the cap', async () => {
+    const { env, disp, launches } = setup(approve, (c) => { unit(c); c.budgets = { dailyUsd: null, taskUsd: null, taskTokens: 2_000_000 }; }, () => exit({ tokens: 3_000_000 }));
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(readHolds(env.db)['task-1']?.kind).toBe('budget-cap');
+    env.config.budgets = { dailyUsd: null, taskUsd: null, taskTokens: null };
+    await drive(disp);
+    expect(readHolds(env.db)).toEqual({});
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer']);
+  });
+
+  it('daily token cap on a subscription: a notice at 50% and 80%, then nothing starts at the cap', async () => {
+    const { env, disp, launches } = setup(approve, (c) => { unit(c); c.budgets = { dailyUsd: null, taskUsd: null, dailyTokens: 10_000_000 }; });
+    const coordinator = (tokens: number) => env.db.addEvent('usage', null, { key: 'session:s1', scope: 'session', session: 's1', tokens, model: 'sonnet', source: 'transcript' });
+    const caps = () => pending(env.db, { includeWaiting: true }).filter((n) => n.key.startsWith('budget-cap:')).map((n) => [n.key.replace(/\d{4}-\d{2}-\d{2}/, 'DAY'), n.kind]);
+    coordinator(4_000_000);
+    await disp.pass();
+    expect(caps()).toEqual([]);
+    coordinator(5_500_000);
+    await disp.pass(); await disp.pass();
+    expect(caps()).toEqual([['budget-cap:day-warn:DAY:tokens:10000000:50', 'status']]);
+    coordinator(8_500_000);
+    await disp.pass();
+    expect(caps()).toEqual([['budget-cap:day-warn:DAY:tokens:10000000:50', 'status'], ['budget-cap:day-warn:DAY:tokens:10000000:80', 'status']]);
+    coordinator(10_000_000);
+    env.backlog.add({ id: 'task-1' });
+    const r = await disp.pass(); await disp.settled();
+    expect(launches).toEqual([]);
+    expect(r.blocked).toMatch(/^Daily spend cap reached: 10M of 10M tokens today/);
+    expect(caps().at(-1)).toEqual(['budget-cap:day:DAY:tokens:10000000', 'blocker']);
+  });
+
+  it('at the daily cap: nothing starts, a stage waiting for verification is still verified, one notice per day', async () => {
+    vi.stubEnv('MINIONS_AUTH_METHOD', 'api-key');
+    try {
+      const v = verifier();
+      const { env, disp, launches } = setup(approve, (c) => { unit(c); c.budgets = { dailyUsd: 5, taskUsd: null }; }, () => exit({ tokens: 3_000_000 }), { verify: v.verify });
+      env.backlog.add({ id: 'task-1' });
+      await drive(disp);
+      await disp.pass(); await disp.settled();
+      expect(launches.map((l) => l.stage.role)).toEqual(['engineer']);
+      expect(v.runs.map((r) => r.key)).toEqual(['task-1']);
+      const notices = pending(env.db, { includeWaiting: true }).filter((n) => n.key.startsWith('budget-cap:'));
+      expect(notices.map((n) => n.key)).toEqual([expect.stringMatching(/^budget-cap:day:\d{4}-\d{2}-\d{2}:5$/)]);
+      expect(notices[0]!.text).toMatch(/^Daily spend cap reached: ~\$9\.00 of \$5 \(estimated\) today/);
+    } finally { vi.unstubAllEnvs(); }
+  });
+
+  it('red: back to the engineer as a counted repair with the failing command and output tail in its brief', async () => {
+    let n = 0;
+    const v = verifier(() => (++n === 1 ? { state: 'red', command: 'npm run test:unit', detail: '`npm run test:unit` failed twice\nexpected 2 to be 3' } : { state: 'passed' }));
+    const briefs: { priorFindings: { role: string; findings: unknown[] }[] }[] = [];
+    const { env, disp, launches, notified } = setup((i) => {
+      if (i.claim.role === 'engineer') briefs.push(JSON.parse(readFileSync(join(paths(env).briefs, `${i.claim.leaseId}.json`), 'utf8')));
+      return approve(i);
+    }, unit, undefined, { verify: v.verify });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'engineer', 'reviewer']);
+    expect(env.db.repairCycles('task-1')).toBe(1);
+    const finding = briefs[1]!.priorFindings.find((f) => f.role === 'verify')!;
+    expect(finding.findings.join('\n')).toMatch(/verification failed at [0-9a-f]{40}: `npm run test:unit`[\s\S]*expected 2 to be 3/);
+    expect(briefs[0]!.priorFindings.some((f) => f.role === 'verify')).toBe(false);
+    expect(notified).toEqual([]);
+    expect((await env.backlog.getTask('task-1')).status).toBe('delivered');
+  });
+
+  it('red at the repair limit: awaiting-human and a replan hold', async () => {
+    const v = verifier(() => ({ state: 'red', command: 'npm run test:unit', detail: 'boom' }));
+    const { env, disp, notified } = setup(approve, (c) => { unit(c); c.execution.maxRepairCyclesBeforeReplan = 1; }, undefined, { verify: v.verify });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect((await env.backlog.getTask('task-1')).status).toBe('awaiting-human');
+    expect(notified.map((h) => h.kind)).toEqual(['replan']);
+  });
+
+  it('transient (a setup problem): blocked with a setup hint and a hold, no repair cycle', async () => {
+    const v = verifier(() => ({ state: 'transient', detail: '`npm run test:unit` failed (exit 127: command not found): a setup problem' }));
+    const { env, disp, launches, notified } = setup(approve, unit, undefined, { verify: v.verify });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer']);
+    expect((await env.backlog.getTask('task-1')).status).toBe('blocked');
+    expect(env.db.repairCycles('task-1')).toBe(0);
+    expect(notified).toEqual([expect.objectContaining({ kind: 'blocked', message: expect.stringMatching(/a setup problem, not a code failure.*verification\.setupCommands/) })]);
+  });
+
+  it('no verification commands: no verify step; verify:full adds the periodic commands', async () => {
+    const v = verifier();
+    const { env, disp, launches } = setup(approve, (c) => { c.verification.commands = []; }, undefined, { verify: v.verify });
+    env.backlog.add({ id: 'task-1' });
+    await drive(disp);
+    expect(launches.map((l) => l.stage.role)).toEqual(['engineer', 'reviewer']);
+    expect(v.runs).toEqual([]);
+
+    const w = verifier();
+    const full = setup(approve, (c) => { unit(c); c.verification.periodic = { commands: ['npm run test:integration'] }; c.execution.maxActiveTasks = 2; c.execution.maxEngineers = 2; },
+      undefined, { verify: w.verify, now: () => new Date('2026-01-01T00:00:00Z') });
+    full.env.db.setMeta(PERIODIC_META, JSON.stringify({ base: full.env.baseSha, at: '2026-01-01T00:00:00Z', outcome: 'passed' })); // not due
+    full.env.backlog.add({ id: 'task-1', labels: [VERIFY_FULL_LABEL] });
+    await drive(full.disp);
+    expect(w.runs.map((r) => r.commands)).toEqual([['npm run test:unit', 'npm run test:integration']]);
+  });
+
+  it('periodic: runs on the base head when due and moved; a failure files one verify:periodic task and a notice, never a duplicate', async () => {
+    let now = new Date('2026-01-01T00:00:00Z');
+    const v = verifier((r) => (r.key === 'periodic' ? { state: 'red', command: 'npm run test:integration', detail: 'it broke' } : { state: 'passed' }));
+    const { env, disp } = setup(approve, (c) => { unit(c); c.verification.periodic = { commands: ['npm run test:integration'], everyHours: 24 }; }, undefined, { verify: v.verify, now: () => now });
+    const periodic = () => v.runs.filter((r) => r.key === 'periodic');
+    await drive(disp);
+    expect(periodic()).toEqual([expect.objectContaining({ key: 'periodic', head: env.baseSha, commands: ['npm run test:integration'] })]);
+    const filed = [...env.backlog.tasks.values()].filter((t) => t.labels.includes('verify:periodic'));
+    expect(filed.map((t) => t.title)).toEqual([`Periodic verification failed on ${env.baseSha.slice(0, 12)}: npm run test:integration`]);
+    expect(pending(env.db, { includeWaiting: true }).filter((n) => n.key.startsWith('verify-periodic:'))).toHaveLength(1);
+
+    // Due but the base did not move, or moved but not due yet: no run.
+    now = new Date('2026-01-02T01:00:00Z');
+    await drive(disp);
+    now = new Date('2026-01-01T12:00:00Z');
+    commitFile(env.layout.repo, 'later.txt', 'merged');
+    await drive(disp);
+    expect(periodic()).toHaveLength(1);
+    // Due and moved: runs again; the open (here delivered, not yet on the base) task is not duplicated.
+    now = new Date('2026-01-02T01:00:00Z');
+    await drive(disp);
+    expect(periodic()).toHaveLength(2);
+    expect([...env.backlog.tasks.values()].filter((t) => t.labels.includes('verify:periodic'))).toHaveLength(1);
+  });
+});
+
+describe('headless worker plumbing', () => {
+  it('hooks treat a headless worker as a worker, never as the coordinator', async () => {
+    const input = { tool_name: 'Bash', tool_input: { command: 'minions work claim task-9' }, cwd: '/workspace/repo' };
+    expect(asWorkerInput(input, {})).toBe(input);
+    const w = asWorkerInput(input, { [WORKER_LEASE_ENV]: 'lease-1', MINIONS_WORKER_ROLE: 'engineer' }) as Record<string, unknown>;
+    expect(w).toMatchObject({ agent_id: 'headless-lease-1', agent_type: 'minions:engineer' });
+    expect(preBashHook(input).reason).toMatch(/^allow/);
+    expect(preBashHook(w).reason).toMatch(/^deny/);
+    const stop = await stopHook({}, async () => { throw new Error('not loaded'); }, { [WORKER_LEASE_ENV]: 'lease-1' });
+    expect(stop.reason).toMatch(/allow: headless worker/);
+  });
+
+  it('the worker env carries the lease marker and never the coordinator\'s Telegram or credentials', () => {
+    const env = workerEnv({ PATH: '/bin', TELEGRAM_BOT_TOKEN: 'x', GH_TOKEN: 'y', ANTHROPIC_API_KEY: 'z', MINIONS_SESSION: 'general', SECRET_THING: 's' }, '/state/run/dispatch/config/lease-1',
+      { method: 'login', envName: 'CLAUDE_CODE_OAUTH_TOKEN', token: 'tok', source: 'f' }, { leaseId: 'lease-1', role: 'engineer', tmp: '/tmp/x', scratchDir: '/scratch/lease-1' });
+    expect(env).toMatchObject({ PATH: '/bin', MINIONS_WORKER_LEASE: 'lease-1', MINIONS_WORKER_ROLE: 'engineer', CLAUDE_CODE_OAUTH_TOKEN: 'tok', TMPDIR: '/scratch/lease-1', CLAUDE_CONFIG_DIR: '/state/run/dispatch/config/lease-1' });
+    for (const k of ['TELEGRAM_BOT_TOKEN', 'GH_TOKEN', 'ANTHROPIC_API_KEY', 'MINIONS_SESSION', 'SECRET_THING']) expect(env).not.toHaveProperty(k);
+  });
+
+  it('reads usage and the session id from the stream-json log', () => {
+    const log = [
+      JSON.stringify({ type: 'system', subtype: 'init', session_id: 'abc-123', model: 'claude-sonnet' }),
+      'some stderr line',
+      JSON.stringify({ type: 'result', session_id: 'abc-123', usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 100, cache_creation_input_tokens: 1 } }),
+    ].join('\n');
+    expect(parseStreamLine('not json')).toBeNull();
+    expect(summarizeWorkerLog(log)).toEqual({ tokens: 116, model: 'claude-sonnet', sessionId: 'abc-123', tail: 'some stderr line' });
+  });
+});

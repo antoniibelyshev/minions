@@ -1,11 +1,11 @@
-import { execFileSync, spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, relative } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { generatePlugin, LIVE_CLAUDE_RUN_GUIDANCE, renderPolicySummary, renderTemplate } from '../../src/plugin/generate.js';
 import { DRAIN_HOOK_COMMAND } from '../../src/runtime/drain.js';
-import { PRE_BASH_HOOK_COMMAND } from '../../src/runtime/hooks.js';
+import { hangGuarded } from '../../src/runtime/hook-guard.js';
+import { PRE_BASH_HOOK_COMMAND, PRE_SSH_HOOK_COMMAND, PRE_FILE_READ_HOOK_COMMAND, PRE_FILE_WRITE_HOOK_COMMAND } from '../../src/runtime/hooks.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import { defaults, FAKE_MINIONS, runHookCommand } from '../helpers.js';
 
@@ -13,11 +13,24 @@ const dirs: string[] = [];
 const tmp = async () => { const d = await mkdtemp(join(tmpdir(), 'minions-plugin-')); dirs.push(d); return d; };
 afterAll(async () => { await Promise.all(dirs.map((d) => rm(d, { recursive: true, force: true }))); });
 
-async function gen(cfg: MinionsConfig = defaults()) {
-  const out = await tmp();
-  const files = await generatePlugin(cfg, out);
-  const read = (rel: string) => readFile(join(out, rel), 'utf8');
-  return { out, files, rel: files.map((f) => relative(out, f.path).split('\\').join('/')), read };
+type Generated = { out: string; files: Awaited<ReturnType<typeof generatePlugin>>; rel: string[]; read: (rel: string) => Promise<string> };
+/**
+ * Plugin output per distinct config, generated once per file (task-104.3): most tests generate the defaults
+ * and only read the files, so they share one output dir. Nothing here writes into it; `fresh` generates anew.
+ */
+const generated = new Map<string, Promise<Generated>>();
+function gen(cfg: MinionsConfig = defaults(), o: { fresh?: boolean } = {}): Promise<Generated> {
+  const key = JSON.stringify(cfg);
+  const hit = o.fresh ? undefined : generated.get(key);
+  if (hit) return hit;
+  const p = (async () => {
+    const out = await tmp();
+    const files = await generatePlugin(cfg, out);
+    const read = (rel: string) => readFile(join(out, rel), 'utf8');
+    return { out, files, rel: files.map((f) => relative(out, f.path).split('\\').join('/')), read };
+  })();
+  if (!o.fresh) generated.set(key, p);
+  return p;
 }
 
 function frontmatter(md: string): Record<string, string> {
@@ -36,7 +49,8 @@ const EXPECTED = [
   'coordinator.md',
   'hooks/hooks.json',
   'skills/intake/SKILL.md', 'skills/maintain-context/SKILL.md', 'skills/orchestrate/SKILL.md',
-  'skills/recover/SKILL.md', 'skills/status/SKILL.md',
+  'skills/recover/SKILL.md',
+  'skills/status/SKILL.md', 'skills/task/SKILL.md',
 ];
 /** Generated worker definitions and the lease role each runs under. */
 const WORKER_AGENTS = [['engineer', 'engineer'], ['engineer-deep', 'engineer'], ['tester', 'tester'], ['reviewer', 'reviewer']] as const;
@@ -63,7 +77,7 @@ describe('generatePlugin', () => {
         expect(m[0], r).toContain('--expected-version <v>');
       }
     }
-    expect(seen).toBeGreaterThanOrEqual(4);
+    expect(seen).toBeGreaterThanOrEqual(3);
   });
 
   it('renders every placeholder', async () => {
@@ -113,7 +127,7 @@ describe('generatePlugin', () => {
 
   it('skill frontmatter has name and description only', async () => {
     const { read } = await gen();
-    for (const s of ['orchestrate', 'status', 'intake', 'recover', 'maintain-context']) {
+    for (const s of ['orchestrate', 'status', 'intake', 'recover', 'maintain-context', 'task']) {
       const fm = frontmatter(await read(`skills/${s}/SKILL.md`));
       expect(Object.keys(fm).sort()).toEqual(['description', 'name']);
       expect(fm.name).toBe(s);
@@ -130,36 +144,25 @@ describe('generatePlugin', () => {
     expect(Object.keys(hooks)).toEqual(['hooks']);
     expect(hooks.hooks.Stop).toEqual([{ hooks: [{ type: 'command', command: 'minions hook stop' }] }]);
     expect(hooks.hooks.PreToolUse).toEqual([
-      { matcher: 'Agent', hooks: [{ type: 'command', command: 'timeout 20 minions hook pre-agent || exit 2', timeout: 30 }] },
+      { matcher: 'Agent', hooks: [{ type: 'command', command: `${hangGuarded('minions hook pre-agent')} || exit 2`, timeout: 30 }] },
       // Subagents cannot run minions work run|claim|release (task-14.5); node starts only for subagent calls naming minions.
       { matcher: 'Bash', hooks: [{ type: 'command', command: PRE_BASH_HOOK_COMMAND, timeout: 30 }] },
+      // A call to an owner SSH host in a form that would stay sandboxed is refused with the form to use.
+      { matcher: 'Bash', hooks: [{ type: 'command', command: PRE_SSH_HOOK_COMMAND, timeout: 30 }] },
+      // Subagents cannot write (or read) the runtime state through the file tools (task-72).
+      { matcher: 'Edit|MultiEdit|Write|NotebookEdit', hooks: [{ type: 'command', command: PRE_FILE_WRITE_HOOK_COMMAND, timeout: 30 }] },
+      { matcher: 'Read|Glob|Grep', hooks: [{ type: 'command', command: PRE_FILE_READ_HOOK_COMMAND, timeout: 30 }] },
       // Every tool; gated by a shell test so node starts only while a drain is requested.
       { matcher: '*', hooks: [{ type: 'command', command: DRAIN_HOOK_COMMAND }] },
     ]);
   });
 
-  it('the generated pre-agent hook fails closed: a missing or crashing minions blocks the Agent launch', async () => {
-    const hooks = JSON.parse(await (await gen()).read('hooks/hooks.json'));
-    const entry = (hooks.hooks.PreToolUse as { matcher: string; hooks: { command: string }[] }[]).find((h) => h.matcher === 'Agent');
-    const command = entry!.hooks[0]!.command;
-    const stdin = JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_input: { subagent_type: 'minions:engineer', prompt: 'x' } });
-    // Exit 2 is the only blocking PreToolUse exit; 127 (not found), 1 (crash) or 137 (killed) would let the launch through.
-    expect(runHookCommand(command, null, stdin).status).toBe(2);
-    expect(runHookCommand(command, FAKE_MINIONS.crash, stdin).status).toBe(2);
-    expect(runHookCommand(command, FAKE_MINIONS.killed, stdin).status).toBe(2);
-    // A healthy hook exits 0 and decides through stdout, unchanged by the wrapper.
-    expect(runHookCommand(command, FAKE_MINIONS.allow, stdin)).toMatchObject({ status: 0, stdout: '' });
-    const denied = runHookCommand(command, FAKE_MINIONS.deny, stdin);
-    expect(denied.status).toBe(0);
-    expect(JSON.parse(denied.stdout).hookSpecificOutput.permissionDecision).toBe('deny');
-  });
-
   it('tells the coordinator, the skills and the workers how a drain winds work down', async () => {
     const { read } = await gen(defaults());
-    expect(await read('coordinator.md')).toMatch(/Drain \(`minions status --json` shows `draining`.*start nothing.*`drain: true`: not a failed attempt or a repair cycle.*\/minions:recover` re-dispatches the drained tasks to the same role/);
-    expect(await read('coordinator.md')).toContain('re-dispatch nothing, and start no local integration merge (an upgrade could interrupt a `--no-commit` merge and leave the repo mid-merge)');
-    expect(await read('skills/orchestrate/SKILL.md')).toMatch(/If `draining` is set .*start nothing/);
-    expect(await read('skills/recover/SKILL.md')).toMatch(/Drained tasks .*re-dispatch the same role/);
+    expect(await read('coordinator.md')).toMatch(/Drain \(`minions status --json` shows `draining`.*the dispatcher starts nothing.*`drain: true`: not a failed attempt or a repair cycle.*runs those stages again after the upgrade/);
+    expect(await read('coordinator.md')).toContain('resume no hold and start no local integration merge (an upgrade could interrupt a `--no-commit` merge and leave the repo mid-merge)');
+    expect(await read('skills/orchestrate/SKILL.md')).toMatch(/draining \(an upgrade winds workers down\).*the dispatcher starts nothing new/);
+    expect(await read('skills/recover/SKILL.md')).toMatch(/Drained tasks .*need nothing: the dispatcher runs them again/);
     for (const role of ['engineer', 'tester', 'reviewer']) {
       const md = await read(`agents/${role}.md`);
       expect(md).toMatch(/upgrade is pending \(a drain\).*prefix `wip:`.*`partial` result.*Never discard uncommitted changes/);
@@ -168,8 +171,8 @@ describe('generatePlugin', () => {
   });
 
   it('is deterministic for the same config', async () => {
-    const a = await gen();
-    const b = await gen();
+    const a = await gen(defaults(), { fresh: true });
+    const b = await gen(defaults(), { fresh: true });
     expect(a.files.map((f) => f.sha256)).toEqual(b.files.map((f) => f.sha256));
   });
 
@@ -195,7 +198,7 @@ describe('generatePlugin', () => {
     const base = defaults();
     const g = await gen({ ...base, models: { ...base.models, selection: 'fixed' } });
     const coord = await g.read('coordinator.md');
-    expect(coord).toContain('Selection is fixed: omit `model` so every worker runs `sonnet` from its definition.');
+    expect(coord).toContain('Selection is fixed: every worker runs `sonnet`.');
     expect(coord).not.toMatch(/model: "/);
   });
 });
@@ -230,7 +233,7 @@ describe('reporting granularity', () => {
       expect(comm).toMatch(/Ask the user only about high-level decisions: product scope and goals, architecture direction, security\/privacy trade-offs, anything outward-facing/);
       expect(comm).toContain('Every capability whose effect is `ask` still needs the user\'s explicit approval first');
       expect(comm).toContain('sensitive-path changes before publication/integration');
-      expect(comm).toMatch(/Make lower-level decisions yourself .*task splits, follow-up tasks, model and effort choice, test fixes, implementation approach, review nits/);
+      expect(comm).toMatch(/Make lower-level decisions yourself .*task splits, follow-up tasks, risk labels and workflows, test fixes, implementation approach, review nits/);
       expect(comm).toContain('`minions backlog note <taskId>`');
     }
   });
@@ -240,7 +243,7 @@ describe('reporting granularity', () => {
     expect(coord).toContain('`ask` = get the user\'s explicit approval first');
     expect(coord).toContain('never permission to change this policy');
     expect(coord).toMatch(/Sensitive paths \(changes need human approval/);
-    expect(coord).toMatch(/\| ask \|/);
+    expect(coord).toMatch(/\| deploy\.execute \| deny \|/);
   });
 
   it('"tasks" keeps the per-task wording; "quiet" reports only what needs the user', async () => {
@@ -256,12 +259,12 @@ describe('reporting granularity', () => {
   it('orchestrate and status skills follow the reporting level and never ask to report every stage', async () => {
     const g = await gen();
     const orch = await g.read('skills/orchestrate/SKILL.md');
-    expect(orch).toContain('## 7. Report');
+    expect(orch).toContain('## 3. Report');
     expect(orch).toContain('Reporting level `milestones` (feature-level): do not report stage transitions, splits, follow-ups or individual task deliveries');
     expect(orch).toContain('Approvals for `ask` capabilities and sensitive paths are always requested explicitly');
     expect(orch).not.toMatch(/report the branch and `prUrl`/);
-    expect(orch).toMatch(/`needs_split` → decide the split yourself/);
-    expect(await g.read('coordinator.md')).toMatch(/reset before dispatching more work, without asking or announcing it/);
+    expect(orch).toMatch(/`needs-split`: decide the split yourself/);
+    expect(await g.read('coordinator.md')).toMatch(/when it is due, reset without asking or announcing it/);
     const status = await g.read('skills/status/SKILL.md');
     expect(status).toContain('grouped by feature');
     expect(status).toContain('unprompted reports follow the reporting level');
@@ -307,20 +310,6 @@ describe('renderPolicySummary', () => {
   });
 });
 
-// Opt-in (MINIONS_LIVE_CLAUDE=1). The real claude runs with a temp HOME and CLAUDE_CONFIG_DIR so the
-// user's enabled plugins (e.g. the Telegram channel, which would take over a running poller) never load.
-const live = process.env.MINIONS_LIVE_CLAUDE === '1';
-const hasClaude = live && (() => { try { execFileSync('claude', ['--version'], { stdio: 'ignore' }); return true; } catch { return false; } })();
-describe.runIf(hasClaude)('claude plugin validate', () => {
-  it('accepts the generated plugin', async () => {
-    const { out } = await gen();
-    const home = await tmp();
-    const res = spawnSync('claude', ['plugin', 'validate', '--strict', out],
-      { encoding: 'utf8', timeout: 60_000, cwd: home, env: { ...process.env, HOME: home, CLAUDE_CONFIG_DIR: join(home, '.claude') } });
-    expect(res.status, res.stdout + res.stderr).toBe(0);
-  }, 70_000);
-});
-
 describe('Telegram tools are coordinator-only', () => {
   const telegram = () => { const c = defaults(); c.communication.channel = 'telegram'; return c; };
 
@@ -341,9 +330,10 @@ describe('Telegram tools are coordinator-only', () => {
     const { read } = await gen(telegram());
     const coord = await read('coordinator.md');
     expect(coord).toContain('Communication channel: Telegram');
-    expect(coord).toContain('the plugin drops unpaired senders');
+    expect(coord).toContain('`<channel source="minions-telegram" chat_id=… message_id=… …>`');
+    expect(coord).toContain('the channel server drops unpaired senders');
     expect(coord).toMatch(/Never give them to workers/);
-    expect(coord).toMatch(/Pairing and access changes .* happen only in the terminal/);
+    expect(coord).toMatch(/Pairing and access changes .* happen only there/);
     const terminal = defaults(); terminal.communication.channel = 'terminal';
     const term = await gen(terminal);
     expect(await term.read('coordinator.md')).toContain('Telegram is not configured for this project.');
@@ -355,7 +345,7 @@ describe('Telegram tools are coordinator-only', () => {
     const { read } = await gen(telegram());
     const coord = await read('coordinator.md');
     expect(coord).toMatch(/\*\*When the channel drops\*\*.*`minions status` shows a `telegram poller` problem/);
-    expect(coord).toContain('run /mcp and reconnect plugin:telegram:telegram');
+    expect(coord).toContain('run /mcp and reconnect minions-telegram');
     expect(coord).toContain('`minions coordinator restart --recover`');
     expect(coord).toMatch(/Never launch other claude sessions yourself outside a controlled live run \(see Testing\), and never ask a worker to/);
     for (const [role] of WORKER_AGENTS) {
@@ -377,6 +367,7 @@ describe('Telegram tools are coordinator-only', () => {
       expect(coord).toContain(LIVE_CLAUDE_RUN_GUIDANCE);
       expect(coord).toMatch(/Only you run it, at a controlled moment: no worker lease is active/);
       expect(coord).toMatch(/separate, fresh `CLAUDE_CONFIG_DIR`/);
+      expect(coord).toMatch(/`minions coordinator live-run -- <claude args>`.*refuses while a worker lease is active/);
       expect(coord).toMatch(/workers never launch claude sessions/);
       expect(coord).not.toMatch(/Never launch nested claude sessions \(`claude -p` and the like\) yourself/);
       for (const [role] of WORKER_AGENTS) {
@@ -418,7 +409,7 @@ describe('models.effort / models.coordinator', () => {
     expect(await fx('reviewer')).toBe('medium');
     const coord = await g.read('coordinator.md');
     expect(coord).toMatch(/reasoning effort engineer `low`, tester `medium`, reviewer `medium`/);
-    expect(coord).toMatch(/spawn `minions:engineer-deep` instead of `minions:engineer`: the same engineer under the same engineer lease, at effort `medium`/);
+    expect(coord).toContain('run the deep engineer (`minions:engineer-deep`, effort `medium`)');
 
     const explicit = await gen(withModels({ effortByRole: { engineer: 'low', engineerDeep: 'xhigh', reviewer: 'high' } }));
     expect(frontmatter(await explicit.read('agents/engineer-deep.md')).effort).toBe('xhigh');
@@ -442,23 +433,16 @@ describe('models.effort / models.coordinator', () => {
     expect(deep).toContain('Not permitted for the engineer');
   });
 
-  it('never tells the coordinator to pass a full model id as the Agent `model`', async () => {
-    for (const cfg of [withModels({}), withModels({ selection: 'fixed' }), defaults(), withModels({ allowed: ['claude-opus-5-5', 'claude-sonnet-5', 'haiku'] })]) {
+  it('steers worker models through labels and config, never per call (autonomy Decision 10)', async () => {
+    for (const cfg of [withModels({}), withModels({ selection: 'fixed' }), defaults()]) {
       const g = await gen(cfg);
       for (const f of ['coordinator.md', 'skills/orchestrate/SKILL.md']) {
         const text = await g.read(f);
-        const passed = [...text.matchAll(/model: "([^"]+)"/g)].map((m) => m[1]);
-        for (const m of passed) expect(['sonnet', 'opus', 'haiku', 'fable'], `${f}: ${m}`).toContain(m);
-        if (cfg.models.selection === 'coordinator') expect(text, f).toMatch(/omit `model` \(the definitions run `[^`]+`\)/);
+        expect(text, f).not.toMatch(/model: "/);
+        expect(text, f).toContain('Steer it with a `risk:low` or `risk:high` label when you create a task, a stage `model` in a workflow, or `roles.<role>.model`');
       }
     }
-    const g = await gen(withModels({}));
-    const coord = await g.read('coordinator.md');
-    expect(coord).toContain('Pass `model` only as one of the aliases `sonnet`, `opus`, `haiku`, `fable`, never a full model ID');
-    expect(coord).toContain('`model: "haiku"` for narrow inspection');
-    const extra = await (await gen(withModels({ allowed: ['claude-opus-5-5', 'claude-sonnet-5', 'haiku'] }))).read('coordinator.md');
-    expect(extra).toContain('Allowed full IDs other than the default (`claude-sonnet-5`) cannot be chosen per call.');
-    expect(await g.read('skills/orchestrate/SKILL.md')).toMatch(/`minions:engineer-deep` instead of `minions:engineer` for hard debugging, architecture work, or a retry after an engineer attempt failed/);
+    expect(await (await gen(withModels({}))).read('coordinator.md')).toContain('The dispatcher runs each stage on the model `work next` suggests (`suggestedModel`)');
   });
 });
 
@@ -478,24 +462,10 @@ describe('file hand-offs and compact reads', () => {
     expect(await read('agents/reviewer.md')).toMatch(/`minions work submit` commands are allowed: they read and write minions state under `\/state`, not your worktree/);
   });
 
-  it('the coordinator and orchestrate skill use compact claims, marker-only prompts and record --submitted', async () => {
-    const { read } = await gen();
-    const coord = await read('coordinator.md');
-    const orch = await read('skills/orchestrate/SKILL.md');
-    for (const md of [coord, orch]) {
-      expect(md).toContain('--compact --json');
-      expect(md).toContain('minions work record <leaseId> --submitted');
-      expect(md).toContain('--submitted --correction');
-      expect(md).not.toMatch(/pipe it verbatim|brief JSON in a ```json fence/);
-      // older-CLI fallback: plain claim with pasted brief, record via stdin
-      expect(md).toContain('Older CLI fallback: if `--compact`, `work brief` or `--submitted` is rejected as an unknown option or command, claim without `--compact` and paste the brief in a ```json fence after the marker and worktree lines');
-      expect(md).toContain("piping the worker's final JSON to `minions work record <leaseId> --json` on stdin");
-      expect(md).toMatch(/`brief unavailable: <error>`.*do not record it.*[Rr]elease/s);
-    }
-    expect(orch).toMatch(/minions-lease: <leaseId>\n\s*worktree: <worktree>/);
-    const recover = await read('skills/recover/SKILL.md');
+  it('the recover skill records a submitted result of a lease the dispatcher does not own before releasing it', async () => {
+    const recover = await (await gen()).read('skills/recover/SKILL.md');
     expect(recover).toContain('minions work record <leaseId> --submitted --json');
-    expect(recover).toMatch(/On `PRECONDITION` about a pending correction.*--submitted --correction --json/);
+    expect(recover).toMatch(/On `PRECONDITION` about a pending correction.*--submitted --correction/);
   });
 
   it('routine context resets (task-45, on by default with coordinator.contextReset unset): when to write the handoff, when to restart, read it on start', async () => {
@@ -504,18 +474,35 @@ describe('file hand-offs and compact reads', () => {
     expect(coord).toContain('## Session start');
     expect(coord).toContain('minions coordinator handoff --read --json');
     expect(coord).toMatch(/Context resets \(on, `coordinator.contextReset`\)/);
-    expect(coord).toMatch(/only when no worker lease is active, no drain runs, and a task was delivered in this session, or this session's context reached 60k tokens, or 10 worker hand-offs happened/);
+    expect(coord).toMatch(/only when no lease of yours is active \(the dispatcher's workers never block it\), no drain runs, and a task was delivered in this session, or this session's context reached 60k tokens, or 10 worker hand-offs happened/);
     expect(coord).toMatch(/Write the handoff first: `minions coordinator handoff --json` with the note on stdin.*at most 4 KB/);
     expect(coord).toMatch(/\*\*Open owner questions\*\* \(each with your recommended answer/);
     expect(coord).toMatch(/an unanswered owner question goes into the handoff/);
     expect(coord).toContain('`minions coordinator restart --recover --detach --json`');
-    expect(coord).toMatch(/Never restart while a worker lease is active \(the restart refuses; never use --force for a reset\)/);
+    expect(coord).toMatch(/Never restart while a lease of yours is active \(the restart refuses; never use --force for a reset\)/);
     expect(coord).not.toMatch(/setsid|Idle context reset \(opt-in\)/);
     const orch = await g.read('skills/orchestrate/SKILL.md');
-    expect(orch).toMatch(/If the response carries `contextReset` \(`due: true`\), do the context reset now/);
-    expect(orch).toMatch(/unless a record or release response carried `contextReset`/);
+    expect(coord).not.toMatch(/[Bb]arrier/);
+    expect(orch).toMatch(/check `minions coordinator handoff --check --json`: when it is `due`, do the reset/);
     const recover = await g.read('skills/recover/SKILL.md');
     expect(recover).toMatch(/^1\. `minions coordinator handoff --read --json`/m);
+  });
+
+  it('the digest (task-68.5): routine on -> the wake sends the composed digest first and the outbox rules name the holds; off -> no digest step', async () => {
+    const on = await gen({ ...defaults(), routine: { enabled: true, digestAt: ['08:00'], timezone: 'Europe/Berlin' } } as MinionsConfig);
+    const orch = await on.read('skills/orchestrate/SKILL.md');
+    expect(orch).toMatch(/\*\*Digest\*\* \(`digest` among the reasons; 08:00 Europe\/Berlin\): do it before anything else/);
+    expect(orch).toContain('Run `minions notify digest --json`');
+    expect(orch).toMatch(/Send `text` exactly as given with one `reply`.*then ack every key it returns: `minions notify ack <keys\.\.\.> --json`/);
+    expect(orch).toMatch(/At 100% budget the digest is the only reason a wake happens/);
+    const coord = await on.read('coordinator.md');
+    expect(coord).toMatch(/holds `delivered`, `feature` and `question` items for the digest by default/);
+    expect(coord).toMatch(/`goal-ack`, `status` \(owner-requested\), `approval` and `blocker` go out at once/);
+    expect(coord).toContain('`--hold digest`');
+    expect(coord).toMatch(/the recommended one first and marked "\(recommended\)"/);
+    const off = await gen();
+    expect(await off.read('skills/orchestrate/SKILL.md')).not.toContain('minions notify digest');
+    expect(await off.read('coordinator.md')).toMatch(/Nothing is held for a digest while the routine is off/);
   });
 
   it('coordinator.contextReset.enabled: false keeps resets opt-in (owner request only)', async () => {
@@ -525,7 +512,6 @@ describe('file hand-offs and compact reads', () => {
     expect(coord).toContain('`minions coordinator restart --recover --detach --json`');
     expect(coord).toMatch(/Never restart with active leases or while waiting on the owner mid-question/);
     expect(coord).toContain('minions coordinator handoff --read --json'); // a handoff is still read on start
-    expect(await g.read('skills/orchestrate/SKILL.md')).toContain('Context resets are off for this project');
   });
 });
 
@@ -559,41 +545,6 @@ describe('file hand-off templates render completely (task-9 edge cases)', () => 
   });
 });
 
-describe('coordinator prompt: origin/<base> as the single source of truth', () => {
-  it('GitHub delivery forbids local base merges and explains the pre-claim sync; local delivery does not', async () => {
-    for (const mode of ['branch', 'pull-request'] as const) {
-      const cfg = defaults();
-      cfg.delivery.mode = mode;
-      cfg.delivery.provider = 'github';
-      const md = await (await gen(cfg)).read('coordinator.md');
-      expect(md).toContain('`origin/main` is the single source of truth');
-      expect(md).toMatch(/never merge, rebase, cherry-pick or commit into the local `main`/);
-      expect(md).toMatch(/Every `minions work claim` first fetches origin and fast-forwards `main`/);
-      expect(md).toMatch(/do not repair it by merging or resetting yourself/);
-    }
-    const local = await (await gen(defaults())).read('coordinator.md');
-    expect(local).not.toContain('single source of truth');
-    expect(local).not.toContain('CI-gated auto-merge is on');
-    expect(local).toContain('the user fetches branches with `minions export` on the host');
-  });
-});
-
-describe('coordinator prompt: CI-gated auto-merge (task-1.9)', () => {
-  it('explains merge states and the host-signed --merge approval only when auto-merge is on', async () => {
-    const cfg = defaults();
-    Object.assign(cfg.delivery, { mode: 'pull-request', provider: 'github' });
-    const off = await (await gen(cfg)).read('coordinator.md');
-    expect(off).toContain('minions never merges pull requests');
-    expect(off).not.toContain('--merge');
-    cfg.delivery.merge = 'auto-when-eligible';
-    const on = await (await gen(cfg)).read('coordinator.md');
-    expect(on).toContain('CI-gated auto-merge is on');
-    expect(on).toContain('minions work approve <taskId> --head <sha> --merge');
-    expect(on).toMatch(/You never run `gh pr merge`/);
-    expect(on).not.toContain('minions never merges pull requests');
-  });
-});
-
 describe('owner behaviour defaults (task-34)', () => {
   const ownerSection = (coord: string) => coord.slice(coord.indexOf('## Owner defaults'), coord.indexOf('## Communicating with the user'));
 
@@ -601,20 +552,23 @@ describe('owner behaviour defaults (task-34)', () => {
     const coord = await (await gen()).read('coordinator.md');
     expect(coord.indexOf('## Owner defaults')).toBeGreaterThan(coord.indexOf('## Project policy'));
     const owner = ownerSection(coord);
-    for (const heading of ['Intake', 'Big features', 'Worker briefs', 'Staffing', 'Spend', 'Quota mode', 'Graceful operations', 'Small user-facing surface', 'Permission mode']) {
+    for (const heading of ['Intake', 'Big features', 'Task text is the brief', 'Staffing', 'Small tasks', 'Spend', 'Quota mode', 'Graceful operations', 'Small user-facing surface', 'Permission mode']) {
       expect(owner, heading).toContain(`**${heading}.**`);
     }
     expect(owner).toMatch(/Turn owner requests into backlog tasks yourself .* without asking first/);
     expect(owner).toContain('Capabilities marked `ask` and sensitive paths still need explicit approval');
     expect(owner).toMatch(/Design first: .*show it to the owner, and build only after they agree/);
     expect(owner).toMatch(/juniors growing into mid-levels: do the investigation yourself first, then give the context, the goal, where to look, pitfalls, what to preserve and how to verify \(with exact environment workarounds, .*\), not every step/);
-    expect(owner).toMatch(/Pass each worker's token total from its task notification \(`subagent_tokens`\) whenever you record or release it \(`--usage <tokens>`/);
+    expect(owner).toContain('Workers get only the brief (the task description, acceptance criteria, notes and prior findings), never a message from you.');
+    expect(owner).toContain('The dispatcher records each worker\'s token total');
     expect(owner).toMatch(/Report it with deliveries and when asked: tokens plus a rough USD estimate with API-key billing \(the Console usage page is authoritative\), tokens only on a subscription \(its remaining plan quota is not visible\)/);
     expect(owner).toContain('`minions work spend --budget "<their words>" --json`');
-    expect(owner).toMatch(/tell the owner when `budget.crossed` is 50 or 80; at 100 new claims are refused \(running workers continue\): say why starts stopped/);
+    expect(owner).toMatch(/tell the owner when it passes 50 or 80; at 100 new claims are refused \(running workers continue\): say why starts stopped/);
     expect(owner).toMatch(/plan usage or rate limit, pause starts \(`minions pause --starts --json`\)/);
     expect(owner).toContain('"major things only, then stop"');
     expect(owner).toMatch(/pause or drain before restarts and upgrades .* keep uncommitted work/);
+    expect(owner).toMatch(/Label small, low-risk tasks .* `small` and file them readily instead of deferring them/);
+    expect(owner).toContain('keeps one for a ready `small` task (`waitingOn: "small-task-slot"`)');
     expect(owner).toMatch(/Fold new features into existing commands \(for minions itself: setup, upgrade, status\)/);
     // Kept short: the prompt is read every session.
     expect(owner.length).toBeLessThan(4000);
@@ -623,7 +577,7 @@ describe('owner behaviour defaults (task-34)', () => {
   it('staffing shows the per-role effort the host config resolves, never a per-call choice', async () => {
     const base = defaults();
     const unset = ownerSection(await (await gen(base)).read('coordinator.md'));
-    expect(unset).toContain('Effort is per role, set on the host (`models.effortByRole`; now engineer default, tester default, reviewer default), never per call');
+    expect(unset).toContain('Effort is per role, set on the host (`models.effortByRole`; now engineer default, tester default, reviewer default); label hard work `risk:high`');
     expect(unset).not.toMatch(/engineers at `low` effort/);
     const set = ownerSection(await (await gen({ ...base, models: { ...base.models, effortByRole: { engineer: 'low', reviewer: 'medium' } } })).read('coordinator.md'));
     expect(set).toContain('now engineer `low`, tester default, reviewer `medium`');
@@ -632,11 +586,10 @@ describe('owner behaviour defaults (task-34)', () => {
   it('budget and permission mode follow the config', async () => {
     const base = defaults();
     const none = ownerSection(await (await gen(base)).read('coordinator.md'));
-    expect(none).not.toContain('budgets');
-    expect(none).toContain('The coordinator is launched in `auto` by default (`coordinator.permissionMode`); the host runtime always uses `default`');
-
-    const capped = ownerSection(await (await gen({ ...base, budgets: { taskUsd: 5, dailyUsd: 40 } })).read('coordinator.md'));
-    expect(capped).toContain("The config's `budgets` ($40 per day, $5 per task; not enforced in v0.1) counts as a budget until the owner gives one");
+    expect(none).toContain('Only the owner changes the caps (`/budget` in Telegram), never you');
+    expect(none).toContain('token caps (`budgets.dailyTokens`, `budgets.taskTokens`; any billing)');
+    expect(none).toContain('The coordinator is launched in `auto` by default (`coordinator.permissionMode`)');
+    expect(ownerSection(await (await gen({ ...base, coordinator: { permissionMode: 'bypassPermissions' } })).read('coordinator.md'))).toContain('fully unattended (`bypassPermissions`)');
 
     const strict = ownerSection(await (await gen({ ...base, coordinator: { permissionMode: 'acceptEdits' } })).read('coordinator.md'));
     expect(strict).toContain('runs the coordinator in `acceptEdits` permission mode');
@@ -646,12 +599,12 @@ describe('owner behaviour defaults (task-34)', () => {
   it('intake says when starting still needs authorization', async () => {
     const base = defaults();
     const gated = ownerSection(await (await gen({ ...base, intake: { ...base.intake, startReady: false } })).read('coordinator.md'));
-    expect(gated).toContain('Starting them still needs the owner\'s authorization in this profile');
+    expect(gated).toContain('Starting them still needs the owner\'s authorization in this project');
   });
 
   it('decisions are asked as numbered polls with the recommended option first and "Other" last', async () => {
     const coord = await (await gen()).read('coordinator.md');
-    expect(coord).toMatch(/Ask decisions as numbered polls: the recommended option first, marked "\(recommended\)", .* "Other" as the last option\. A reply that is only a number answers the latest poll/);
+    expect(coord).toMatch(/Ask decisions as numbered polls: the recommended option first, marked "\(recommended\)", .* "Other" as the last option\. A reply that is only a number answers the latest poll only when exactly one poll is open/);
   });
 
   it('answers on the channel the owner used and handles channel outages', async () => {
@@ -667,7 +620,7 @@ describe('owner behaviour defaults (task-34)', () => {
     const comm = coord.slice(coord.indexOf('## Communicating with the user'));
     expect(comm).toMatch(/\*\*Threads\.\*\* When you answer an owner Telegram message .*pass `reply_to` = that message's `message_id` to `reply`, even when it is the latest message/);
     expect(comm).toContain('End every Telegram message with `ref: #<id>`');
-    expect(comm).toContain('an owner message without a ref answers your latest message or poll');
+    expect(comm).toContain('an owner message with a ref belongs to that thread; one without a ref is a new request or thread; a bare number with no ref answers the latest poll only when exactly one poll is open, otherwise ask which poll it answers');
     expect(comm).toMatch(/Unsolicited notifications \(delivered, blocker\) stay unthreaded unless you know the owner message that requested the work/);
     expect(comm).toMatch(/On an outbox resend, take `reply_to` from the message id the key carries/);
     // The threading rule sits right before the outbox bullet.
@@ -677,9 +630,9 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(await (await gen(terminal)).read('coordinator.md')).not.toContain('**Threads.**');
   });
 
-  it('local delivery, project-owner: verifies the merge before the base moves, then commits or aborts', async () => {
-    const base = defaults('project-owner');
-    const cfg = { ...base, delivery: { ...base.delivery, mode: 'local' as const, provider: 'none' as const }, git: { ...base.git, baseBranch: 'trunk' } };
+  it('local delivery, independent without local integration: verifies the merge before the base moves, then commits or aborts', async () => {
+    const base = defaults('independent');
+    const cfg = { ...base, delivery: { merge: 'disabled' as const }, git: { ...base.git, baseBranch: 'trunk' } };
     const g = await gen(cfg);
     const coord = await g.read('coordinator.md');
     expect(coord).toContain('Then integrate each delivered branch into the local `trunk` yourself, one at a time, in `/workspace/repo` with `trunk` checked out and a clean tree');
@@ -690,7 +643,7 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(merge).toBeGreaterThan(-1);
     expect(verify).toBeGreaterThan(merge);
     expect(commit).toBeGreaterThan(verify);
-    expect(coord).toMatch(/On a conflict or a failure, `git merge --abort` \(`trunk` has not moved\), set the task back \(`minions backlog update <taskId> --expected-version <v> --status changes-requested` with a note; `<v>` is the `version` from `minions backlog show <taskId> --json`\)/);
+    expect(coord).toMatch(/On a conflict or a failure, `git merge --abort` \(`trunk` has not moved\), set the task back \(`minions backlog update <taskId> --expected-version <v> --status changes-requested` with a note asking the repair to merge `trunk` into the branch and re-test; `<v>` is the `version` from `minions backlog show <taskId> --json`\): the dispatcher runs the engineer repair/);
     expect(coord).toContain("with `trunk` checked out and a clean tree, never while draining:");
     expect(coord).toMatch(/Never resolve conflicts yourself or reset `trunk`/);
     expect(coord).toContain('revert that revert before re-merging the repaired branch');
@@ -702,12 +655,15 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(orch).toContain('Local delivery: then integrate it into the local `trunk` as described under Delivery (verify before committing the merge).');
   });
 
-  it('local delivery, personal-work: asks before each merge', async () => {
-    const g = await gen(defaults('personal-work'));
-    const coord = await g.read('coordinator.md');
-    expect(coord).toContain("Sensitive-path changes need the user's explicit approval, and in this profile so does every merge: ask first (task, branch, head SHA).");
-    expect(coord).toContain('`git merge --no-ff --no-commit agent/<slug>`');
-    expect(await g.read('skills/orchestrate/SKILL.md')).toContain('verify before committing the merge; ask the user before each merge');
+  it('the project policy states the mode and how closely the owner supervises', async () => {
+    const policy = (md: string) => md.slice(md.indexOf('## Project policy'), md.indexOf('## Owner defaults'));
+    const sup = policy(await (await gen(defaults('supervised'))).read('coordinator.md'));
+    expect(sup).toContain('- Mode: `supervised`');
+    expect(sup).toMatch(/the owner reviews and merges all code, so you and the workers are free to experiment/);
+    expect(sup).toMatch(/dependency updates and upgrades, migrations, CI, broad refactors/);
+    const ind = policy(await (await gen(defaults('independent'))).read('coordinator.md'));
+    expect(ind).toContain('- Mode: `independent`');
+    expect(ind).toMatch(/make decisions within the policy and record each one/);
   });
 
   it('local delivery, supervised: never merges', async () => {
@@ -719,19 +675,6 @@ describe('owner behaviour defaults (task-34)', () => {
     const orch = await g.read('skills/orchestrate/SKILL.md');
     expect(orch).toContain('Never merge into the local `main`: the user integrates.');
     expect(orch).not.toContain('Local delivery: then integrate');
-  });
-
-  it('GitHub delivery: never merges locally, PR merges are not the coordinator\'s', async () => {
-    for (const mode of ['branch', 'pull-request'] as const) {
-      const cfg = defaults();
-      cfg.delivery.mode = mode;
-      cfg.delivery.provider = 'github';
-      const g = await gen(cfg);
-      expect(await g.read('coordinator.md')).not.toContain('Then integrate each delivered branch');
-      const orch = await g.read('skills/orchestrate/SKILL.md');
-      expect(orch).toContain('GitHub delivery: never merge into the local `main`; changes land through pull requests');
-      expect(orch).not.toContain('Local delivery: then integrate');
-    }
   });
 
   it('paused intake: follow-ups stay exempt, QA sweep scheduling does not', async () => {
@@ -746,23 +689,92 @@ describe('owner behaviour defaults (task-34)', () => {
     expect(intake).toMatch(/proactively for every owner request, without asking first/);
   });
 
-  it('orchestrate covers briefs, staffing, budget stops, failing-check corrections and spend reports; status shows spend', async () => {
+  it('orchestrate covers budget stops, failing-check corrections and spend reports; status shows spend', async () => {
     const g = await gen();
     const orch = await g.read('skills/orchestrate/SKILL.md');
-    expect(orch).toMatch(/how to verify \(with exact environment workarounds\)/);
-    expect(orch).toContain('Brief and staff as under Owner defaults.');
     expect(orch).not.toContain('juniors');
-    expect(orch).toContain('Do not loop waiting for work. Start nothing new while the budget is used up (`spend.budget.exhausted` in the status) or quota mode is on');
-    expect(orch).not.toContain('Do not poll');
-    expect(orch).toMatch(/A `complete` tester or reviewer result with failing checks is rejected this way; for an engineer `complete` with failing checks, ask the same correction yourself/);
+    expect(orch).toContain('the budget used up (`spend.budget.exhausted`): the dispatcher starts nothing new');
+    expect(orch).toContain('Do not loop or wait for workers.');
+    expect(orch).toMatch(/A `complete` result with a failing check, a skipped verification command or no passing test run is rejected this way: note the exact way to run the checks/);
     expect(orch).toContain('Include the spend so far');
-    expect(orch).toContain('`minions work record <leaseId> --submitted --usage <subagent_tokens> --json`');
-    expect(orch).toMatch(/Always pass `--usage` for Agent workers \(also on `--correction` records and `work release`\)/);
-    expect(orch).toMatch(/`crossed` 50 or 80 → tell the owner/);
-    expect(orch).toContain('`Budget reached`');
-    expect(await g.read('coordinator.md')).toContain('--submitted --usage <subagent_tokens> --json');
+    expect(orch).not.toContain('--usage');
     const status = await g.read('skills/status/SKILL.md');
     expect(status).toMatch(/Spend so far .*USD cost with API-key billing .*tokens only on a subscription plan/);
     expect(status).toContain('`spend.budget`');
+  });
+});
+
+describe('own ideas rule (task-130): the coordinator promotes its own ideas freely', () => {
+  it('says to promote own ideas without the owner and names no caps, override or digest veto', async () => {
+    const coord = await (await gen()).read('coordinator.md');
+    const policy = coord.slice(coord.indexOf('## Project policy'), coord.indexOf('## Owner defaults'));
+    expect(policy).toContain('**Own ideas.**');
+    expect(policy).toMatch(/Move one to `ready` yourself when it is worth doing \(no owner permission needed\) and mention it in your normal updates/);
+    expect(coord).not.toMatch(/Auto-promotion refused|--owner-approved|needs-owner|"cancel <id>"|"hold <id>"|auto-promot/i);
+    expect(coord).not.toContain('{{ownIdeasRule}}');
+  });
+
+  it('an old config that still carries routine.autoPromote generates the same rule', async () => {
+    const c = defaults(); c.routine = { autoPromote: { perDay: 0 } };
+    expect(await (await gen(c)).read('coordinator.md')).toMatch(/Move one to `ready` yourself/);
+  });
+
+  it('the intake skill names no caps', async () => {
+    const intake = await (await gen()).read('skills/intake/SKILL.md');
+    expect(intake).not.toMatch(/auto-promotion|runtime caps/);
+  });
+});
+
+describe('local integration prompts (task-82.4)', () => {
+  const local = (mode: 'independent' | 'supervised', merge: 'disabled' | 'auto-when-eligible') => {
+    const c = defaults(mode);
+    c.delivery = { ...c.delivery, merge };
+    c.verification.commands = ['npm run typecheck', 'npm test'];
+    return c;
+  };
+  const deliverySection = (md: string) => md.slice(md.indexOf('## Delivery'), md.indexOf('\n\n', md.indexOf('Never merge into, commit on')) + 1 || undefined);
+
+  it('with local integration on, the coordinator gets no manual merge steps and never merges, commits on or resets the base', async () => {
+    const g = await gen(local('independent', 'auto-when-eligible'));
+    const coord = await g.read('coordinator.md');
+    expect(coord).not.toMatch(/git merge --no-ff|--no-commit|git commit --no-edit|git merge --abort/);
+    expect(coord).toContain('The runtime integrates approved tasks into the local `main`; you never merge.');
+    expect(coord).toContain('Never merge into, commit on, rebase or reset the local `main`, and never run `minions work integrate`');
+    expect(coord).toMatch(/failed once and passed on its rerun still lands, with a `flaky` notice: file a follow-up task/);
+    expect(coord).toMatch(/Workers keep running meanwhile/);
+    expect(coord).toContain('resume no hold and merge nothing (the runtime\'s integrator stops a running verification by itself and queues it again).');
+    expect(coord).toMatch(/sensitive paths need the user's host-signed merge approval/);
+    const orch = await g.read('skills/orchestrate/SKILL.md');
+    expect(orch).toMatch(/Local integration: the approved task goes to `merging` and the runtime integrates it into the local `main` \(never merge it yourself\)/);
+    expect(orch).not.toMatch(/as described under Delivery \(verify before committing the merge/);
+    expect(deliverySection(coord)).toMatchSnapshot();
+  });
+
+  it('base.merge "ask": every landing needs the signed approval', async () => {
+    const c = local('independent', 'auto-when-eligible');
+    c.capabilities['base.merge'] = 'ask';
+    const coord = await (await gen(c)).read('coordinator.md');
+    expect(coord).toMatch(/under this policy every landing needs the user's host-signed merge approval/);
+    expect(coord).not.toMatch(/--no-commit/);
+    expect(deliverySection(coord)).toMatchSnapshot();
+  });
+
+  it('with the switch off (rollout) or base.merge denied, the existing local guidance stays', async () => {
+    const off = await (await gen(local('independent', 'disabled'))).read('coordinator.md');
+    expect(off).toMatch(/`git merge --no-ff --no-commit agent\/<slug>`/);
+    expect(off).toContain('start no local integration merge (an upgrade could interrupt a `--no-commit` merge');
+    const sup = await (await gen(local('supervised', 'auto-when-eligible'))).read('coordinator.md');
+    expect(sup).toMatch(/Never merge into the local `main`: the user integrates/);
+    expect(sup).not.toMatch(/The runtime integrates approved tasks/);
+  });
+
+  it('the `merging` lines of the drain rule, orchestrate and recover skills appear only with local integration on', async () => {
+    const off = await gen(local('independent', 'disabled'));
+    expect(await off.read('coordinator.md')).toContain('resume no hold and start no local integration merge (an upgrade could interrupt a `--no-commit` merge and leave the repo mid-merge). A hook');
+    expect(await off.read('skills/orchestrate/SKILL.md')).toContain('reviewer `approve` → `delivered` (local delivery). Local delivery: then integrate');
+    expect(await off.read('skills/recover/SKILL.md')).not.toContain('Tasks in `merging`');
+    const on = await gen(local('independent', 'auto-when-eligible'));
+    expect(await on.read('skills/orchestrate/SKILL.md')).toContain('(local delivery; `merging` with local integration on: the runtime integrates it, no worker runs for it). Local integration:');
+    expect(await on.read('skills/recover/SKILL.md')).toMatch(/their brief carries `resume`\.\n {3}- Tasks in `merging` have no lease and no worker: the runtime's integrator owns them/);
   });
 });

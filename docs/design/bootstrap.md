@@ -134,8 +134,10 @@ deterministic init. `minions init` stays complete without it.
   `--allowedTools <read-only...> --disallowedTools <denied...> --plugin-dir <dir> --append-system-prompt
   <system-prompt.md> --settings '{"permissions":{"disableBypassPermissionsMode":"disable"}}' --name
   "minions setup" --permission-mode default "<kick-off prompt>"`. The variadic tool lists come first so
-  they never swallow the positional prompt. `default` is accepted by 2.1.292 (its help lists the same mode
-  as `manual`); never `bypassPermissions`, `acceptEdits`, `auto` or `dontAsk`.
+  they never swallow the positional prompt. The mode value follows the `--permission-mode` choices in
+  `claude --help` (src/runtime/permission-modes.ts): `default` when listed, else `manual` (its newer name,
+  the only one 2.1.292 lists), and no launch when neither is listed; never `bypassPermissions`,
+  `acceptEdits`, `auto` or `dontAsk`. The host-runtime coordinator maps its `default` the same way.
 - **Allowed without a prompt:** `Bash(minions doctor*)`, `Bash(minions status*)`, `Bash(minions auth show*)`,
   `Bash(minions config show*)`, `Bash(minions runtime show*)`, `Bash(git remote -v)`, `Bash(git status*)`,
   `Bash(git log*)`, and `Read(//<repo root>/**)` (Claude Code applies Read rules to Glob/Grep as well). Never a
@@ -242,6 +244,34 @@ Decision record for `delivery.mode` `branch` / `pull-request` (`src/runtime/publ
   only https for network operations), but repository-level `url.<x>.insteadOf` rewrites from one
   https URL to another still apply. Neither source is trusted to *remove* a path: each base can only
   add paths to the union, which is why the union stays safe when one of them is forged.
+- **Decision (task-71): gate reads ignore history rewrites.** The object database and git dir are
+  agent-writable too: `git replace <head> <commit with the base's tree>` (or a graft giving the base the
+  head as parent) made the sensitive-path diff empty. Every local git read whose answer decides a gate
+  (the `rev-parse`/`merge-base`/`diff` of `gateChangedPaths`, shared by publication and the merge gate;
+  the scheduler's QA-requirement and edit-scope diffs and its verifier ancestry check; the ref -> commit
+  reads of `resolveBaseBranch`/`headOf`) runs through `gateGit` (`src/runtime/git-hardening.ts`) in both
+  runtimes: `GIT_NO_REPLACE_OBJECTS=1`, `core.useReplaceRefs=false`, `GIT_GRAFT_FILE=/dev/null`,
+  `GIT_SHALLOW_FILE=/dev/null`, `core.commitGraph=false`, and the allowlisted environment of
+  `allowlistedGitEnv` (no inherited `GIT_*`, no global or system config, HOME that does not exist).
+  Network reads do not use the workspace git either (next decision).
+- **Decision (task-71 repair): the gate base comes from the server, read at minions' recorded URL.** A worker
+  could set `url.<forged>.insteadOf` (reads) and `url.<real>.pushInsteadOf` (pushes) and move the local base,
+  so the next claim recorded a poisoned base F and a forged `ls-remote` confirmed it; the sensitive change in F
+  then reached the real origin without approval (QA case D). Now: (1) the server is minions' own record of the
+  repository (the task's PR URL, else the `owner/repo` that `minions workspace import --remote-url` stores in the
+  runtime DB meta `origin_repository`; installs imported before that fall back to the normalized
+  `remote.origin.url`); (2) origin's base is read with task-68.3's helpers (`base-update.ts`
+  `verifiedServerBase`: an isolated `ls-remote` of that explicit https URL with the credential helper on the
+  command line and none of the repository's url/remote/http/credential config, cross-checked with
+  `gh api --hostname github.com /repos/<o>/<r>/branches/<base>`), then fetched isolated when missing
+  (`publish.ts verifiedGateBase`); a mismatch, gh down or an unfetchable commit fails closed (publication
+  fails, the merge gate is not eligible, the claim is blocked); (3) the claim records that verified commit as
+  `leases.base_sha` and fast-forwards the local base to it (a local base ahead of it blocks the claim);
+  (4) `gateChangedPaths` runs no `ls-remote` of its own: callers pass the verified `serverBase`, and without it
+  only recorded bases count (none: PRECONDITION); (5) publication's branch `ls-remote` and push go to the
+  same explicit URL (`serverRefOf` / `pushToServer`), so the server that was read is the one that is pushed
+  to. Residual: a worker able to run `minions workspace import --remote-url` could repoint the record, but
+  reads, the API cross-check, the push and `gh pr create --repo` then all target that other repository.
 - **Decision (task-40): main merged into a branch after the claim is still over-reported.** When main
   moves on after a task's first claim and the branch merges it, the diff against the earliest recorded
   base also lists main's own changes, so sensitive paths main changed ask for approval again. Fixing
@@ -658,6 +688,38 @@ Decision record for `delivery.merge: "auto-when-eligible"` (task-1.9; `src/runti
   anyone who can post a status with that name (see "CI as verification authority"); pin them to their
   app. Code that already runs in the container can still use the token directly (see "Host-signed
   publication approvals"); branch protection on GitHub stays the final control.
+- **Unattended delivery (proposed, task-68.1).** [unattended-delivery.md](unattended-delivery.md) adds three things.
+  A deterministic routine pass runs this merge pass on a clock. A PR scan handles behind or conflicting PRs: a
+  verified base update without re-review, and `needs-rebase` for real conflicts. A derived-approval rule covers the
+  updated heads.
+
+## Automatic local integration (surface)
+
+Decision record for the user-facing part of local integration (task-82.4, phase 4 of
+[local-auto-integration.md](local-auto-integration.md); engine, queue and wiring are phases 1-3).
+
+- **Same switch as PR auto-merge.** `delivery.merge: "auto-when-eligible"` in local delivery turns on local
+  integration; `autoMergeConfigReasons`, doctor `merge.readiness` and setup's autoMerge step are mode-aware. In
+  local delivery setup asks *Integrate approved tasks automatically?* (default: the current value; not asked when
+  `base.merge` is denied, as in `supervised`). `base.merge` is optional in the JSON schema (a missing one is deny).
+- **Status and doctor read one model** (`src/runtime/integration-status.ts`): the `integration` block of
+  `minions status`; the host doctor maps its `problems` from the container's `minions status --json` to
+  `integration.lock`, `integration.queue` and `integration.checkout` checks (no new command). A crash during
+  `git merge --ff-only` (a `landing` row, no live holder, tracked changes in the base checkout) is a FAIL with the
+  fix: save own edits, then `git checkout --force <base>`; recovery itself never touches `/workspace/repo`.
+- **Flaky rule (Decision 2).** A failed verification command is rerun once in place; a pass lands (row outcome
+  `landed-flaky`, event `integration-flaky`, an owner notice asking for a follow-up), a second failure is red.
+- **Notices.** One line each in the outbox: `approval` (awaiting a merge approval), `blocker` (blocked after two
+  transient failures, a halted queue, a dirty checkout, the repair limit), `other` (red, conflict, refused, flaky).
+  Landings go to the digest's *Merged* section; failures and flaky landings to its *Integration* section; a local
+  publication awaiting approval is listed as a **merge** approval (`/approve <task> <sha> merge`).
+- **Backstops.** The coordinator wrapper runs an integration watch (now and every minute) and
+  `coordinator restart --recover` checks once: start the integrator when local integration is on, entries are
+  queued (or a dead holder left a running row), no live holder, and no halt, drain or start pause.
+- **Merge approval after a failure.** `work approve --merge` refuses a local integration that failed (conflict,
+  red, refused, policy denied); only a transient failure can be approved and retried at the same head.
+- **Workers keep running (Decision 3)** during an integration; the coordinator prompt has no manual merge steps
+  when the switch is on and says the coordinator never merges into, commits on or resets the base.
 
 ## GitHub intake sync
 
@@ -858,10 +920,20 @@ date is the source phase. It runs before everything else (see "Upgrade from the 
   attempted and failures are reported (`ok: false`, exit code 1).
 - **Volumes.** The upgrade never runs `down -v` or volume commands. `--dry-run` only reads (compose
   ps, image inspect, `minions status`) and lists every step.
-- **Host runtime.** Not supported: `minions upgrade` refuses with `PRECONDITION` for a project on the
-  host runtime (there is no image or container to move). Install the new CLI, let workers finish
-  (`minions status`, or `minions pause --starts`), then `minions down && minions start`, which
-  regenerates the plugin, shim and sandbox settings and restarts the coordinator.
+- **Host runtime** (task-7, `src/host/upgrade-host.ts`). The same command, the same source phase
+  (`--from-container` strict fast-forward of the owner's checkout, `--rebuild-cli` packed reinstall with
+  the CLI backup, hand-off to the new CLI) and the same pause, drain, resume and recovery steps, run
+  through the project's minions shim instead of `docker compose exec`. Steps: preflight, pause, drain,
+  files (runtime config and plugin), secrets, `shim` (regenerates the minions and gh shims for the
+  installed CLI; the point of no return, as the recreate is for Docker), workspace, resume,
+  coordinator (`coordinator restart --recover`, no `--force`: refused while a worker lease is active,
+  so it runs only after the drain). No image, container or origin step: the workspace is kept as is.
+  The preflight needs a prepared host runtime (`minions start` ran once) and refuses a CLI inside, or
+  linked into, the agent-writable dirs (`<project>/host/workspace`, `<project>/host/state`): the
+  shims run it outside the sandbox. For the same reason the CLI check never rebuilds a linked install
+  whose target, or a checkout, lies in those dirs; it prints the packed reinstall and stops. The CLI is
+  never built from the agent workspace itself: commits reach the owner's checkout only through the
+  `--from-container` fast-forward (exported bundles), and are built in a later run.
 
 ### Upgrade from the container
 
@@ -916,6 +988,14 @@ The source phase (`src/host/upgrade-source.ts`) adds two steps, `sync` and `cli`
   the host CLI runs from a minions source checkout and the project is minions, with local delivery and a clean
   checkout; its plan shows `git log --oneline <build commit>..HEAD`, the diffstat and the sensitive paths the
   range touches, and it always asks twice. Details: [host-manager.md](host-manager.md#phases).
+- **Dev self-update (task-99): installed minions unchanged.** For the minions project developing itself, the owner
+  can run the host-side `scripts/dev/self-update.mjs` ([coordinator-self-update.md](coordinator-self-update.md)). It
+  applies the coordinator's `upgrade --from-container` requests: `--sync-only`, a gate on the host, then
+  `upgrade --rebuild-cli` as a second run, each one a child `minions` process. It is not in the npm package and
+  never starts by itself. For installed minions the rules above stay as they are: no self-continuation (a freshly
+  built CLI always runs in a new process), `--rebuild-cli` only as an explicit flag, commits from
+  `--from-container` never built in the same run, and the manager's `/rebuild_cli` (owner decision Q3 in
+  [host-manager.md](host-manager.md#owner-decisions)) dev-only and asking twice.
 
 ### origin/<base> as the single source of truth
 
@@ -1204,6 +1284,17 @@ Scheduler rules:
   When repairs ≥ `maxRepairCyclesBeforeReplan`, response includes `replan: true` and status →
   awaiting-human. Records evidence keyed by head SHA + config revision. Releases the lease.
 - `work release <leaseId> --reason` releases without a result (worktree kept).
+- `work advance <leaseId> [--usage <n>] [--correction]` (task-68.7, unattended-delivery Phases item 6):
+  one coordinator call per stage hand-off. It records the submitted file through `record --submitted`,
+  then claims through `claim --compact` (the same task's next runnable stage first, else the first
+  `work next` entry) and returns `{record, next}` with the Agent parameters (`agentType`, `agentModel`,
+  `launch` for a process harness), or `{record, decision}` when the coordinator must judge. `kind` is one of
+  invalid, draining, replan, needs-split, needs-changes, awaiting-human, publication, blocked, partial,
+  ci-unverified, qa-findings, context-reset, paused, budget, capacity, nothing-runnable or claim-failed.
+  Decisions: it adds no checks of its own. Pauses, drain, budget and capacity come from `work next`, the
+  claim checks run again inside `claim`, and a refused claim after a successful record is a decision, not
+  an error. Exceptions on the recorded task (and a due context reset) claim nothing, even when other work
+  is runnable, so the coordinator handles them first. Like `claim`, it is coordinator-only (pre-bash hook).
 - File hand-offs (coordinator context diet). `work claim` also stores the brief at
   `/state/briefs/<leaseId>.json`; `--compact` prints only leaseId, briefMarker, taskId, title, role,
   attempt, branch, worktree, expectedHead and the brief command. `work brief <leaseId> --role <role>`
@@ -1255,10 +1346,16 @@ handoff, instead of one long session whose re-read context grows every turn. Imp
   conversation knows: open owner questions with the recommended answers, pending decisions, what the session waits
   on, the spend tally, chat context. A fresh coordinator reads it first (`handoff --read --json`, named in the
   recovery prompt and step 1 of the recover skill), together with `minions status`.
-- Settings: `coordinator.contextReset` `{ enabled, afterDelivery?, contextTokens?, handoffs? }`. Unset means on with
+- Settings: `coordinator.contextReset` `{ enabled, afterDelivery?, contextTokens?, handoffs?, barrierTokens? }`. Unset means on with
   the defaults (existing projects get resets without a config edit); `enabled: false` is the opt-out, which leaves
   resets to an explicit owner request. Unset trigger fields take the defaults (after delivery on, 60000 context
-  tokens, 10 hand-offs); `null` turns one trigger off.
+  tokens, 10 hand-offs, a 120000-token barrier); `null` turns one trigger off.
+- Reset barrier (task-57.6, [coordinator-sessions.md](coordinator-sessions.md) decision 2): once the context reaches
+  `barrierTokens` and only running workers (active leases, open runs) block the reset, `work claim` refuses
+  (PRECONDITION, detail `decision: context-reset-pending`), `work next` lists every stage as waiting with
+  `waitingOn: context-reset`, `work advance` returns the decision `context-reset-pending`, and the Stop guard allows the
+  stop. Records and releases go on; the last one makes the reset due (reaching the barrier is a `context` trigger).
+  Not during a drain, not with resets off, and not when the context is unknown (null). `status` shows the barrier.
 - Triggers are evaluated on demand from DB events, never by a timer. The session is scoped to the current lock by
   event id: events after the latest `coordinator-lock` event naming the current holder (pid and session). That
   event is written by `acquireCoordinatorLock`, the only writer of the lock, on every holder change; a re-entrant
@@ -1274,7 +1371,8 @@ handoff, instead of one long session whose re-read context grows every turn. Imp
 - Surfacing: `work record|release` responses carry `contextReset` (`due`, `reason`, `steps`) only when due, to keep
   responses small; `coordinator handoff --check --json` shows the full check (triggers, blockers, session counts);
   `minions status` adds a `context reset:` line and `contextReset` in `--json`.
-- The runtime never restarts the coordinator by itself. The coordinator, told by a response, finishes the current
+- The runtime never restarts the coordinator by itself for a context reset (the unattended routine's wakes, opt-in with
+  `routine.enabled`, are the one exception: [unattended-delivery.md](unattended-delivery.md)). The coordinator, told by a response, finishes the current
   owner exchange, sends pending notifications, writes the handoff, then runs
   `minions coordinator restart --recover --detach --json`. `--detach` is needed because the restart kills the tmux
   session the caller runs in: it checks active leases in-band (refusing with `PRECONDITION`), then runs the real

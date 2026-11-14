@@ -46,7 +46,7 @@ check() {
   local want; want="$(node -p 'require(process.argv[1]).version' "$SRC/package.json")"
   [ "$v" = "$want" ] || fail "minions --version printed '$v', expected '$want'"
   ok "minions --version = $v"
-  for f in dist/cli.js package.json docker/Dockerfile docker/gh-wrapper.sh schema/config.schema.json templates/plugin; do
+  for f in dist/cli.js package.json docker/Dockerfile schema/config.schema.json templates/plugin; do
     [ -e "$pkg/$f" ] || fail "installed package lacks $f"
   done
   ok "runtime assets present (dist, docker, schema, templates)"

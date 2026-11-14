@@ -29,7 +29,7 @@ describe('codex credential kind', () => {
       expect(msg).not.toContain(KEY);
     }
     expect(C.codexKeyGuidance().join('\n')).toMatch(/CODEX_API_KEY, never as an argument/);
-    expect(C.CREDENTIAL_KINDS.map((k) => k.name)).toEqual(['github', 'telegram', 'codex']);
+    expect(C.CREDENTIAL_KINDS.map((k) => k.name)).toEqual(['telegram', 'codex', 'claude']);
     expect(C.CODEX_CREDENTIAL.fileName).toBe('codex-api-key');
     expect(CONTAINER.codexKeyFile.endsWith('/codex-api-key')).toBe(true);
   });
@@ -45,7 +45,7 @@ describe('codex credential kind', () => {
 
     await C.provisionCodexKey({ projectId: ID, token: KEY2, repoPath: repo });
     expect(await C.readCodexKey(ID)).toBe(KEY2);
-    expect(await C.materializeSecrets(ID)).toEqual({ github: false, telegram: false, codex: true });
+    expect(await C.materializeSecrets(ID)).toEqual({ telegram: false, codex: true, claude: false });
     const mounted = `${projectPaths(ID).secretsDir}/codex-api-key`;
     expect(readFileSync(mounted, 'utf8')).toBe(KEY2 + '\n');
     expect(statSync(mounted).mode & 0o777).toBe(0o600);
@@ -61,6 +61,23 @@ describe('codex credential kind', () => {
     await C.removeCodexKey(ID);
     expect((await C.codexCredentialStatus(ID)).state).toBe('missing');
     expect(JSON.stringify(s)).not.toMatch(/sk-proj/);
+  });
+
+  it('task-14.14: refuses an Anthropic (sk-ant-) key, which also matches the sk- shape, without echoing it', async () => {
+    const ant = 'sk-ant-api03-AbcdefghijklmnopqrstuvwxyzABCDEF0123456789';
+    let msg = '';
+    try { C.checkOpenAiKeyFormat(ant); } catch (e) { msg = `${(e as Error).message} ${(e as { hint?: string }).hint ?? ''}`; }
+    expect(msg).toMatch(/Anthropic API key/);
+    expect(msg).not.toContain(ant);
+    const repo = makeRepo(env.root);
+    await expect(C.provisionCodexKey({ projectId: ID, token: ant, repoPath: repo })).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+    expect((await C.loadCredentialRefs(ID)).codex).toBeUndefined();
+    // One stored by an older build is reported as invalid.
+    await C.provisionCodexKey({ projectId: ID, token: KEY, repoPath: repo });
+    writeFileSync(new C.FileStore(C.CODEX_CREDENTIAL).path(ID), ant + '\n');
+    const s = await C.codexCredentialStatus(ID);
+    expect(s).toMatchObject({ state: 'invalid', detail: expect.stringMatching(/not an OpenAI API key/) });
+    expect(JSON.stringify(s)).not.toContain(ant);
   });
 
   it('refuses a malformed key before storing anything', async () => {

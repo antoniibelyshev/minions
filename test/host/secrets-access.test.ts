@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { projectPaths } from '../../src/core/paths.js';
 import { writeKeyFile, ensureSecretsDir } from '../../src/host/auth.js';
 import { authPlan } from '../../src/host/auth-cli.js';
-import { materializeSecrets, provisionGithubToken } from '../../src/host/credentials.js';
+import { materializeSecrets, provisionCodexKey } from '../../src/host/credentials.js';
 import { composeYaml } from '../../src/host/docker.js';
 import { linuxDockerChecks, linuxHostFacts, unknownLinuxFacts, type LinuxHostFacts } from '../../src/host/linux-host.js';
 import type { ProjectJson } from '../../src/host/project.js';
@@ -17,10 +17,10 @@ import {
 import { makeRepo, withHome } from './fixtures.js';
 
 const ID = '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f';
-const TOKEN = 'github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789';
+const TOKEN = 'sk-proj-11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789';
 const project: ProjectJson = {
   version: 1, projectId: ID, repoPath: '/home/x/repo', gitCommonDir: '/home/x/repo/.git', visibility: 'private',
-  profile: 'personal-work', imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null,
+  mode: 'supervised', imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null,
   gitIdentity: { name: 'Ada', email: 'ada@example.com' },
   container: { cpus: 4, memoryMiB: 6144, pidsLimit: 512, publishPorts: [], network: 'outbound-internet' },
 };
@@ -140,32 +140,32 @@ describe('secrets directory modes', () => {
 
   it('owner mode: dir 0700, token and key files 0600 (unchanged)', async () => {
     const repo = makeRepo(env.root);
-    await provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false });
+    await provisionCodexKey({ projectId: ID, token: TOKEN, repoPath: repo });
     const p = projectPaths(ID);
     await materializeSecrets(ID, undefined, { mode: 'owner' });
     await writeKeyFile(ID, 'sk-test', { mode: 'owner' });
     expect(mode(p.secretsDir)).toBe(0o700);
-    expect(mode(p.githubTokenFile)).toBe(0o600);
+    expect(mode(p.codexKeyFile)).toBe(0o600);
     expect(mode(p.apiKeyFile)).toBe(0o600);
   });
 
   it('group mode: dir 0750, files 0640 with the group, owner unchanged, no temp files', async () => {
     const repo = makeRepo(env.root);
-    await provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false });
+    await provisionCodexKey({ projectId: ID, token: TOKEN, repoPath: repo });
     const p = projectPaths(ID);
     const old = process.umask(0o077); // a strict umask must not narrow the group bits
     try {
       await materializeSecrets(ID, undefined, own());
       await writeKeyFile(ID, 'sk-test', own());
     } finally { process.umask(old); }
-    for (const f of [p.secretsDir, p.githubTokenFile, p.apiKeyFile]) {
+    for (const f of [p.secretsDir, p.codexKeyFile, p.apiKeyFile]) {
       expect(statSync(f).gid).toBe(process.getgid!());
       expect(statSync(f).uid).toBe(process.getuid!());
     }
     expect(mode(p.secretsDir)).toBe(0o750);
-    expect(mode(p.githubTokenFile)).toBe(0o640);
+    expect(mode(p.codexKeyFile)).toBe(0o640);
     expect(mode(p.apiKeyFile)).toBe(0o640);
-    expect(readFileSync(p.githubTokenFile, 'utf8')).toBe(TOKEN + '\n');
+    expect(readFileSync(p.codexKeyFile, 'utf8')).toBe(TOKEN + '\n');
     expect(readdirSync(p.secretsDir).filter((n) => n.endsWith('.tmp'))).toEqual([]);
   });
 

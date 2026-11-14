@@ -7,17 +7,17 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { atomicWrite } from '../../src/core/fsutil.js';
 import { projectPaths } from '../../src/core/paths.js';
 import { ensureSecretsDir, writeKeyFile } from '../../src/host/auth.js';
-import { materializeSecrets, provisionGithubToken } from '../../src/host/credentials.js';
+import { materializeSecrets, provisionCodexKey } from '../../src/host/credentials.js';
 import { composeYaml } from '../../src/host/docker.js';
 import type { ProjectJson } from '../../src/host/project.js';
 import { dockerLooksRootless, probeSecretsAccess, secretsAccessFor, type SecretsAccess } from '../../src/host/secrets-access.js';
 import { makeRepo, withHome } from './fixtures.js';
 
 const ID = '7a1b2c3d-4e5f-4a6b-8c7d-9e0f1a2b3c4d';
-const TOKEN = 'github_pat_11QAQAQAQ0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789';
+const TOKEN = 'sk-proj-11QAQAQAQ0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789';
 const project: ProjectJson = {
   version: 1, projectId: ID, repoPath: '/home/x/repo', gitCommonDir: '/home/x/repo/.git', visibility: 'private',
-  profile: 'personal-work', imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null,
+  mode: 'supervised', imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null,
   gitIdentity: { name: 'Ada', email: 'ada@example.com' },
   container: { cpus: 4, memoryMiB: 6144, pidsLimit: 512, publishPorts: [], network: 'outbound-internet' },
 };
@@ -75,20 +75,20 @@ describe('real secret writes and transitions', () => {
 
   it('private -> shared group (e.g. a member added): re-provision narrows the dir and every file back to owner-only', async () => {
     const repo = makeRepo(env.root);
-    await provisionGithubToken({ projectId: ID, token: TOKEN, repoPath: repo, verify: false });
+    await provisionCodexKey({ projectId: ID, token: TOKEN, repoPath: repo });
     const p = projectPaths(ID);
     const priv = probeSecretsAccess({ platform: 'linux', uid: 4001, readFile: read(passwd(), group()) });
     expect(priv.mode).toBe('group');
     await materializeSecrets(ID, undefined, priv);
     await writeKeyFile(ID, 'sk-qa', priv);
-    expect([mode(p.secretsDir), mode(p.githubTokenFile), mode(p.apiKeyFile)]).toEqual([0o750, 0o640, 0o640]);
-    expect(statSync(p.githubTokenFile).gid).toBe(gid);
+    expect([mode(p.secretsDir), mode(p.codexKeyFile), mode(p.apiKeyFile)]).toEqual([0o750, 0o640, 0o640]);
+    expect(statSync(p.codexKeyFile).gid).toBe(gid);
 
     // Someone joins ada's group: the next probe refuses, and the next materialize re-modes everything.
     const nowShared = probeSecretsAccess({ platform: 'linux', uid: 4001, readFile: read(passwd(), `ada:x:${gid}:mallory\n`) });
     expect(nowShared.mode).toBe('unsupported');
     await materializeSecrets(ID, undefined, nowShared);
-    expect([mode(p.secretsDir), mode(p.githubTokenFile), mode(p.apiKeyFile)]).toEqual([0o700, 0o600, 0o600]);
+    expect([mode(p.secretsDir), mode(p.codexKeyFile), mode(p.apiKeyFile)]).toEqual([0o700, 0o600, 0o600]);
     expect(composeYaml(project, nowShared)).not.toContain('group_add');
   });
 
@@ -96,10 +96,10 @@ describe('real secret writes and transitions', () => {
     const p = projectPaths(ID);
     const priv: SecretsAccess = { mode: 'group', gid, group: 'ada', user: 'ada' };
     await writeKeyFile(ID, 'sk-1', priv);
-    writeFileSync(`${p.secretsDir}/github-token`, 'x\n', { mode: 0o640 });
+    writeFileSync(`${p.secretsDir}/codex-api-key`, 'x\n', { mode: 0o640 });
     await writeKeyFile(ID, 'sk-2', { mode: 'unsupported', reason: 'shared' });
     expect(mode(p.apiKeyFile)).toBe(0o600);
-    expect(mode(`${p.secretsDir}/github-token`)).toBe(0o600);
+    expect(mode(`${p.secretsDir}/codex-api-key`)).toBe(0o600);
     expect(mode(p.secretsDir)).toBe(0o700);
     expect(readFileSync(p.apiKeyFile, 'utf8')).toBe('sk-2');
   });

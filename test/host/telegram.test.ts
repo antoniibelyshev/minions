@@ -30,7 +30,7 @@ const { saveRegistry } = await import('../../src/host/registry.js');
 const { DEFERRED_FEATURES, listUnavailable, validateConfig } = await import('../../src/config/resolve.js');
 const { redact } = await import('../../src/core/output.js');
 const { MinionsError } = await import('../../src/core/errors.js');
-const { evaluateTelegram, TELEGRAM_PLUGIN_ID } = await import('../../src/telegram/probe.js');
+const { hostChannelServerProbe } = await import('../../src/telegram/channel/launch.js');
 const { defaults } = await import('../helpers.js');
 const { dockerDown, dockerUp, makeRepo, withHome } = await import('./fixtures.js');
 type RunResult = import('../../src/core/exec.js').RunResult;
@@ -39,7 +39,7 @@ type RunOptions = import('../../src/core/exec.js').RunOptions;
 const ID = '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f';
 const OTHER = '9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d';
 const TOKEN = '123456789:AAHfakefakefakefakefakefakefake_-0123';
-const GH = 'github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789';
+const KEY = 'sk-proj-11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyzABCDEFGHIJ0123456789';
 
 let env: ReturnType<typeof withHome>;
 let prevStore: string | undefined;
@@ -78,7 +78,7 @@ describe('bot token format', () => {
 
   it('rejects anything that could break out of a keychain line or environment, before any store call', async () => {
     const hostile = ['', 'hunter2', `${TOKEN} -w x`, `${TOKEN}\nadd-generic-password -s evil`, `${TOKEN}"`, `${TOKEN};id`, `${TOKEN}$(id)`,
-      '12:AAHfakefakefakefakefakefakefake_-0123', `123456789:${'a'.repeat(10)}`, GH];
+      '12:AAHfakefakefakefakefakefakefake_-0123', `123456789:${'a'.repeat(10)}`, KEY];
     const { calls, runner } = recorder();
     const ks = new C.KeychainStore(runner, C.TELEGRAM_CREDENTIAL);
     for (const t of hostile) {
@@ -98,36 +98,36 @@ describe('bot token format', () => {
 });
 
 describe('provisioning through the shared credential mechanism', () => {
-  it('file store: 0600 token file separate from the GitHub token; reference holds only the bot id', async () => {
+  it('file store: 0600 token file separate from the Codex key; reference holds only the bot id', async () => {
     const repo = makeRepo(env.root);
-    await C.provisionGithubToken({ projectId: ID, token: GH, repoPath: repo, verify: false });
+    await C.provisionCodexKey({ projectId: ID, token: KEY, repoPath: repo });
     const r = await C.provisionTelegramToken({ projectId: ID, token: TOKEN, repoPath: repo });
     expect(r).toMatchObject({ backend: 'file', botId: '123456789', verification: null, sharedWith: [], warnings: [] });
     const file = new C.FileStore(C.TELEGRAM_CREDENTIAL).path(ID);
-    expect(file).not.toBe(new C.FileStore().path(ID));
+    expect(file).not.toBe(new C.FileStore(C.CODEX_CREDENTIAL).path(ID));
     expect(readFileSync(file, 'utf8')).toBe(TOKEN + '\n');
     expect(mode(file)).toBe(0o600);
     const refText = readFileSync(projectPaths(ID).credentialsJson, 'utf8');
     expect(refText).not.toContain(TOKEN);
-    expect(JSON.parse(refText)).toMatchObject({ github: { backend: 'file' }, telegram: { backend: 'file', botId: '123456789', ref: `file:${file}` } });
+    expect(JSON.parse(refText)).toMatchObject({ codex: { backend: 'file' }, telegram: { backend: 'file', botId: '123456789', ref: `file:${file}` } });
     expect(JSON.stringify(r)).not.toContain(TOKEN);
     for (const p of allFiles(repo)) expect(readFileSync(p, 'utf8')).not.toContain(TOKEN);
 
-    // Materialized next to the GitHub token in the read-only mounted dir.
-    expect(await C.materializeSecrets(ID)).toEqual({ github: true, telegram: true, codex: false });
+    // Materialized next to the Codex key in the read-only mounted dir.
+    expect(await C.materializeSecrets(ID)).toEqual({ telegram: true, codex: true, claude: false });
     expect(readFileSync(projectPaths(ID).telegramTokenFile, 'utf8')).toBe(TOKEN + '\n');
     expect(mode(projectPaths(ID).telegramTokenFile)).toBe(0o600);
     expect(CONTAINER.telegramTokenFile).toBe('/opt/minions/secrets/telegram-bot-token');
 
-    // Removing the Telegram token leaves the GitHub token alone.
+    // Removing the Telegram token leaves the Codex key alone.
     expect(await C.removeTelegramToken(ID)).toEqual({ removed: true, backend: 'file' });
     expect(existsSync(file)).toBe(false);
     expect(existsSync(projectPaths(ID).telegramTokenFile)).toBe(false);
-    expect(existsSync(projectPaths(ID).githubTokenFile)).toBe(true);
-    expect(await C.readGithubToken(ID)).toBe(GH);
-    expect(await C.materializeSecrets(ID)).toEqual({ github: true, telegram: false, codex: false });
+    expect(existsSync(projectPaths(ID).codexKeyFile)).toBe(true);
+    expect(await C.readCodexKey(ID)).toBe(KEY);
+    expect(await C.materializeSecrets(ID)).toEqual({ telegram: false, codex: true, claude: false });
     await C.clearSecrets(ID);
-    expect(existsSync(projectPaths(ID).githubTokenFile)).toBe(false);
+    expect(existsSync(projectPaths(ID).codexKeyFile)).toBe(false);
   });
 
   it('keychain: own service name; the token goes through stdin, never argv', async () => {
@@ -216,33 +216,8 @@ function answering(answers: Record<string, string>, secrets: string[] = []) {
   };
 }
 
-describe('wizard', () => {
-  it('offers Telegram and guides bot creation, pairing and allowlisting; questions never ask for secrets', async () => {
-    const repo = makeRepo(env.root);
-    const a = answering({ 'Communication channel': 'telegram' });
-    const r = await runWizard({ discovery: await discover(repo), projectId: ID, yes: false, io: a.io });
-    expect(r.config.communication.channel).toBe('telegram');
-    expect(r.asked).toContain('communication.channel');
-    const text = a.info.join('\n');
-    for (const s of ['https://t.me/BotFather', '/newbot', 'One coordinator per bot', '/telegram:access pair <code>', '/telegram:access policy allowlist',
-      'Pair only yourself', 'Unpaired senders get no access', 'research preview', 'Terminal mode always keeps working']) expect(text).toContain(s);
-    for (const q of a.asked) expect(q).not.toMatch(/token|password|secret|api key/i);
-  });
-
-  it('falls back to terminal with a clear reason when Telegram cannot work (network none)', async () => {
-    const repo = makeRepo(env.root);
-    const { profileDefaults } = await import('../../src/config/profiles.js');
-    const existing = profileDefaults('project-owner', { hasGitHub: false, baseBranch: 'main', identity: { name: 'A', email: 'a@b' }, projectId: ID, packageVersion: '0.1.0' }).config;
-    existing.container.network = 'none';
-    const a = answering({ 'Communication channel': 'telegram' });
-    const r = await runWizard({ discovery: await discover(repo), projectId: ID, yes: false, io: a.io, existing });
-    expect(r.config.communication.channel).toBe('terminal');
-    expect(r.notes.join()).toMatch(/Telegram is unavailable: container.network is none.*Using terminal/);
-  });
-});
-
 describe('init and doctor', () => {
-  const container = (opts: { probe: 'available' | 'no-bun'; access?: string; offAtUserScope?: boolean; poller?: string }) => recorder((c) => {
+  const container = (opts: { probe: 'available' | 'old-claude'; access?: string; poller?: string }) => recorder((c) => {
     const a = c.args.join(' ');
     if (c.cmd !== 'docker') return undefined;
     if (a.startsWith('image inspect')) return { code: 0, stdout: 'x\n', stderr: '' };
@@ -250,11 +225,7 @@ describe('init and doctor', () => {
     if (a.endsWith('claude auth status') || a.endsWith('backlog --version') || a.endsWith('coordinator --probe --json')) return { code: 0, stdout: '1.54.0\n', stderr: '' };
     if (a.endsWith('telegram probe --json')) {
       const ok = (stdout: string) => ({ code: 0, stdout, stderr: '' });
-      const report = evaluateTelegram({
-        claude: ok('2.1.292 (Claude Code)'), bun: opts.probe === 'available' ? ok('1.4.3') : { code: 127, stdout: '', stderr: 'not found' },
-        marketplaces: ok(JSON.stringify([{ name: 'claude-plugins-official', source: 'github', repo: 'anthropics/claude-plugins-official' }])),
-        plugins: ok(JSON.stringify([{ id: TELEGRAM_PLUGIN_ID, version: '0.0.7', scope: 'user', enabled: !opts.offAtUserScope }])), managed: { present: false },
-      });
+      const report = hostChannelServerProbe({ claudeVersion: opts.probe === 'available' ? '2.1.308 (Claude Code)' : '2.0.1 (Claude Code)', token: 'ok', command: true });
       return ok(JSON.stringify({ ok: true, data: report }));
     }
     if (a.endsWith('telegram status --json')) {
@@ -267,12 +238,12 @@ describe('init and doctor', () => {
   it('interactive init with Telegram stores the token via the hidden prompt; doctor reports ok', async () => {
     const repo = makeRepo(env.root);
     const a = answering({ 'Communication channel': 'telegram', 'Store the Telegram bot token': 'y', 'Check the token with Telegram': 'n' }, [TOKEN]);
-    const r = await runInit({ path: repo, yes: false, visibility: 'private', io: a.io, dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'independent', path: repo, yes: false, visibility: 'private', io: a.io, dockerProbe: dockerUp });
     expect(r.telegram).toMatchObject({ status: 'stored', provisioned: { backend: 'file', botId: '123456789' } });
     expect(a.asked).toContain('secret:Telegram bot token (input hidden): ');
-    expect(r.plan.communication.channel).toBe('telegram');
+    expect(r.plan.communication.channel).toBe('auto');
     expect(r.plan.externalSetup.join('\n')).toContain('/opt/minions/secrets/telegram-bot-token');
-    expect(r.nextSteps.join('\n')).toContain('/telegram:access pair <code>');
+    expect(r.nextSteps.join('\n')).toContain('minions telegram access pair <code>');
     expect(await C.readTelegramToken(r.plan.projectId)).toBe(TOKEN);
     expect(JSON.stringify(r) + formatInit(r)).not.toContain(TOKEN);
     const p = projectPaths(r.plan.projectId);
@@ -283,37 +254,24 @@ describe('init and doctor', () => {
     const ok = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'available' }).runner });
     const by = (n: string) => ok.checks.find((c) => c.name === n);
     expect(by('telegram.credential')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/^ok: bot 123456789/) });
-    expect(by('telegram.plugin')?.status).toBe('ok');
+    expect(by('telegram.server')?.status).toBe('ok');
     expect(by('telegram.access')?.status).toBe('ok');
     expect(by('telegram')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/^ok:/) });
     expect(by('features')!.detail).not.toContain('Telegram');
     expect(ok.healthy).toBe(true);
     expect(JSON.stringify(ok) + formatDoctor(ok)).not.toContain(TOKEN);
 
-    // Task-52: plugin off at user scope (the task-51 state) and a coordinator without a live poller: the
-    // launch's flag enabledPlugins may have been ignored. telegram.plugin warns (never fails); readiness
-    // still follows the probe.
+    // No live channel server for a running Telegram coordinator: telegram.poller warns, readiness follows the probe.
     for (const poller of ['missing', 'dead']) {
-      const w = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'available', offAtUserScope: true, poller }).runner });
-      expect(w.checks.find((c) => c.name === 'telegram.plugin'), poller).toMatchObject({ status: 'warn',
-        detail: expect.stringMatching(new RegExp(`off at user scope and the running coordinator has no live poller \\(bot.pid ${poller}\\).*enabledPlugins may have been ignored`)),
-        hint: expect.stringContaining('minions coordinator restart --recover') });
-      expect(w.checks.find((c) => c.name === 'telegram.poller')?.status).toBe('warn');
+      const w = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'available', poller }).runner });
+      expect(w.checks.find((c) => c.name === 'telegram.poller')?.status, poller).toBe('warn');
       expect(w.checks.find((c) => c.name === 'telegram')).toMatchObject({ status: 'ok' });
       expect(w.checks.some((c) => c.name.startsWith('telegram') && c.status === 'fail')).toBe(false);
     }
-    // Off at user scope with a live coordinator poller, or no running Telegram coordinator: ok.
-    for (const poller of ['ok', 'not-applicable', undefined]) {
-      const fine = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'available', offAtUserScope: true, ...(poller ? { poller } : {}) }).runner });
-      expect(fine.checks.find((c) => c.name === 'telegram.plugin'), String(poller)).toMatchObject({ status: 'ok', detail: expect.not.stringMatching(/no live poller/) });
-    }
-    // Enabled at user scope (pre-launch state) with no poller: telegram.poller reports it, telegram.plugin stays ok.
-    const en = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'available', poller: 'missing' }).runner });
-    expect(en.checks.find((c) => c.name === 'telegram.plugin')?.status).toBe('ok');
 
-    // Plugin unavailable (e.g. outdated image without Bun): unavailable, never fail.
-    const un = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'no-bun', access: 'unpaired' }).runner });
-    expect(un.checks.find((c) => c.name === 'telegram')).toMatchObject({ status: 'unavailable', detail: expect.stringMatching(/^unavailable: .*Bun is not installed.*terminal-only/) });
+    // Channel server unavailable (a Claude Code without development channels): unavailable, never fail.
+    const un = await runDoctor({ cwd: repo, probe: dockerUp, runner: container({ probe: 'old-claude', access: 'unpaired' }).runner });
+    expect(un.checks.find((c) => c.name === 'telegram')).toMatchObject({ status: 'unavailable', detail: expect.stringMatching(/^unavailable: .*terminal-only/) });
     expect(un.checks.find((c) => c.name === 'telegram.access')?.status).toBe('warn');
     expect(un.checks.filter((c) => c.name.startsWith('telegram')).some((c) => c.status === 'fail')).toBe(false);
 
@@ -324,34 +282,34 @@ describe('init and doctor', () => {
     expect(existsSync(p.telegramTokenFile)).toBe(false);
   });
 
-  it('Telegram selected without a token: init says terminal-only until stored; doctor reports missing', async () => {
+  it('independent, token declined: init says terminal-only until stored; doctor reports it missing', async () => {
     const repo = makeRepo(env.root);
-    const a = answering({ 'Communication channel': 'telegram', 'Store the Telegram bot token': 'n' });
-    const r = await runInit({ path: repo, yes: false, visibility: 'private', io: a.io, dockerProbe: dockerUp });
+    const a = answering({ 'Store the Telegram bot token': 'n' });
+    const r = await runInit({ mode: 'independent', path: repo, yes: false, visibility: 'private', io: a.io, dockerProbe: dockerUp });
     expect(r.telegram).toMatchObject({ status: 'skipped', detail: expect.stringMatching(/terminal-only until a bot token is stored with `minions auth telegram`/) });
     expect(a.asked.some((q) => q.startsWith('secret:'))).toBe(false);
     expect(r.nextSteps.join('\n')).toContain('minions auth telegram');
     const doc = await runDoctor({ cwd: repo, probe: dockerDown, runner: recorder().runner });
-    expect(doc.checks.find((c) => c.name === 'telegram.credential')).toMatchObject({ status: 'warn', detail: expect.stringMatching(/^missing:/) });
-    expect(doc.checks.find((c) => c.name === 'telegram')).toMatchObject({ status: 'warn', detail: expect.stringMatching(/^missing:.*terminal-only/) });
+    expect(doc.checks.find((c) => c.name === 'telegram.credential')?.detail).toMatch(/^missing:/);
+    expect(doc.checks.find((c) => c.name === 'telegram')?.detail).toMatch(/terminal mode/);
   });
 
-  it('auto projects (default) without a token: terminal mode, no prompt, optional hint', async () => {
+  it('non-interactive independent init without a token: terminal mode until stored, no prompt', async () => {
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     expect(r.plan.communication.channel).toBe('auto');
-    expect(r.telegram).toBeUndefined();
-    expect(r.nextSteps.join('\n')).toMatch(/Optional Telegram \(channel auto\): `minions auth telegram`/);
+    expect(r.telegram).toMatchObject({ status: 'skipped', detail: expect.stringMatching(/^non-interactive init; .*terminal-only/) });
+    expect(r.nextSteps.join('\n')).toContain('Run `minions auth telegram`');
     const doc = await runDoctor({ cwd: repo, probe: dockerDown, runner: recorder().runner });
     expect(doc.checks.find((c) => c.name === 'telegram')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/^auto: terminal mode \(auto: no Telegram bot token is stored/) });
     expect(doc.checks.find((c) => c.name === 'telegram.credential')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/^missing: optional/) });
     expect(doc.checks.find((c) => c.name === 'communication.channel')).toMatchObject({ status: 'ok', detail: expect.stringMatching(/^configured auto, effective terminal/) });
   });
 
-  it('terminal projects: Telegram reported as not selected, no prompt', async () => {
+  it('supervised projects (terminal): Telegram reported as not selected, no prompt', async () => {
     const repo = makeRepo(env.root);
-    const a = answering({ 'Communication channel': 'terminal' });
-    const r = await runInit({ path: repo, yes: false, visibility: 'private', io: a.io, dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'supervised', runtime: 'docker', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    expect(r.plan.communication.channel).toBe('terminal');
     expect(r.telegram).toBeUndefined();
     const doc = await runDoctor({ cwd: repo, probe: dockerDown, runner: recorder().runner });
     expect(doc.checks.find((c) => c.name === 'telegram')).toMatchObject({ status: 'ok', detail: 'terminal mode (Telegram not selected)' });

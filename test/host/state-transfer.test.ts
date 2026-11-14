@@ -16,7 +16,7 @@ import { withHome } from './fixtures.js';
 const ID = '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f';
 const project: ProjectJson = {
   version: 1, projectId: ID, repoPath: '/Users/x/repo', gitCommonDir: '/Users/x/repo/.git', visibility: 'private',
-  profile: 'personal-work', imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null,
+  mode: 'supervised', imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null,
   gitIdentity: { name: 'Ada', email: 'ada@example.com' },
   container: { cpus: 4, memoryMiB: 6144, pidsLimit: 512, publishPorts: [], network: 'outbound-internet' },
 };

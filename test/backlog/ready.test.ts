@@ -5,7 +5,7 @@ import type { ScopeFilter, Task } from '../../src/backlog/types.js';
 const t = (id: string, over: Partial<Task> = {}): Task => ({
   id, locator: `backlogmd:${id.toUpperCase()}`, title: id, description: '', acceptanceCriteria: [],
   status: 'ready', priority: null, dependencies: [], parent: null, externalLinks: [], labels: [],
-  authorized: true, branch: null, commits: [], prUrl: null, provenance: 'user-decision', version: 'v', milestone: null, ...over,
+  authorized: true, branch: null, commits: [], provenance: 'user-decision', version: 'v', milestone: null, ...over,
 });
 const scope: ScopeFilter = { milestone: null, requiredLabels: [], allowedPaths: ['**'] };
 const ctxFor = (tasks: Task[], over: Partial<Parameters<typeof filterReady>[1]> = {}) => {

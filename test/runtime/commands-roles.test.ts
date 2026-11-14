@@ -14,7 +14,7 @@ beforeAll(() => {
   root = tmp();
   mkdirSync(join(root, 'state'), { recursive: true });
   const roles = { researcher: { description: 'Researches.', promptText: 'Research.', contract: 'producer' } };
-  writeFileSync(join(root, 'config.json'), JSON.stringify({ ...defaults('project-owner'), roles }));
+  writeFileSync(join(root, 'config.json'), JSON.stringify({ ...defaults('independent'), roles }));
   process.env.MINIONS_RUNTIME = 'container';
   process.env.MINIONS_STATE_DIR = join(root, 'state');
   process.env.MINIONS_CONFIG = join(root, 'config.json');

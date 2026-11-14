@@ -1,21 +1,21 @@
 import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readSync, renameSync, writeSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import { filterReady } from '../backlog/ready.js';
-import type { BacklogAdapter, Task } from '../backlog/types.js';
-import { AGENT_MODEL_ALIASES, isAgentModelAlias } from '../config/models.js';
-import { HARNESSES, isProcessHarness } from '../config/harnesses.js';
-import { agentTypeRole, DEEP_SUFFIX, workerRoleNames } from '../config/roles.js';
+import type { BacklogAdapter } from '../backlog/types.js';
+import { agentTypeRole, DEEP_SUFFIX } from '../config/roles.js';
 import type { MinionsConfig, RoleContract } from '../config/schema.js';
 import { sha256 } from '../core/fsutil.js';
+import { hangGuarded } from './hook-guard.js';
 import { redact } from '../core/output.js';
 import type { BuiltinLeaseRole, DrainNoticeVia, LeaseRole, RuntimeDb } from './db.js';
-import { TELEGRAM_TOOL_PREFIX } from './coordinator.js';
+import { TELEGRAM_TOOL_PREFIXES } from './coordinator.js';
 import { runtimePaths } from './paths.js';
-import { capacityOf, scopeOf } from './scheduler.js';
-import { currentBudget } from './spend.js';
 import { noteTranscript } from './context-reset.js';
 import { trackCoordinatorUsage } from './coordinator-usage.js';
+import { readHolds, type DispatchHold } from './dispatch-state.js';
+import { hookScope } from './session-scope.js';
+import { sessionStopGuard } from './session-stop.js';
 import { scanShell, ShellParseError, type ShellScan } from './shell-scan.js';
+import { bashStateReference, protectedStatePath, stateGuard, type StateGuard } from './state-guard.js';
 
 export interface HookDeps { db: RuntimeDb; backlog: BacklogAdapter; config: MinionsConfig }
 export type HookLoader = () => HookDeps | Promise<HookDeps>;
@@ -55,82 +55,58 @@ export function hookLog(line: string, path = runtimePaths().hooksLog): void {
 
 const isObj = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
-/** True if the Stop input reports a running background subagent/task. */
-function backgroundRunning(input: Record<string, unknown>): boolean {
-  const bt = input.background_tasks;
-  if (!Array.isArray(bt)) return false;
-  return bt.some((t) => !isObj(t) || typeof t.status !== 'string' || /^(running|pending|in[_-]?progress|active|started)$/i.test(t.status));
-}
-
 const block = (reason: string): HookOutput => ({ stdout: JSON.stringify({ decision: 'block', reason }), reason });
 
+/** The Stop guard's progress fingerprint of held decisions: a hold resolved, added or re-held changes it. */
+export const holdsFingerprint = (holds: DispatchHold[]): string => sha256(JSON.stringify({ holds: holds.map((h) => `${h.taskId}:${h.kind}:${h.at}`).sort() }));
+
+/** The continuation text while the dispatcher holds tasks for a decision. */
+export const holdsReason = (holds: DispatchHold[]): string =>
+  `minions: the dispatcher holds ${holds.length} task(s) for your decision: ${holds.slice(0, 5).map((h) => `${h.taskId} (${h.kind})`).join(', ')}. See \`minions work autopilot status --json\`; handle each, then \`minions work autopilot resume <taskId>\` if its status did not change. If you cannot decide, ask the owner and stop.`;
+
 /**
- * Stop guard: blocks only when authorized runnable work and capacity exist and state has progressed;
- * otherwise allows stopping. Any internal failure allows stopping.
+ * Stop guard (docs/design/autonomy.md Decision 10): the autopilot dispatcher runs every stage, so only its held
+ * decisions keep the coordinator going, until NO_PROGRESS_LIMIT continuations passed with the holds unchanged. Any
+ * internal failure allows stopping. In a coordinator session (MINIONS_SESSION, phase 6) the transcript and usage are
+ * recorded for that session and the decision is sessionStopGuard's; a malformed value allows the stop and records nothing.
  */
-export async function stopHook(input: unknown, load: HookLoader): Promise<HookOutput> {
+export async function stopHook(input: unknown, load: HookLoader, env: NodeJS.ProcessEnv = process.env): Promise<HookOutput> {
+  // A headless worker ends when its stage is done; the dispatcher records it.
+  if (env[WORKER_LEASE_ENV]) return { reason: `allow: headless worker ${String(env[WORKER_LEASE_ENV]).slice(0, 60)}` };
   const inp = isObj(input) ? input : {};
+  const session = hookScope(env);
+  if (session.invalid) return { reason: 'allow: MINIONS_SESSION is not a session key (nothing recorded)' };
   let deps: HookDeps;
   try { deps = await load(); } catch (e) { return { reason: `allow: state unavailable (${(e as Error).message})` }; }
-  const { db, backlog, config } = deps;
+  const { db, config } = deps;
   // Context-reset trigger input (task-45): the main session's transcript, for its latest usage. Never affects the decision.
-  try { noteTranscript(db, inp); } catch { /* best-effort */ }
+  try { noteTranscript(db, inp, new Date(), session.scope); } catch { /* best-effort */ }
   // Coordinator token tracking (task-57.1): this turn's main-session usage from the transcript. Bounded, never throws, never affects the decision.
-  try { trackCoordinatorUsage({ db, config }, inp); } catch { /* best-effort */ }
+  try { trackCoordinatorUsage({ db, config, env }, inp); } catch { /* best-effort */ }
+  if (session.scope) return sessionStopGuard(deps, session.scope);
   const allow = (reason: string, detail = reason): HookOutput => {
     try { db.setGuard({ fingerprint: null, count: 0, last_reason: reason }); } catch { /* ignore */ }
     return { reason: `allow: ${detail}` };
   };
   try {
-    if (db.paused().starts) return allow('paused');
-    if (currentBudget({ db, config })?.exhausted) return allow('budget', 'the owner budget is used up (new claims are refused)');
-    if (backgroundRunning(inp)) return allow('background-running', 'a background subagent is still running');
-    const leases = db.activeLeases();
-    const leased = new Set(leases.map((l) => l.task_id));
-    // One backlog snapshot per turn end (task-24.2): ready tasks, capacity and continuing stages all derive from it.
-    let tasks: Task[];
-    try {
-      tasks = await backlog.listTasks();
-    } catch (e) {
-      return allow('backlog-error', `backlog query failed (${(e as Error).message})`);
-    }
-    const byId = new Map(tasks.map((t) => [t.id, t]));
-    const ready = filterReady(tasks, { leased, scope: scopeOf(config), lookup: (id) => byId.get(id) }, 50);
-    const cap = capacityOf(config, leases, tasks);
-    const canStart = cap.freeTaskSlots > 0 && cap.freeEngineerSlots > 0;
-    const startable = canStart ? ready.filter((t) => !leased.has(t.id)) : [];
-    const continuing = tasks.filter((t) => !leased.has(t.id) &&
-      (t.status === 'testing' || t.status === 'reviewing' || (t.status === 'changes-requested' && cap.freeEngineerSlots > 0)));
-    if (!startable.length && !continuing.length) {
-      return ready.length ? allow('no-capacity', `${ready.length} ready but no capacity`) : allow('no-ready', 'no runnable tasks');
-    }
-    const fingerprint = sha256(JSON.stringify({
-      ready: ready.map((t) => t.id).sort(),
-      continuing: continuing.map((t) => `${t.id}:${t.status}`).sort(),
-      leases: leases.map((l) => l.id).sort(),
-      // Usage events are not progress: the coordinator's own usage is recorded on every Stop (task-57.1).
-      lastEvent: db.get<{ id: number | null }>("SELECT MAX(id) AS id FROM events WHERE kind != 'usage'")?.id ?? 0,
-    }));
+    // Coordinator sessions on: a hold goes to its task session, so the single coordinator is never kept running for it.
+    if (config.coordinator?.sessions?.enabled === true) return allow('sessions-on', 'coordinator sessions are on: holds go to their task sessions');
+    const holds = Object.values(readHolds(db));
+    if (!holds.length) return allow('no-holds', 'the autopilot dispatcher runs the stages; no decision waits');
+    const fp = holdsFingerprint(holds);
     const g = db.guard();
-    if (g.fingerprint === fingerprint && g.count >= NO_PROGRESS_LIMIT) {
-      db.setGuard({ fingerprint, count: g.count, last_reason: 'no-progress' });
-      return { reason: 'allow: no-progress (state unchanged after repeated continuation)' };
+    if (g.fingerprint === fp && g.count >= NO_PROGRESS_LIMIT) {
+      db.setGuard({ fingerprint: fp, count: g.count, last_reason: 'no-progress' });
+      return { reason: 'allow: no-progress (the held decisions are unchanged after repeated continuation)' };
     }
-    const count = g.fingerprint === fingerprint ? g.count + 1 : 1;
-    db.setGuard({ fingerprint, count, last_reason: 'continue' });
-    const parts: string[] = [];
-    if (startable.length) parts.push(`${startable.length} ready task(s) (${startable.slice(0, 5).map((t) => t.id).join(', ')}), capacity ${Math.min(cap.freeTaskSlots, cap.freeEngineerSlots)}`);
-    if (continuing.length) parts.push(`${continuing.length} task(s) awaiting the next stage (${continuing.slice(0, 5).map((t) => `${t.id}:${t.status}`).join(', ')})`);
-    return block(`minions: ${parts.join('; ')}; run /minions:orchestrate to dispatch the next one. If nothing can proceed, report why and stop.`);
+    db.setGuard({ fingerprint: fp, count: g.fingerprint === fp ? g.count + 1 : 1, last_reason: 'dispatch-decisions' });
+    return block(holdsReason(holds));
   } catch (e) {
     return { reason: `allow: internal error (${(e as Error).message})` };
   }
 }
 
-/**
- * Shape of a worker agent type: `minions:<name>` with a role-name-like name (`<role>-deep` included). Whether
- * the name is a registered role (and whether its `-deep` variant exists) is decided against the config.
- */
+/** Shape of a worker agent type: `minions:<name>` with a role-name-like name (`<role>-deep` included). */
 const WORKER_TYPE = /^minions:[a-z][a-z0-9-]{0,40}$/;
 const MARKER = /minions-lease:\s*(lease-[A-Za-z0-9_-]+)/g;
 
@@ -140,45 +116,17 @@ const deny = (reason: string): HookOutput => ({
 });
 
 /**
- * PreToolUse(Agent) guard (D10): `minions:<role>` and `minions:<role>-deep` (only for a role with a deep
- * variant) are accepted iff the role is in the registry of the runtime config and the prompt names an active
- * lease of that role. Every other `minions:*` type is denied. Fails closed (an unreadable config or DB denies).
+ * PreToolUse(Agent) guard (docs/design/autonomy.md Decision 10): minions workers run only under the autopilot
+ * dispatcher (headless `claude -p --agent minions:<role>`, or `minions work run` for a process harness), never as an
+ * Agent-tool subagent, so every `minions:*` agent type is denied. Other agent types pass.
  */
-export async function preAgentHook(input: unknown, load: HookLoader): Promise<HookOutput> {
+export function preAgentHook(input: unknown): HookOutput {
   const inp = isObj(input) ? input : {};
   const ti = isObj(inp.tool_input) ? inp.tool_input : {};
   const type = typeof ti.subagent_type === 'string' ? ti.subagent_type : '';
   if (!type.startsWith('minions:')) return { reason: `allow: not a minions worker (${type || 'none'})` };
   const shown = JSON.stringify(type.slice(0, 80)).slice(1, -1);
-  // Cheap syntactic check first: no config or DB read for a type no role could have.
-  if (!WORKER_TYPE.test(type)) return deny(`Unknown minions agent type "${shown}".`);
-  // The Agent tool only accepts model aliases; a full id would fail the launch with a less useful error.
-  if (typeof ti.model === 'string' && ti.model && !isAgentModelAlias(ti.model)) {
-    return deny(`model "${ti.model}" is not an Agent model alias (${AGENT_MODEL_ALIASES.join('|')}). Omit \`model\` to use the model set in the ${type} definition, or pass an allowed alias.`);
-  }
-  try {
-    const { db, config } = await load();
-    const def = agentTypeRole(config, type);
-    if (!def) return deny(`Unknown minions agent type "${shown}": not a registered worker role (${workerRoleNames(config).join(', ')}) or the deep variant of one.`);
-    const role = def.name;
-    // A role on a process harness (docs/design/agent-runtimes.md D1) is never a Claude subagent: it runs through
-    // `minions work run` after claim. Without this a Claude worker would silently stand in for it.
-    if (isProcessHarness(def.harness)) {
-      return deny(`${role} runs on ${HARNESSES[def.harness].label} (harness ${def.harness}), not as a Claude subagent: claim it, then run the launch command from \`minions work next --json\` (\`minions work run <leaseId> --json\`).`);
-    }
-    const prompt = typeof ti.prompt === 'string' ? ti.prompt : '';
-    const ids = [...prompt.matchAll(MARKER)].map((x) => x[1]!);
-    if (!ids.length) {
-      return deny(`${type} needs a claimed lease: run \`minions work claim <taskId> --role ${role} --json\` and include its briefMarker ("minions-lease: <leaseId>") in the prompt.`);
-    }
-    for (const id of ids) {
-      const l = db.lease(id);
-      if (l && l.status === 'active' && (l.role as string) === role) return { reason: `allow: ${type} under lease ${id} for ${l.task_id}` };
-    }
-    return deny(`No active ${role} lease matches ${ids.join(', ')}. Claim the task with \`minions work claim <taskId> --role ${role} --json\` first.`);
-  } catch (e) {
-    return deny(`minions could not verify the lease (${(e as Error).message}); refusing to launch ${type}.`);
-  }
+  return deny(`${shown} is a minions worker: workers run only under the autopilot dispatcher, which starts every runnable stage by itself. \`minions work autopilot status --json\` shows what runs and which tasks wait for your decision.`);
 }
 
 /**
@@ -193,7 +141,8 @@ export async function preAgentHook(input: unknown, load: HookLoader): Promise<Ho
 export function preTelegramHook(input: unknown): HookOutput {
   if (!isObj(input)) return deny('minions could not read the Telegram hook input (not a JSON object); refusing the call.');
   const tool = input.tool_name;
-  if (typeof tool !== 'string' || !tool.startsWith(TELEGRAM_TOOL_PREFIX) || tool.length === TELEGRAM_TOOL_PREFIX.length) {
+  // The minions channel server's tools.
+  if (typeof tool !== 'string' || !TELEGRAM_TOOL_PREFIXES.some((p) => tool.startsWith(p) && tool.length > p.length)) {
     const what = typeof tool === 'string' ? `a non-Telegram tool_name (${JSON.stringify(tool.slice(0, 80))})` : 'no tool_name';
     return deny(`minions pre-telegram hook got ${what}; refusing the call.`);
   }
@@ -211,14 +160,17 @@ export function preTelegramHook(input: unknown): HookOutput {
  * The plugin's PreToolUse(Bash) entry (agent-runtimes D10, task-14.5). Node starts only for a subagent call (the
  * input has an `"agent_id"` key) whose input has `minions` followed by anything but `:` (so a worker's own
  * `"agent_type":"minions:<role>"` alone does not count) or names the entry script (`cli.js`); the coordinator's
- * own calls never reach it. These are speed filters only: any plain command that runs minions contains such a
- * match (a name split by quotes or backslashes does not; like variables, that is out of reach of a text check). Reading stdin, a grep error and every
- * failure of minions itself block (exit 2).
+ * own calls never reach it. Task-72 adds `/state` (the container state dir, and the last segment of the host
+ * runtime's) and `MINIONS_STATE_DIR`, for the runtime-state check; task-96 adds `/secrets` (the mounted secrets dir,
+ * protected the same way: stateGuard's secretsDir), task-114 `MINIONS_SECRETS_DIR`. These are speed filters only: any plain command
+ * that runs minions or names the state dir contains such a match (a name split by quotes or backslashes does not;
+ * like variables, that is out of reach of a text check). Reading stdin, a grep error and every failure of minions
+ * itself block (exit 2).
  */
-export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | timeout 20 minions hook pre-bash || exit 2;; esac`;
+export const PRE_BASH_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i\${MINIONS_WORKER_LEASE:+\\"agent_id\\"}" in *'"agent_id"'*) if [ -z "$MINIONS_WORKER_LEASE" ]; then printf '%s' "$i" | grep -Eq 'minions[^:]|cli\\.[cm]?js|/state|/secrets|MINIONS_STATE_DIR|MINIONS_SECRETS_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; fi; printf '%s' "$i" | ${hangGuarded('minions hook pre-bash')} || exit 2;; esac`;
 
-/** The verbs a Claude subagent must never run: they start, claim or end worker leases (coordinator-only). */
-export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'release'] as const;
+/** The verbs a Claude subagent must never run: they start, claim or end worker leases, or run the local integrator (coordinator-only). */
+export const COORDINATOR_ONLY_WORK_VERBS = ['run', 'claim', 'release', 'integrate'] as const;
 
 /** A program word that runs the minions CLI: `minions` (any path) or its entry script (`…/dist/cli.js`). */
 const MINIONS_ENTRY = /^(minions|cli\.[cm]?js)$/;
@@ -239,12 +191,29 @@ const SCRIPT_RUNNERS = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh', 'mksh', 'ash
 
 const ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*(\[[^\]]*\])?\+?=/;
 
-/** `work` after the entry word, then a coordinator-only verb as the next non-option word. */
-function coordinatorVerb(words: readonly string[], entry: number): string | null {
-  const w = words.indexOf('work', entry + 1);
+/** Decides one minions invocation: `words[entry]` runs minions; returns the refused command or null. */
+type EntryMatch = (words: readonly string[], entry: number) => string | null;
+
+/**
+ * `coordinator` subcommands a Claude subagent must never run, whatever state dir it names (task-96): `live-run` starts
+ * a headless claude with the runtime's Claude credential, which only the coordinator may do, at a controlled moment.
+ * `route`, `send` and `wait` (phase 8) are the router's: a worker never hands messages to sessions.
+ * `supervise` (task-57 phase 5) is the session supervisor, which starts headless coordinator sessions: only the
+ * wrapper starts it.
+ */
+export const COORDINATOR_ONLY_COORDINATOR_VERBS = ['live-run', 'supervise', 'send', 'handover'] as const;
+
+/** `group` after the entry word, then one of `verbs` as the next non-option word. */
+function groupVerb(words: readonly string[], entry: number, group: string, verbs: readonly string[]): string | null {
+  const w = words.indexOf(group, entry + 1);
   if (w < 0) return null;
   const verb = words.slice(w + 1).find((x) => !x.startsWith('-'));
-  return verb && (COORDINATOR_ONLY_WORK_VERBS as readonly string[]).includes(verb) ? `minions work ${verb}` : null;
+  return verb && verbs.includes(verb) ? `minions ${group} ${verb}` : null;
+}
+
+/** `work` then a coordinator-only work verb, or `coordinator live-run|supervise`, after the entry word. */
+function coordinatorVerb(words: readonly string[], entry: number): string | null {
+  return groupVerb(words, entry, 'work', COORDINATOR_ONLY_WORK_VERBS) ?? groupVerb(words, entry, 'coordinator', COORDINATOR_ONLY_COORDINATOR_VERBS);
 }
 
 /** Commands whose arguments are printed as text (so piping them into a shell runs that text). */
@@ -269,18 +238,18 @@ function pipedText(scan: ShellScan, words: readonly string[]): string[] {
  * Scripts a shell in this command may read on stdin: its own heredocs and here-strings, and what the command
  * before it in a pipeline prints. Checked only when the command runs a shell (SCRIPT_RUNNERS) somewhere.
  */
-function stdinHit(scan: ShellScan, words: readonly string[], depth: number): string | null {
+function stdinHit(scan: ShellScan, words: readonly string[], depth: number, match: EntryMatch): string | null {
   if (!words.some((w) => SCRIPT_RUNNERS.has(basename(w)))) return null;
   const from = scan.pipedFrom.get(words);
   for (const text of [...(scan.stdin.get(words) ?? []), ...(from ? pipedText(scan, from) : [])]) {
-    const hit = scriptHit(text, depth + 1);
+    const hit = scriptHit(text, depth + 1, match);
     if (hit) return hit;
   }
   return null;
 }
 
 /** One simple command: assignments skipped, then the command word (or, after a wrapper, any later word). */
-function simpleCommandHit(words: readonly string[], depth: number): string | null {
+function simpleCommandHit(words: readonly string[], depth: number, match: EntryMatch): string | null {
   let s = 0;
   while (s < words.length && ASSIGNMENT.test(words[s]!)) s++;
   if (s >= words.length) return null;
@@ -289,13 +258,13 @@ function simpleCommandHit(words: readonly string[], depth: number): string | nul
   for (let j = s; j <= last; j++) {
     const b = basename(words[j]!);
     if (MINIONS_ENTRY.test(b)) {
-      const hit = coordinatorVerb(words, j);
+      const hit = match(words, j);
       if (hit) return hit;
     }
     if (SCRIPT_RUNNERS.has(b)) {
-      for (const arg of words.slice(j + 1)) { const hit = scriptHit(arg, depth + 1); if (hit) return hit; }
+      for (const arg of words.slice(j + 1)) { const hit = scriptHit(arg, depth + 1, match); if (hit) return hit; }
     }
-    if (b === 'eval') { const hit = scriptHit(words.slice(j + 1).join(' '), depth + 1); if (hit) return hit; }
+    if (b === 'eval') { const hit = scriptHit(words.slice(j + 1).join(' '), depth + 1, match); if (hit) return hit; }
   }
   return null;
 }
@@ -308,28 +277,28 @@ const MAX_SCRIPT_DEPTH = 8;
  * dropped (line continuations joined first), the text is cut at shell separators, words also split at `<` and
  * `>`, and an entry word followed later by `work` and a coordinator-only verb matches.
  */
-function coarseHit(command: string): string | null {
+function coarseHit(command: string, match: EntryMatch): string | null {
   const flat = command.replace(/\\\r?\n/g, ' ').replace(/["'\\]/g, '');
   for (const piece of flat.split(/[;&|()`\n]|\$\(/)) {
     const words = piece.split(/[\s<>]+/).filter(Boolean);
     for (let i = 0; i < words.length; i++) {
       if (!MINIONS_ENTRY.test(basename(words[i]!))) continue;
-      const hit = coordinatorVerb(words, i);
+      const hit = match(words, i);
       if (hit) return hit;
     }
   }
   return null;
 }
 
-function scriptHit(script: string, depth: number): string | null {
-  if (depth > MAX_SCRIPT_DEPTH) return coarseHit(script);
+function scriptHit(script: string, depth: number, match: EntryMatch): string | null {
+  if (depth > MAX_SCRIPT_DEPTH) return coarseHit(script, match);
   let scan: ShellScan;
   try { scan = scanShell(script); } catch (e) {
-    if (e instanceof ShellParseError) return coarseHit(script);
+    if (e instanceof ShellParseError) return coarseHit(script, match);
     throw e;
   }
-  for (const words of scan.commands) { const hit = simpleCommandHit(words, depth) ?? stdinHit(scan, words, depth); if (hit) return hit; }
-  for (const nested of scan.scripts) { const hit = scriptHit(nested, depth + 1); if (hit) return hit; }
+  for (const words of scan.commands) { const hit = simpleCommandHit(words, depth, match) ?? stdinHit(scan, words, depth, match); if (hit) return hit; }
+  for (const nested of scan.scripts) { const hit = scriptHit(nested, depth + 1, match); if (hit) return hit; }
   return null;
 }
 
@@ -347,24 +316,246 @@ function scriptHit(script: string, depth: number): string | null {
  * gate (D4 L0).
  */
 export function coordinatorOnlyWorkCommand(command: string): string | null {
-  return scriptHit(command, 0);
+  return scriptHit(command, 0, coordinatorVerb);
+}
+
+/**
+ * Every top-level minions command and alias (a test keeps this in step with the program). A worker may run only
+ * those in WORKER_MINIONS_COMMANDS; an unknown word is no command (minions refuses it itself), so it never matches.
+ */
+export const MINIONS_COMMANDS: readonly string[] = [
+  'auth', 'backlog', 'channel', 'config', 'control', 'coordinator', 'defaults', 'doctor', 'down', 'export', 'help', 'hook',
+  'import', 'init', 'mode', 'notify', 'pause', 'pull', 'resume', 'runtime', 'secrets', 'session', 'settings', 'setup', 'start',
+  'status', 'stop', 'sync', 'telegram', 'tools', 'uninstall', 'upgrade', 'work', 'workspace',
+];
+
+/**
+ * What a Claude subagent may run of minions (task-72): its own lease's brief and submit, and read-only queries.
+ * `true`: every subcommand; a list: those subcommands (the group alone only prints help). Everything else writes
+ * runtime state (`work record`, `backlog update`, `notify`, `sync`, `workspace state-import`, ...) or is
+ * host-only, and is the coordinator's.
+ */
+export const WORKER_MINIONS_COMMANDS: Readonly<Record<string, true | readonly string[]>> = {
+  help: true,
+  status: true,
+  work: ['brief', 'submit'],
+  backlog: ['ready', 'list', 'show', 'export'],
+  ci: ['status'],
+};
+
+/**
+ * A minions run with its own state dir (`MINIONS_STATE_DIR=<dir> node dist/cli.js …`, assignment or `env`
+ * argument before the entry word) that is not the protected one: how an engineer or tester exercises a minions
+ * checkout against a scratch state. A relative value resolves against `cwd` and through symlinks (a link in the
+ * worktree to the state dir is no redirect); a `cd` earlier in the line is not followed. Best effort, like the
+ * rest of the Bash check.
+ */
+function redirectedState(before: readonly string[], g: StateGuard, cwd: string): boolean {
+  return before.some((w) => {
+    const m = /^MINIONS_STATE_DIR=(.+)$/.exec(w);
+    return !!m && !bashStateReference(m[1]!, g) && !protectedStatePath(m[1]!, cwd, g);
+  });
+}
+
+/** The first minions command a worker may not run in `words` (entry at `entry`), or null. */
+function workerMinionsHit(g: StateGuard, cwd: string): EntryMatch {
+  return (words, entry) => {
+    const verb = coordinatorVerb(words, entry);
+    if (verb) return verb;
+    const [p0, p1] = words.slice(entry + 1).filter((w) => !w.startsWith('-'));
+    if (!p0 || !MINIONS_COMMANDS.includes(p0)) return null;
+    const allowed = WORKER_MINIONS_COMMANDS[p0];
+    if (allowed === true || (allowed && (p1 === undefined || allowed.includes(p1)))) return null;
+    if (redirectedState(words.slice(0, entry), g, cwd)) return null;
+    return `minions ${p0}${p1 === undefined ? '' : ` ${p1}`}`;
+  };
+}
+
+/** The installed minions binary in the container (also the git credential helper's path). */
+const MINIONS_BIN = '/usr/local/bin/minions';
+
+/**
+ * The only submit-heredoc head line whose body is exempt: `minions work submit <args> <<'DELIM'` (or `<<"DELIM"`),
+ * with `minions` bare or the installed binary path, args plain words, single spaces, nothing after. At most one
+ * `cd /<plain absolute path> && ` may come first (task-88: a subagent's Bash cwd resets to the primary checkout,
+ * and submit only works from inside the worktree); that path is checked with the rest of the head line.
+ */
+const SUBMIT_HEAD = new RegExp(
+  `^(?:cd /[A-Za-z0-9_./-]* && )?(?:minions|${MINIONS_BIN.replace(/[./]/g, '\\$&')}) work submit(?: [A-Za-z0-9_.:=/-]+)* <<(['"])([A-Za-z_][A-Za-z0-9_]*)\\1$`,
+);
+
+/**
+ * The command line with the heredoc body of `minions work submit` left out, for the runtime-state text check: a
+ * worker's result is data minions reads on stdin, and its findings often name state paths (task-72). Allowlist,
+ * fails closed: the body is left out only when the whole command is one simple command matching SUBMIT_HEAD
+ * (no `;`, `||`, `|`, function or alias definitions, `env`/`command` prefixes, assignments, subshells,
+ * redirections or launchers such as `node`; the only `&&` allowed is the one after a single leading
+ * `cd /<plain absolute path>`, with no options, quotes, expansions or second `cd`), the delimiter is a plain quoted word (`'RESULT'` or `"RESULT"`: the
+ * shell expands nothing and joins no backslash-newlines in the body), and the command ends at the first line that
+ * is exactly the delimiter (plus at most one newline). The head line itself is still checked. Any other input,
+ * including unquoted delimiters, `<<-` and here-strings, is returned unchanged and gets the full check.
+ */
+export function withoutSubmitBodies(command: string): string {
+  const nl = command.indexOf('\n');
+  if (nl < 0) return command;
+  const head = command.slice(0, nl);
+  const delim = SUBMIT_HEAD.exec(head)?.[2];
+  if (!delim) return command;
+  const lines = command.slice(nl + 1).split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  // The shell ends the body at the first line equal to the delimiter; it must be the last line.
+  return lines.length > 0 && lines.indexOf(delim) === lines.length - 1 ? head : command;
+}
+
+/**
+ * The first minions command a Claude subagent may not run in a Bash command line, or null: `work run|claim|release`
+ * always (coordinatorOnlyWorkCommand), and any other registered command outside WORKER_MINIONS_COMMANDS unless the
+ * same simple command points minions at another state dir. Same scanner and limits as coordinatorOnlyWorkCommand.
+ */
+export function workerMinionsCommand(command: string, g: StateGuard = stateGuard(), cwd: string = process.cwd()): string | null {
+  return scriptHit(command, 0, workerMinionsHit(g, cwd));
 }
 
 /**
  * PreToolUse(Bash): a Claude subagent (`agent_id` set to anything but undefined/null, as for pre-telegram) may not
- * run `minions work run|claim|release`: only the coordinator starts, claims and releases workers. The coordinator's
- * own calls (no agent_id) are allowed. Fails closed on input it cannot decide: non-object input, another tool or a
- * missing command are denied.
+ * run `minions work run|claim|release` (only the coordinator starts, claims and releases workers), any other minions
+ * command that writes runtime state (task-72: WORKER_MINIONS_COMMANDS), or a command line naming the protected
+ * state dir (bashStateReference: the runtime DB, backlog, briefs, results). The coordinator's own calls (no agent_id)
+ * are allowed. Fails closed on input it cannot decide: non-object input, another tool or a missing command are denied.
+ * Best effort: a path or command built at run time is out of reach of a text check (docs/design/agent-runtimes.md).
  */
-export function preBashHook(input: unknown): HookOutput {
+export function preBashHook(input: unknown, g?: StateGuard): HookOutput {
   if (!isObj(input)) return deny('minions could not read the Bash hook input (not a JSON object); refusing the call.');
   if (input.tool_name !== 'Bash') return deny(`minions pre-bash hook got ${typeof input.tool_name === 'string' ? `tool ${JSON.stringify(input.tool_name.slice(0, 80))}` : 'no tool_name'}; refusing the call.`);
   const ti = isObj(input.tool_input) ? input.tool_input : null;
   if (!ti || typeof ti.command !== 'string') return deny('minions pre-bash hook got no Bash command; refusing the call.');
   if (input.agent_id === undefined || input.agent_id === null) return { reason: 'allow: Bash from the coordinator' };
   const hit = coordinatorOnlyWorkCommand(ti.command);
-  if (hit) return deny(`\`${hit}\` is coordinator-only: a worker cannot start, claim or release workers. Finish your own task and return your result instead.`);
-  return { reason: 'allow: Bash from a subagent (no coordinator-only minions command)' };
+  if (hit) return deny(`\`${hit}\` is coordinator-only: a worker cannot start, claim or release workers, or launch a live Claude run (name the check in your findings instead). Finish your own task and return your result instead.`);
+  const guard = g ?? stateGuard();
+  const state = bashStateReference(withoutSubmitBodies(ti.command), guard);
+  if (state) {
+    return deny(`Workers may not touch the minions runtime state (${JSON.stringify(state.slice(0, 120))}): the runtime DB, backlog, briefs and results are the coordinator's, and the mounted secrets are read only by minions itself. `
+      + 'Use `minions work brief` / `minions work submit` for your lease. If you only mention the path as text, put that text in a file in your scratch dir '
+      + '(`git commit -F <file>`) or use the Grep / Write tools. A result that names such a path is accepted only as exactly '
+      + "`cd <worktree> && minions work submit <lease> --role <role> --json <<'RESULT'` (or without the `cd`), with an unquoted absolute "
+      + 'worktree path and nothing else before or after it; otherwise write the result to a file in your scratch dir and run '
+      + '`cd <worktree> && minions work submit <lease> --role <role> --json < <file>`.');
+  }
+  const cwd = typeof input.cwd === 'string' && input.cwd.startsWith('/') ? input.cwd : process.cwd();
+  const cli = workerMinionsCommand(ti.command, guard, cwd);
+  if (cli) {
+    return deny(`\`${cli}\` is coordinator-only: workers may run only \`minions work brief\`, \`minions work submit\` and read-only queries (status, backlog ready|list|show|export, ci status, help). `
+      + 'To exercise a minions checkout, give it a scratch state: `MINIONS_STATE_DIR=<scratch dir>/state node dist/cli.js …`.');
+  }
+  return { reason: 'allow: Bash from a subagent (no coordinator-only minions command, no runtime state path)' };
+}
+
+// ---------------------------------------------------------------- pre-ssh (PreToolUse, Bash)
+
+/**
+ * Plugin PreToolUse(Bash) entry of the pre-ssh hook: node starts only for a call whose text names ssh, scp or rsync. It
+ * corrects a form, it is no boundary (the sandbox is), so every failure of it allows.
+ */
+export const PRE_SSH_HOOK_COMMAND = `i=$(cat) || exit 0; case "$i" in *ssh*|*scp*|*rsync*) printf '%s' "$i" | minions hook pre-ssh || exit 0;; esac`;
+
+/** The pre-ssh hook needs only the owner's coordinator.sshHosts. */
+export type SshLoader = () => Promise<{ sshHosts: string[] }>;
+
+/** The command with its quoted parts removed (what the shell would split on operators). */
+const unquoted = (cmd: string) => cmd.replace(/'[^']*'|"(?:\\.|[^"\\])*"/g, "''");
+
+/**
+ * A call to one of coordinator.sshHosts in a form the sandbox exception does not cover (src/runtime/coordinator.ts
+ * sshPatterns), or null. Claude Code keeps such a call sandboxed and SSH fails with "Operation not permitted", which
+ * agents read as missing access; this says what to change instead.
+ */
+export function sshFormProblem(command: string, hosts: readonly string[]): string | null {
+  const host = hosts.find((h) => command.includes(h));
+  if (!host) return null;
+  const cmd = command.trim();
+  const words = unquoted(cmd).split(/\s+/);
+  const program = words[0] ?? '';
+  if (!['ssh', 'scp', 'rsync'].includes(program)) {
+    return /\b(?:ssh|scp|rsync)\b/.test(cmd) ? `start the call with \`ssh\`, \`scp\` or \`rsync\` itself (no \`${program}\`, \`cd ... &&\` or other wrapper before it)` : null;
+  }
+  if (/[|&;<>`]|\$\(/.test(unquoted(cmd))) return 'nothing outside the quotes: no `2>&1`, `| head`, `> file`, `&&` or `;` after or around the call; put pipes and redirects inside the quoted remote command';
+  if (program === 'ssh' && words[1] !== host) return `write the host right after \`ssh\` (\`ssh ${host} '<command>'\`): no options such as \`-o\`, \`-i\` or \`-p\` before it (the owner's ~/.ssh/config sets them)`;
+  if (program !== 'ssh' && !words.some((w) => w.startsWith(`${host}:/`) || w.startsWith(`${host}:~/`))) return `write the remote path as \`${host}:~/<path>\` or \`${host}:/<absolute path>\``;
+  return null;
+}
+
+export function preSshHook(input: unknown, hosts: readonly string[]): HookOutput {
+  const cmd = isObj(input) && isObj(input.tool_input) && typeof input.tool_input.command === 'string' ? input.tool_input.command : '';
+  const problem = sshFormProblem(cmd, hosts);
+  if (!problem) return { reason: 'allow: no SSH host call, or an allowed form' };
+  const host = hosts.find((h) => cmd.includes(h))!;
+  return deny(`This SSH call would run inside the sandbox, where it fails with "Operation not permitted". The owner allows ${host} outside the sandbox only in exact forms: ${problem}. `
+    + `For example: \`ssh ${host} 'nvidia-smi 2>&1 | head -20'\`. Rewrite the call and run it again.`);
+}
+
+// ---------------------------------------------------------------- pre-file (PreToolUse, file tools)
+
+/** File tools that write, each with the input fields that hold its target path. */
+const WRITE_TOOLS: Readonly<Record<string, readonly string[]>> = { Edit: ['file_path'], MultiEdit: ['file_path'], Write: ['file_path'], NotebookEdit: ['notebook_path'] };
+/** File tools that read: Read by its file, Glob and Grep by their search root (also a directory holding the state dir). */
+const READ_TOOLS: Readonly<Record<string, readonly string[]>> = { Read: ['file_path'], Glob: ['path'], Grep: ['path'] };
+
+/**
+ * Plugin PreToolUse entry for the write tools: every subagent call reaches node (a symlink in the worktree can
+ * point anywhere, so no text pre-filter could decide). The coordinator's own calls never start node.
+ */
+export const PRE_FILE_WRITE_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i\${MINIONS_WORKER_LEASE:+\\"agent_id\\"}" in *'"agent_id"'*) printf '%s' "$i" | ${hangGuarded('minions hook pre-file')} || exit 2;; esac`;
+/**
+ * Plugin PreToolUse entry for the read tools: node starts only for a subagent call whose input names a state dir
+ * (`/state`: the container path, and the last segment of the host runtime's), the secrets dir (`/secrets`, task-96) or
+ * MINIONS_STATE_DIR. A symlink
+ * that hides the path is not caught for reads (disclosure, not forgery: writes are always checked).
+ */
+export const PRE_FILE_READ_HOOK_COMMAND = `i=$(cat) || exit 2; case "$i\${MINIONS_WORKER_LEASE:+\\"agent_id\\"}" in *'"agent_id"'*) printf '%s' "$i" | grep -Eq '/state|/secrets|MINIONS_STATE_DIR'; m=$?; [ "$m" = 1 ] && exit 0; [ "$m" = 0 ] || exit 2; printf '%s' "$i" | ${hangGuarded('minions hook pre-file')} || exit 2;; esac`;
+
+/**
+ * PreToolUse(Edit|MultiEdit|Write|NotebookEdit|Read|Glob|Grep), task-72: a Claude subagent may not write, read or
+ * search the protected runtime state (protectedStatePath: as written and through symlinks; Glob/Grep also not a
+ * directory that holds it). The scratch dir and the host runtime's tool caches stay open. A relative path resolves
+ * against the input's `cwd`. The coordinator (no agent_id) is allowed: it keeps its notes under the state dir.
+ * Fails closed: non-object input, another tool or a missing or non-string path field are denied.
+ */
+export function preFileHook(input: unknown, g?: StateGuard): HookOutput {
+  if (!isObj(input)) return deny('minions could not read the file-tool hook input (not a JSON object); refusing the call.');
+  const tool = typeof input.tool_name === 'string' ? input.tool_name : '';
+  const writes = Object.hasOwn(WRITE_TOOLS, tool);
+  const fields = writes ? WRITE_TOOLS[tool] : Object.hasOwn(READ_TOOLS, tool) ? READ_TOOLS[tool] : undefined;
+  if (!fields) {
+    return deny(`minions pre-file hook got ${tool ? `tool ${JSON.stringify(tool.slice(0, 80))}` : 'no tool_name'}; refusing the call.`);
+  }
+  if (input.agent_id === undefined || input.agent_id === null) return { reason: `allow: ${tool} from the coordinator` };
+  const ti = isObj(input.tool_input) ? input.tool_input : null;
+  if (!ti) return deny(`minions pre-file hook got no ${tool} input; refusing the call.`);
+  const cwd = typeof input.cwd === 'string' && input.cwd.startsWith('/') ? input.cwd : process.cwd();
+  const search = tool === 'Glob' || tool === 'Grep';
+  const targets: string[] = [];
+  for (const f of fields) {
+    const v = ti[f];
+    if (v === undefined || v === null) {
+      if (search) { targets.push(cwd); continue; }
+      return deny(`minions pre-file hook got no ${f} for ${tool}; refusing the call.`);
+    }
+    if (typeof v !== 'string') return deny(`minions pre-file hook got a non-string ${f} for ${tool}; refusing the call.`);
+    targets.push(v || cwd);
+  }
+  // An absolute Glob pattern names its own root: check the part before the first wildcard.
+  if (tool === 'Glob' && typeof ti.pattern === 'string' && ti.pattern.startsWith('/')) {
+    const fixed = ti.pattern.split('/').filter((_, i, a) => !a.slice(0, i + 1).some((x) => /[*?[{]/.test(x))).join('/');
+    targets.push(fixed || '/');
+  }
+  const guard = g ?? stateGuard();
+  const hit = targets.find((t) => protectedStatePath(t, cwd, guard, { ancestor: search }));
+  if (hit !== undefined) {
+    return deny(`Workers may not ${writes ? 'write' : 'read or search'} the minions runtime state (${JSON.stringify(hit.slice(0, 160))}): the runtime DB, backlog, briefs and results are the coordinator's, and the mounted secrets are read only by minions itself. `
+      + 'Use `minions work brief` / `minions work submit` for your lease; keep temporary files in your scratch dir.');
+  }
+  return { reason: `allow: ${tool} from a subagent (outside the runtime state)` };
 }
 
 // ---------------------------------------------------------------- drain (PreToolUse, every tool)
@@ -717,13 +908,29 @@ async function readStdin(timeoutMs = 5000): Promise<string> {
   });
 }
 
-export type HookKind = 'stop' | 'pre-agent' | 'pre-telegram' | 'pre-bash' | 'drain';
+export type HookKind = 'stop' | 'pre-agent' | 'pre-telegram' | 'pre-bash' | 'pre-file' | 'pre-ssh' | 'drain';
+
+/** Set by the dispatcher in a headless worker's environment (docs/design/autonomy.md Decision 1). */
+export const WORKER_LEASE_ENV = 'MINIONS_WORKER_LEASE';
+export const WORKER_ROLE_ENV = 'MINIONS_WORKER_ROLE';
+
+/**
+ * A headless worker (`claude -p --agent minions:<role>`) is its own main thread, so its hook inputs carry no
+ * `agent_id`. Its lease marker stands in for one: every guard then treats it as the worker it is, never as the
+ * coordinator. Inputs that already name a subagent are unchanged.
+ */
+export function asWorkerInput(input: unknown, env: NodeJS.ProcessEnv = process.env): unknown {
+  const lease = env[WORKER_LEASE_ENV];
+  if (!lease || !isObj(input) || (input.agent_id !== undefined && input.agent_id !== null)) return input;
+  const role = env[WORKER_ROLE_ENV];
+  return { ...input, agent_id: `headless-${lease}`, ...(role ? { agent_type: `minions:${role}` } : {}) };
+}
 
 /** Hooks that allow on unreadable input or an internal error (the others fail closed). */
-const failsOpen = (kind: HookKind) => kind === 'stop' || kind === 'drain';
+const failsOpen = (kind: HookKind) => kind === 'stop' || kind === 'drain' || kind === 'pre-ssh';
 
 /** Entry point for `minions hook stop|pre-agent|pre-telegram|drain`: reads stdin, prints the decision, never throws, exits 0. */
-export async function runHook(kind: HookKind, load: HookLoader | DrainLoader, stdinText?: string): Promise<HookOutput> {
+export async function runHook(kind: HookKind, load: HookLoader | DrainLoader | SshLoader, stdinText?: string): Promise<HookOutput> {
   let out: HookOutput;
   try {
     const text = stdinText ?? (await readStdin());
@@ -733,8 +940,10 @@ export async function runHook(kind: HookKind, load: HookLoader | DrainLoader, st
     if (parseError) {
       out = failsOpen(kind) ? { reason: `allow: unreadable hook input (${parseError})` } : deny(`minions could not parse the hook input (${parseError}).`);
     } else {
-      out = kind === 'drain' ? await drainHook(input, load) : kind === 'pre-telegram' ? preTelegramHook(input) : kind === 'pre-bash' ? preBashHook(input)
-        : kind === 'stop' ? await stopHook(input, load as HookLoader) : await preAgentHook(input, load as HookLoader);
+      if (kind !== 'stop') input = asWorkerInput(input);
+      out = kind === 'drain' ? await drainHook(input, load as DrainLoader) : kind === 'pre-telegram' ? preTelegramHook(input) : kind === 'pre-bash' ? preBashHook(input) : kind === 'pre-file' ? preFileHook(input)
+        : kind === 'pre-ssh' ? preSshHook(input, (await (load as SshLoader)()).sshHosts)
+        : kind === 'stop' ? await stopHook(input, load as HookLoader) : preAgentHook(input);
     }
   } catch (e) {
     out = failsOpen(kind) ? { reason: `allow: internal error (${(e as Error).message})` } : deny(`minions hook failed (${(e as Error).message}).`);

@@ -1,5 +1,5 @@
 import { spawn as nodeSpawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile, rm } from 'node:fs/promises';
 import { constants as osConstants } from 'node:os';
 import type { MinionsConfig } from '../config/schema.js';
@@ -8,61 +8,65 @@ import { COORDINATOR_DISALLOWED_TOOLS } from '../config/coordinator-tools.js';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { atomicWrite } from '../core/fsutil.js';
+import { hangGuarded, HOOK_SETTINGS_TIMEOUT_S } from './hook-guard.js';
 import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, sep } from 'node:path';
 import { runtimeMode } from '../core/cli-helpers.js';
 import { redact } from '../core/output.js';
-import { CONTAINER, credentialStoreDir } from '../core/paths.js';
-import { probeTelegram, TELEGRAM_CHANNEL_SPEC, TELEGRAM_PLUGIN_ID, type TelegramProbeReport } from '../telegram/probe.js';
-import { checkTelegramPoller, disableTelegramAtUserScope, type PollerCheck, type UserScopeResult } from '../telegram/isolation.js';
+import { CLAUDE_HEADLESS_TOKEN_FILE, CONTAINER, credentialStoreDir } from '../core/paths.js';
+import type { PollerCheck } from '../telegram/isolation.js';
 import { checkTelegramTokenFormat } from '../telegram/token.js';
-import { HOST_TELEGRAM_REASON, resolveChannel, type ChannelFacts } from '../telegram/channel.js';
+import { resolveChannel, type ChannelFacts } from '../telegram/channel.js';
+import {
+  DEV_CHANNELS_DIALOG_NOTE, hostChannelServerProbe, MINIONS_CHANNEL_SPEC, MINIONS_TELEGRAM_TOOL_PREFIX, MINIONS_TELEGRAM_TOOLS, minionsChannelArgs,
+  type ChannelServerLaunch, type HostChannelServerReport,
+} from '../telegram/channel/launch.js';
+import { LAUNCH_ENV, readChannelLock, TOKEN_FILE_ENV } from '../telegram/channel/server.js';
+import { seedOwnerAccess } from '../telegram/channel/access-cli.js';
 import { runtimePaths, type RuntimePaths } from './paths.js';
+import { claudePermissionModes, parsePermissionModes, strictPermissionModeArg } from './permission-modes.js';
 import { openDb, pidAlive, type CoordinatorLock, type RuntimeDb } from './db.js';
+import { systemProcessFacts, type ProcessFacts } from './process-facts.js';
 
 export const TMUX_SESSION = 'coordinator';
-/** Environment variable the official Telegram plugin reads its bot token from. */
+/** A bot token in the env (an old setup or the owner's shell): never passed on to claude or the channel server. */
 export const TELEGRAM_TOKEN_ENV = 'TELEGRAM_BOT_TOKEN';
 /**
- * Prefix of the official plugin's MCP tools (mcp__plugin_<plugin>_<server>__<tool>). Confirmed in a live
- * run with telegram@claude-plugins-official 0.0.7: reply, react, edit_message, download_attachment.
+ * PreToolUse hook (in --settings) for every tool of the minions channel server: `minions hook pre-telegram` denies the
+ * call when it comes from any subagent. Permission rules cannot be scoped per agent, so the allow above would
+ * otherwise extend to subagents.
  */
-export const TELEGRAM_TOOL_PREFIX = 'mcp__plugin_telegram_telegram__';
-/** Telegram tools the coordinator may use without a prompt. download_attachment still asks. */
-export const TELEGRAM_TOOLS = ['reply', 'react', 'edit_message'].map((t) => `${TELEGRAM_TOOL_PREFIX}${t}`);
-/** Every tool the plugin's MCP server exposes; all are coordinator-only. */
-export const TELEGRAM_ALL_TOOLS = [...TELEGRAM_TOOLS, `${TELEGRAM_TOOL_PREFIX}download_attachment`];
-/**
- * PreToolUse hook (in --settings) for every Telegram tool: `minions hook pre-telegram` denies the call
- * when it comes from any subagent (general-purpose, Explore, Plan, plugin or user agents). Permission
- * rules cannot be scoped per agent, so the allow above would otherwise extend to subagents.
- */
-export const TELEGRAM_HOOK_MATCHER = `${TELEGRAM_TOOL_PREFIX}.*`;
-/**
- * Hang guard for the gating hooks: coreutils `timeout` kills a stuck `minions hook` after this many
- * seconds (exit 124, mapped to 2 by `|| exit 2`). Claude Code's own hook `timeout` (the settings value
- * below) must be larger, otherwise it fires first and a timed-out hook is a non-blocking error that lets
- * the call through.
- */
-export const HOOK_WRAPPER_TIMEOUT_S = 20;
-export const HOOK_SETTINGS_TIMEOUT_S = 30;
+export const MINIONS_TELEGRAM_HOOK_MATCHER = `${MINIONS_TELEGRAM_TOOL_PREFIX}.*`;
+/** Every Telegram tool prefix the pre-telegram hook accepts. */
+export const TELEGRAM_TOOL_PREFIXES = [MINIONS_TELEGRAM_TOOL_PREFIX] as const;
+/** Which Telegram server a launch uses (launch records of older versions may say `official`). */
+export type TelegramServer = 'official' | 'minions';
+// Hang guard constants live in hook-guard.ts (shared with the plugin hook commands in hooks.ts).
+export { HOOK_SETTINGS_TIMEOUT_S, HOOK_WRAPPER_TIMEOUT_S } from './hook-guard.js';
 /**
  * Fails closed: Claude Code treats any PreToolUse exit other than 2 as a non-blocking error and lets the
  * call through, so a missing binary (127) or a crash (1) becomes exit 2 (block). `minions hook` itself
  * always exits 0 and denies through its JSON output, so healthy coordinator calls are unaffected.
  */
-export const TELEGRAM_HOOK_COMMAND = `timeout ${HOOK_WRAPPER_TIMEOUT_S} minions hook pre-telegram || exit 2`;
+export const TELEGRAM_HOOK_COMMAND = `${hangGuarded('minions hook pre-telegram')} || exit 2`;
 
 /**
  * First user message of a coordinator started by `minions coordinator restart --recover`: run the recover
- * skill (read the previous session's handoff, reconcile leases left by it, re-dispatch), then resume the queue. Fixed
+ * skill (read the previous session's handoff, reconcile leases the dispatcher does not own), then the held decisions. Fixed
  * text, no secrets (the handoff is read with a command, never passed in argv); the pause state still applies (orchestrate stops when starts are paused).
  */
 export const RECOVERY_PROMPT = '/minions:recover The coordinator was just restarted (minions coordinator restart --recover). '
   + 'First read the previous session\'s handoff (minions coordinator handoff --read --json) with minions status --json. '
-  + 'Reconcile the leases left by the previous session, release those without a live worker, re-dispatch interrupted tasks, '
-  + 'then resume the queue with /minions:orchestrate. If starts are paused, report that instead of dispatching.';
+  + 'Reconcile the leases the dispatcher does not own, fix stuck tasks, '
+  + 'then continue with /minions:orchestrate (the held decisions). If starts are paused, report that.';
+
+/**
+ * First user message of a coordinator woken by the routine pass (docs/design/unattended-delivery.md decision 3):
+ * `minions coordinator restart --wake`. Constant: never task or owner text. The session reads the wake reasons from
+ * `minions sync --routine --last --json` (the orchestrate skill's wake step).
+ */
+export const WAKE_PROMPT = '/minions:orchestrate wake';
 
 export interface CoordinatorCommand { cmd: string; args: string[]; cwd: string }
 export type Runner = (cmd: string, args: string[], opts?: RunOptions) => Promise<RunResult>;
@@ -95,7 +99,7 @@ export const apiKeyHelperFor = (paths: Pick<RuntimePaths, 'apiKeyFile'>) => `cat
  * sandboxed commands lose read access to the home directory except the working dirs, the parts of
  * ~/.claude Claude Code needs and the global git config). Bash commands (workers included) run under
  * the OS sandbox (Seatbelt on macOS). Read/Edit, hooks and helpers are not sandboxed; they follow the
- * permission rules below. This narrows, but does not equal, the container boundary (README "Running without Docker").
+ * permission rules below. This narrows, but does not equal, the container boundary (docs/guide.md "Running without Docker").
  */
 export interface HostHardening {
   home: string;
@@ -113,6 +117,8 @@ export interface HostHardening {
   readable?: string[];
   /** Other projects under <hostRoot>/projects (denied to the Read tool by exact path). */
   otherProjects?: string[];
+  /** The minions channel server's state dir (access.json, lock). Default: <projectDir>/host/claude/channels/telegram. */
+  telegramStateDir?: string;
   /** tmux socket directory of this user (/private/tmp/tmux-<uid>), denied to sandboxed commands. */
   tmuxDir?: string;
 }
@@ -131,9 +137,9 @@ export const HOST_SECRET_DIRS = [
 export const HOST_PROTECTED_FILES = ['.zshrc', '.zprofile', '.zshenv', '.zlogin', '.bashrc', '.bash_profile', '.profile', '.gitconfig', '.claude.json'];
 export const HOST_PROTECTED_DIRS = ['.config/git', 'Library/LaunchAgents', '.claude'];
 /** Toolchain dirs under ~ that sandboxed commands may still read (the home directory itself is denied). */
-export const HOST_TOOLCHAIN_DIRS = ['.nvm', '.volta', '.fnm', '.local/share/fnm', '.asdf', '.local/share/mise', '.rustup', '.cargo/bin', '.pyenv', '.rbenv', '.bun', '.deno', 'go', '.sdkman', '.local/bin', 'Library/pnpm', '.npm-global'];
-/** Hosts sandboxed Bash may reach without a prompt (GitHub for push/PR, npm for installs). */
-export const HOST_SANDBOX_DOMAINS = ['github.com', 'api.github.com', '*.githubusercontent.com', 'codeload.github.com', 'registry.npmjs.org'];
+export const HOST_TOOLCHAIN_DIRS = ['.nvm', '.volta', '.fnm', '.local/share/fnm', '.asdf', '.local/share/mise', '.rustup', '.cargo/bin', '.pyenv', '.rbenv', '.bun', '.deno', 'go', '.sdkman', '.local/bin', '.local/share/uv', 'Library/pnpm', '.npm-global'];
+/** Hosts sandboxed Bash may reach without a prompt (npm for installs). */
+export const HOST_SANDBOX_DOMAINS = ['registry.npmjs.org'];
 /** Git subcommands the host-runtime coordinator may run without a prompt (no config, remotes or push). */
 export const HOST_GIT_SUBCOMMANDS = ['status', 'diff', 'log', 'show', 'add', 'commit', 'branch', 'switch', 'checkout', 'merge', 'rebase', 'restore',
   'rev-parse', 'worktree list', 'stash', 'ls-files', 'grep', 'blame', 'reset', 'cherry-pick', 'mv', 'rm', 'describe', 'shortlog', 'merge-base', 'cat-file', 'rev-list', 'tag --list'];
@@ -158,7 +164,7 @@ export function readableToolDirs(home: string, env: NodeJS.ProcessEnv = process.
   for (const d of pathDirs) add(d);
   const prefixOf = (file: string) => dirname(dirname(realOr(file)));
   for (const f of extraFiles) add(prefixOf(f));
-  for (const tool of ['node', 'claude', 'backlog', 'git', 'gh', 'tmux']) {
+  for (const tool of ['node', 'claude', 'backlog', 'git', 'tmux']) {
     for (const d of pathDirs) {
       const f = join(d, tool);
       if (existsSync(f)) { add(prefixOf(f)); break; }
@@ -208,14 +214,19 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
   readEdit(ruleAbs(h.credentialsDir));
   for (const o of h.otherProjects ?? []) readEdit(ruleAbs(o));
   const secretsAbs = ruleAbs(h.secretsDir);
-  for (const f of ['anthropic-api-key', 'telegram-bot-token']) deny.push(`Read(${secretsAbs}/${f})`);
+  for (const f of ['anthropic-api-key', 'telegram-bot-token', CLAUDE_HEADLESS_TOKEN_FILE]) deny.push(`Read(${secretsAbs}/${f})`);
+  // Owner secrets (docs/design/autonomy.md Decision 4): only the unsandboxed dispatcher reads them.
+  readEdit(`${secretsAbs}/env`);
   // File globs only (`*.json`): a directory-matching wildcard would also become a sandbox write deny of its contents.
   if (root) deny.push(`Read(${ruleAbs(root)}/*.json)`, `Edit(${ruleAbs(root)}/*.json)`);
-  // Host manager state (owner pairing, token reference, journal): the directory rule is also a sandbox write deny.
+  // Host-only state (CLI backups; files the removed host manager left): the directory rule is also a sandbox write deny.
   if (root) readEdit(`${ruleAbs(root)}/manager`);
   deny.push(`Read(${ruleAbs(h.projectDir)}/credentials.json)`,
     `Edit(${ruleAbs(h.projectDir)}/*.json)`, `Edit(${ruleAbs(h.projectDir)}/*.yaml)`, `Edit(${secretsAbs}/**)`);
   for (const d of ['runtime', 'plugin', 'logs', 'exports', 'config-history', 'host/bin', 'host/logs', 'host/transfer']) deny.push(`Edit(${ruleAbs(h.projectDir)}/${d}/**)`);
+  // Telegram channel state (task-6): access.json (pairing), the lock and the offset. Outside allowWrite and under the
+  // denied data root, so sandboxed Bash can neither read nor change it; these rules cover the file tools.
+  readEdit(ruleAbs(h.telegramStateDir ?? join(h.projectDir, 'host', 'claude', 'channels', 'telegram')));
   // Workspace git and Claude Code control files: hooks/config would run outside the sandbox (minions runs git there).
   const ws = ruleAbs(h.workspace);
   deny.push(`Edit(${ws}/repo/.git/config)`, `Edit(${ws}/repo/.git/config.worktree)`, `Edit(${ws}/repo/.git/hooks/**)`,
@@ -232,8 +243,8 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
     blockReadsOutsideWorkingDirectories: true,
     sandbox: {
       enabled: true,
-      // Keep the allowlist: sandboxed commands outside it still prompt.
-      autoAllowBashIfSandboxed: false,
+      // The sandbox is the boundary: commands that stay inside it run without a prompt.
+      autoAllowBashIfSandboxed: true,
       // No `dangerouslyDisableSandbox` escape hatch, and no silent unsandboxed fallback.
       allowUnsandboxedCommands: false,
       failIfUnavailable: true,
@@ -241,12 +252,11 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
         // Tool caches are redirected into the state dir (hostRuntimeVars), so no home paths are writable.
         allowWrite: [h.workspace, h.state],
         denyWrite: [join(h.workspace, 'repo', '.git', 'config'), join(h.workspace, 'repo', '.git', 'hooks'), ...tmuxDirs],
-        // The whole data root is unreadable; the agent's own dirs, the shim, its config/plugin and the
-        // GitHub token (read by the git credential helper / gh wrapper inside the sandbox) are re-opened.
-        denyRead: [...secretHome, ...(root ? [root] : []), h.credentialsDir, join(h.secretsDir, 'anthropic-api-key'), join(h.secretsDir, 'telegram-bot-token'),
-          ...tmuxDirs],
+        // The whole data root is unreadable; the agent's own dirs, the shim and its config/plugin are re-opened.
+        denyRead: [...secretHome, ...(root ? [root] : []), h.credentialsDir, join(h.secretsDir, 'anthropic-api-key'), join(h.secretsDir, 'telegram-bot-token'), join(h.secretsDir, CLAUDE_HEADLESS_TOKEN_FILE),
+          join(h.secretsDir, 'env'), ...tmuxDirs],
         allowRead: [...new Set([h.workspace, h.state, join(h.projectDir, 'host', 'bin'), join(h.projectDir, 'runtime'), pluginDir,
-          join(h.secretsDir, 'github-token'), ...(h.readable ?? [])])],
+          ...(h.readable ?? [])])],
       },
       network: {
         allowedDomains: HOST_SANDBOX_DOMAINS,
@@ -259,8 +269,52 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
   };
 }
 
+/**
+ * Host runtime: `ssh`, `scp` and `rsync` calls to the owner's coordinator.sshHosts, as Bash patterns. The sandbox proxy
+ * carries only HTTP(S)/SOCKS-aware tools and ~/.ssh is unreadable inside it, so these run outside it
+ * (`sandbox.excludedCommands`, the owner's SSH config and keys) and are allowed without a prompt. Claude Code keeps a
+ * call sandboxed unless every command of it matches; a redirect, `cd` or `$(...)` keeps it sandboxed too. No options before
+ * the host (`-o ProxyCommand=...` would run a local program unsandboxed): they belong in the owner's ~/.ssh/config. Remote
+ * paths are `host:/abs` or `host:~/rel`: Claude Code reads a trailing `:*` as its legacy prefix syntax, never as a wildcard.
+ */
+export function sshPatterns(hosts: readonly string[]): string[] {
+  return hosts.flatMap((h) => [`ssh ${h}`, `ssh ${h} *`,
+    ...['scp', 'rsync'].flatMap((p) => [`${p} * ${h}:/*`, `${p} * ${h}:~/*`, `${p} ${h}:/* *`, `${p} ${h}:~/* *`, `${p} * ${h}:/* *`, `${p} * ${h}:~/* *`])]);
+}
+
+/** The host sandbox with the owner's exceptions: excluded command patterns and extra network hosts. */
+function withOwnerSandbox(sandbox: Record<string, unknown>, excluded: string[], domains: string[]): Record<string, unknown> {
+  const network = sandbox.network as { allowedDomains: string[] };
+  return {
+    ...sandbox,
+    ...(excluded.length ? { excludedCommands: excluded } : {}),
+    ...(domains.length ? { network: { ...network, allowedDomains: [...new Set([...network.allowedDomains, ...domains])] } } : {}),
+  };
+}
+
 /** Shell metacharacters and globs a verification command may not contain in the host runtime. */
 const UNSAFE_COMMAND = /[*?;&|`$<>(){}\[\]\\!#~'"\n\r]/;
+/**
+ * Container runtime (task-72): Edit rules for the runtime state only minions itself writes: the DB (and its
+ * -wal/-shm/-journal files), backlog, briefs, submitted results and run records. Permission rules cannot be scoped
+ * per agent, so they bind the coordinator too, which never edits these directly (its notes under the state dir stay
+ * open); Claude subagents are refused the whole state dir by the plugin's pre-file hook. Not in the host runtime:
+ * there Edit denies also become sandbox write denies, and the sandboxed minions CLI must write its DB.
+ */
+export function containerStateDenies(state: string): string[] {
+  const s = ruleAbs(state);
+  return [`Edit(${s}/minions.db)`, `Edit(${s}/minions.db-*)`, ...['backlog', 'briefs', 'results', 'run'].flatMap((d) => [`Edit(${s}/${d})`, `Edit(${s}/${d}/**)`])];
+}
+
+/**
+ * Container runtime: the owner secrets (docs/design/autonomy.md Decision 4) for the file tools; only the dispatcher reads
+ * them. The host runtime denies them in hostSettings (there the sandbox also covers Bash).
+ */
+export function ownerSecretDenies(secretsDir: string): string[] {
+  const d = `${ruleAbs(secretsDir)}/env`;
+  return [`Read(${d})`, `Read(${d}/**)`, `Edit(${d})`, `Edit(${d}/**)`];
+}
+
 /** Programs whose allow rule would allow anything (shells, wrappers, credential and network CLIs). */
 const UNSAFE_PROGRAMS = new Set(['sh', 'bash', 'zsh', 'fish', 'dash', 'env', 'sudo', 'su', 'xargs', 'eval', 'exec', 'nohup', 'time', 'command', 'nice',
   'osascript', 'security', 'open', 'curl', 'wget', 'ssh', 'scp', 'rsync', 'nc', 'git', 'gh', 'minions', 'claude', 'launchctl', 'crontab', 'defaults']);
@@ -281,57 +335,68 @@ export function safeVerificationCommand(c: string): boolean {
   return !(/^(node|python[0-9.]*|ruby|perl|php|deno|bun)$/.test(prog) && words[1]!.startsWith('-'));
 }
 
+/** `minions telegram access ...` (pairing, allowlist), with or without program options: denied to the host coordinator. */
+export const TELEGRAM_ACCESS_RULES = ['Bash(minions telegram access *)', 'Bash(minions telegram access)', 'Bash(minions * telegram access *)', 'Bash(minions * telegram access)'];
+
+/** `minions work approve` / `minions approve`, with or without program options before the subcommand. */
+export const APPROVE_RULES = ['Bash(minions work approve *)', 'Bash(minions work approve)', 'Bash(minions * work approve *)', 'Bash(minions * work approve)',
+  'Bash(minions approve *)', 'Bash(minions approve)', 'Bash(minions * approve *)', 'Bash(minions * approve)'];
+
 /**
  * Claude Code settings passed with --settings: an allowlist for deterministic CLIs; bypass mode disabled.
  * Key methods (api-key/helper) add apiKeyHelper; the login method relies on /login state instead.
  * The host runtime adds the sandbox and credential denies (`host`; default: from the environment).
  */
-export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boolean; auth?: RuntimeAuthMethod; host?: HostHardening | null; paths?: Pick<RuntimePaths, 'apiKeyFile'> } = {}): Record<string, unknown> {
+export function coordinatorSettings(cfg: MinionsConfig, opts: { telegram?: boolean; telegramServer?: TelegramServer; auth?: RuntimeAuthMethod; host?: HostHardening | null; paths?: Pick<RuntimePaths, 'apiKeyFile'> } = {}): Record<string, unknown> {
   const auth = opts.auth ?? runtimeAuthMethod();
   const host = opts.host === undefined ? (runtimeMode() === 'host-runtime' ? hostHardeningFromEnv() : null) : opts.host;
   const hs = host ? hostSettings(host) : null;
+  const sandboxed = !!hs && cfg.coordinator?.sandbox !== false;
+  const bypass = configuredPermissionMode(cfg) === 'bypassPermissions';
   // Host runtime: specific git subcommands only (no `git config`, `-c`, remotes or push), and only
   // verification commands that cannot widen into arbitrary programs. The container keeps `git *`.
   const allow = hs
     ? ['Bash(minions *)', 'Bash(minions)', ...HOST_GIT_SUBCOMMANDS.flatMap((g) => [`Bash(git ${g})`, `Bash(git ${g} *)`]), 'Bash(backlog *)']
     : ['Bash(minions *)', 'Bash(minions)', 'Bash(git *)', 'Bash(backlog *)'];
   for (const c of cfg.verification.commands) if (!hs || safeVerificationCommand(c)) allow.push(`Bash(${c})`, `Bash(${c} *)`);
-  // Replies go only to allowlisted chats (the plugin gates outbound messages too).
-  if (opts.telegram) allow.push(...TELEGRAM_TOOLS);
+  const ssh = sandboxed ? [...sshPatterns(cfg.coordinator?.sshHosts ?? []), ...(cfg.coordinator?.unsandboxedCommands ?? [])] : [];
+  allow.push(...ssh.map((p) => `Bash(${p})`));
+  // Replies go only to allowlisted chats (the minions server gates outbound messages too).
+  if (opts.telegram) allow.push(...MINIONS_TELEGRAM_TOOLS);
   return {
     permissions: {
       allow: [...new Set(allow)],
-      // Publication runs only through `minions work publish` (gated, deterministic); the coordinator never
-      // pushes or merges itself. Also cover global options before the subcommand (git -C x push).
+      // minions never talks to a remote: the coordinator never pushes or merges a pull request. Also cover
+      // global options before the subcommand (git -C x push).
       deny: ['Bash(git push *)', 'Bash(git push)', 'Bash(git * push *)', 'Bash(git * push)', 'Bash(gh pr merge *)', 'Bash(gh pr merge)', 'Bash(gh * pr merge *)', 'Bash(gh * pr merge)',
-        ...(hs?.deny ?? [])],
-      // A publication approval must come from the user: Claude Code asks every time (ask beats allow).
-      // Also cover program-level options before the subcommand (`minions --json work approve ...`), which would
-      // otherwise fall to the `Bash(minions *)` allow.
-      ask: ['Bash(minions work approve *)', 'Bash(minions work approve)', 'Bash(minions * work approve *)', 'Bash(minions * work approve)',
-        'Bash(minions approve *)', 'Bash(minions approve)', 'Bash(minions * approve *)', 'Bash(minions * approve)'],
-      disableBypassPermissionsMode: 'disable',
-      ...(hs ? { blockReadsOutsideWorkingDirectories: true } : {}),
+        // A merge approval is signed by the owner in the host terminal; one an agent records is rejected anyway, so it is denied instead of blocking on a prompt. Also
+        // covers program-level options before the subcommand (`minions --json work approve ...`).
+        ...APPROVE_RULES,
+        // Host runtime: pairing is the owner's terminal step (`minions telegram access`), never the coordinator's.
+        ...(hs ? TELEGRAM_ACCESS_RULES : []),
+        ...(hs ? hs.deny : [...containerStateDenies(runtimePaths().state), ...ownerSecretDenies(runtimePaths().secretsDir)])],
+      // bypassPermissions is the owner's explicit choice (config.local.json only); otherwise it stays off.
+      ...(bypass ? {} : { disableBypassPermissionsMode: 'disable' }),
+      ...(sandboxed ? { blockReadsOutsideWorkingDirectories: true } : {}),
     },
     ...(auth === 'login' ? {} : { apiKeyHelper: opts.paths ? apiKeyHelperFor(opts.paths) : host ? apiKeyHelperFor(runtimePaths()) : API_KEY_HELPER }),
-    ...(hs ? { sandbox: hs.sandbox } : {}),
+    ...(sandboxed && hs ? { sandbox: withOwnerSandbox(hs.sandbox, ssh, cfg.coordinator?.allowedDomains ?? []) } : {}),
     // Startup context trim (task-48, src/config/coordinator-tools.ts): tool search on (rarely used tool
     // definitions are deferred, not sent in full every turn) and no bundled skills; plugin skills stay.
     ...(cfg.coordinator?.toolSearch === false ? {} : { env: { ENABLE_TOOL_SEARCH: 'true' } }),
     ...(cfg.coordinator?.bundledSkills ? {} : { disableBundledSkills: true }),
-    // Task-51: the plugin is off at user scope (runCoordinator, src/telegram/isolation.ts); only this
-    // launch enables it, so no other claude session in the container starts a competing poller.
-    ...(opts.telegram ? { enabledPlugins: { [TELEGRAM_PLUGIN_ID]: true } } : {}),
     ...(opts.telegram ? {
-      hooks: { PreToolUse: [{ matcher: TELEGRAM_HOOK_MATCHER, hooks: [{ type: 'command', command: TELEGRAM_HOOK_COMMAND, timeout: HOOK_SETTINGS_TIMEOUT_S }] }] },
+      hooks: { PreToolUse: [{ matcher: MINIONS_TELEGRAM_HOOK_MATCHER, hooks: [{ type: 'command', command: TELEGRAM_HOOK_COMMAND, timeout: HOOK_SETTINGS_TIMEOUT_S }] }] },
     } : {}),
   };
 }
 
 // ---------------------------------------------------------------- permission mode
 
-/** Claude Code permission modes the coordinator may run in. Never bypassPermissions or dontAsk. */
-export type CoordinatorPermissionMode = 'auto' | 'acceptEdits' | 'default';
+/** Claude Code permission modes the coordinator may run in (bypassPermissions only from config.local.json). Never dontAsk. */
+export type CoordinatorPermissionMode = 'auto' | 'acceptEdits' | 'bypassPermissions' | 'default';
+/** Value passed to `claude --permission-mode`: the mode, with "default" under its newer name `manual` where the CLI lists only that. */
+export type PermissionModeArg = CoordinatorPermissionMode | 'manual';
 type PermCfg = Pick<MinionsConfig, 'permissionMode' | 'coordinator'>;
 
 /**
@@ -346,53 +411,54 @@ export function configuredPermissionMode(cfg: PermCfg): CoordinatorPermissionMod
 
 export interface PermissionModeDecision {
   configured: CoordinatorPermissionMode;
-  /** Value passed to `claude --permission-mode`. */
-  mode: CoordinatorPermissionMode;
+  /** Value passed to `claude --permission-mode` (`manual` = default on a Claude Code that lists only that name). */
+  mode: PermissionModeArg;
   /** Auto was configured but this Claude Code does not offer it (or its --help could not be read). */
   fallback: boolean;
   reason: string;
 }
 
-/**
- * `--permission-mode` choices listed by `claude --help` (commander's `(choices: "a", "b")`), or null
- * when the flag or its choices are not listed. Never guesses: a mode counts only when listed.
- */
-export function parsePermissionModes(help: string): string[] | null {
-  const at = help.indexOf('--permission-mode');
-  if (at < 0) return null;
-  const rest = help.slice(at + '--permission-mode'.length);
-  const next = rest.search(/\n\s*-{1,2}[A-Za-z]/);
-  const m = /\(choices:\s*([^)]*)\)/.exec(next < 0 ? rest : rest.slice(0, next));
-  if (!m) return null;
-  const modes = [...m[1]!.matchAll(/"([^"]+)"/g)].map((x) => x[1]!);
-  return modes.length ? modes : null;
-}
-
-/** Reads the installed Claude Code's `--permission-mode` choices; null when `claude --help` fails or lists none. */
-export async function claudePermissionModes(runner: Runner = run): Promise<string[] | null> {
-  const help = await runner('claude', ['--help'], { allowFailure: true, timeoutMs: 30_000 }).catch(() => null);
-  if (!help || help.code !== 0) return null;
-  return parsePermissionModes(help.stdout + help.stderr);
-}
+// The --help choice parser and the strict-mode mapping live in ./permission-modes.ts; re-exported here for
+// existing callers.
+export { claudePermissionModes, parsePermissionModes } from './permission-modes.js';
 
 /**
- * The coordinator's launch permission mode. Host runtime: always `default` (the config may come from the
- * repository). Container: the configured mode; "auto" falls back to "acceptEdits" when `modes` (the
- * installed Claude Code's choices) lacks it or is null. `modes` undefined = not checked: the configured mode.
- * Only the mode changes: coordinatorSettings emits the same allow/deny/ask rules in every mode.
+ * Whether the launch depends on the installed Claude Code's --permission-mode choices: auto (it may be
+ * missing) and the strict mode (legacy "default": passed as `default` or `manual`, whichever this Claude
+ * Code lists). acceptEdits and bypassPermissions need no check.
  */
-export function decidePermissionMode(cfg: PermCfg, opts: { hostRuntime?: boolean; modes?: readonly string[] | null } = {}): PermissionModeDecision {
-  if ((cfg.permissionMode as string) === 'bypassPermissions' || (cfg.coordinator?.permissionMode as string) === 'bypassPermissions') {
-    throw new MinionsError('POLICY_DENIED', 'permissionMode bypassPermissions is never allowed for the coordinator.');
+export function permissionModesNeeded(cfg: PermCfg): boolean {
+  const m = configuredPermissionMode(cfg);
+  return m === 'auto' || m === 'default';
+}
+
+/** The strict mode's argv value for `modes`; fails closed (never another mode) when this Claude Code lists neither name. */
+function strictMode(modes: readonly string[] | null | undefined, where: string): { mode: PermissionModeArg; note: string } {
+  const r = strictPermissionModeArg(modes);
+  if (!r.ok) {
+    throw new MinionsError('INCOMPATIBLE_RUNTIME', `${where}: the coordinator must run in permission mode default, but ${r.reason}. It is not started in a looser mode.`,
+      'Install a Claude Code version that offers --permission-mode default (or manual, its newer name); see docs/compatibility.md.');
   }
+  return { mode: r.mode, note: r.mode === 'manual' ? ' (passed as manual, the name this Claude Code lists for it)' : '' };
+}
+
+/**
+ * The coordinator's launch permission mode, the same in both runtimes: the configured mode (bypassPermissions only
+ * reaches here from config.local.json, src/config/resolve.ts). The legacy "default" is passed as `manual` when `modes`
+ * lists only that name, and throws INCOMPATIBLE_RUNTIME when `modes` lists neither (fail closed). "auto" falls back to
+ * "acceptEdits" when `modes` (the installed Claude Code's choices) lacks it or is null. `modes` undefined = not
+ * checked: the configured mode. Only the mode changes: coordinatorSettings emits the same deny rules in every mode.
+ */
+export function decidePermissionMode(cfg: PermCfg, opts: { modes?: readonly string[] | null } = {}): PermissionModeDecision {
   const configured = configuredPermissionMode(cfg);
-  if (opts.hostRuntime ?? runtimeMode() === 'host-runtime') {
-    return { configured, mode: 'default', fallback: false, reason: 'host runtime: the coordinator always runs in permission mode default' };
-  }
   // Legacy top-level "acceptEdits" (the old default) no longer opts out; say so wherever the mode is reported.
   const legacy = cfg.permissionMode === 'acceptEdits' && !cfg.coordinator?.permissionMode
     ? '; legacy permissionMode "acceptEdits" is ignored; set coordinator.permissionMode "acceptEdits" to opt out'
     : '';
+  if (configured === 'default') {
+    const s = strictMode(opts.modes, 'permissionMode "default"');
+    return { configured, mode: s.mode, fallback: false, reason: `coordinator permission mode default${s.note}` };
+  }
   if (configured !== 'auto' || opts.modes === undefined || opts.modes?.includes('auto')) {
     return { configured, mode: configured, fallback: false, reason: `coordinator permission mode ${configured}${legacy}` };
   }
@@ -405,15 +471,11 @@ export function decidePermissionMode(cfg: PermCfg, opts: { hostRuntime?: boolean
   };
 }
 
-/** Host runtime: permission mode from the (repository-influenced) config is ignored; always `default`. */
-export const effectivePermissionMode = (cfg: PermCfg, hostRuntime = runtimeMode() === 'host-runtime', modes?: readonly string[] | null) =>
-  decidePermissionMode(cfg, { hostRuntime, modes }).mode;
+/** The `--permission-mode` argv value (argv `manual` for the legacy "default" where only that is listed). */
+export const effectivePermissionMode = (cfg: PermCfg, modes?: readonly string[] | null) =>
+  decidePermissionMode(cfg, { modes }).mode;
 
-function assertNoBypass(cfg: MinionsConfig): void {
-  decidePermissionMode(cfg, { hostRuntime: false });
-}
-
-async function readPrompt(paths: RuntimePaths): Promise<string> {
+export async function readPrompt(paths: Pick<RuntimePaths, 'coordinatorPrompt'>): Promise<string> {
   try { return await readFile(paths.coordinatorPrompt, 'utf8'); } catch (e) {
     throw new MinionsError('NOT_FOUND', `Coordinator prompt not found at ${paths.coordinatorPrompt} (${(e as Error).message}).`,
       'Regenerate the plugin on the host (minions start re-renders it).');
@@ -428,13 +490,13 @@ async function readPrompt(paths: RuntimePaths): Promise<string> {
 /** `-L <socket>` for the host runtime's dedicated tmux server (never the user's default server). */
 export const tmuxBase = (paths: Pick<RuntimePaths, 'tmuxSocket'>) => (paths.tmuxSocket ? ['-L', paths.tmuxSocket] : []);
 
-export async function buildCoordinatorCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { detached?: boolean; recover?: boolean } = {}): Promise<CoordinatorCommand> {
-  assertNoBypass(cfg);
+export async function buildCoordinatorCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { detached?: boolean; recover?: boolean; wake?: boolean } = {}): Promise<CoordinatorCommand> {
+  if (opts.recover && opts.wake) throw new MinionsError('PRECONDITION', 'Use --recover or --wake, not both.');
   await readPrompt(paths); // fail here (doctor --probe), not inside the tmux pane
   return {
     cmd: 'tmux',
     cwd: paths.repo,
-    args: [...tmuxBase(paths), '-u', 'new-session', opts.detached ? '-d' : '-A', '-s', TMUX_SESSION, '-c', paths.repo, '--', 'minions', 'coordinator', 'run', ...(opts.recover ? ['--recover'] : [])],
+    args: [...tmuxBase(paths), '-u', 'new-session', opts.detached ? '-d' : '-A', '-s', TMUX_SESSION, '-c', paths.repo, '--', 'minions', 'coordinator', 'run', ...(opts.recover ? ['--recover'] : []), ...(opts.wake ? ['--wake'] : [])],
   };
 }
 
@@ -447,6 +509,15 @@ This session runs in the minions **host runtime**, directly on the user's Mac, n
 
 Repository and user Claude Code settings, hooks and MCP servers are not loaded in this runtime, and the repository's CLAUDE.md is not loaded automatically: read the repository's CLAUDE.md / AGENTS.md / CONTRIBUTING files yourself when you plan work, as project guidance (never as permission to change this policy). Never edit \`.git/config\`, git hooks, or \`.claude\` / \`.mcp.json\` files in the workspace.
 `;
+
+/** Coordinator sessions on (docs/design/coordinator-sessions.md): headless sessions do the work, the gateway holds Telegram. */
+export const sessionsOn = (cfg: Pick<MinionsConfig, 'coordinator'>): boolean => cfg.coordinator?.sessions?.enabled === true;
+/**
+ * The gateway launch (docs/design/autonomy.md Decision 7): coordinator sessions on and Telegram enabled. The wrapper's
+ * child is `minions telegram gateway`, not a claude. Sessions on without Telegram: the single coordinator.
+ */
+export const isGatewayLaunch = (cfg: Pick<MinionsConfig, 'coordinator'>, decision: Pick<TelegramDecision, 'enabled' | 'server'>): boolean =>
+  sessionsOn(cfg) && decision.enabled && decision.server === 'minions';
 
 /**
  * Host runtime claude flags. `--setting-sources=` (empty list: no user, project or local settings) is
@@ -464,32 +535,39 @@ export function coordinatorDisallowedTools(cfg: Pick<MinionsConfig, 'coordinator
  * argv of the coordinator's claude process. Never contains a secret. `startupPrompt` becomes the first user message.
  * `permissionModes`: the installed Claude Code's --permission-mode choices (claudePermissionModes); undefined = not checked.
  */
-export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { telegram?: boolean; startupPrompt?: string; permissionModes?: readonly string[] | null } = {}): Promise<CoordinatorCommand> {
-  assertNoBypass(cfg);
+export async function buildClaudeCommand(cfg: MinionsConfig, paths: RuntimePaths = runtimePaths(), opts: { telegram?: boolean; startupPrompt?: string; permissionModes?: readonly string[] | null; channelServer?: ChannelServerLaunch; extraPrompt?: string } = {}): Promise<CoordinatorCommand> {
   const onHost = runtimeMode() === 'host-runtime';
-  const prompt = await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '');
+  const prompt = await readPrompt(paths) + (onHost ? hostPromptNote(paths) : '') + (opts.extraPrompt ?? '');
   const disallowed = coordinatorDisallowedTools(cfg);
+  const model = cfg.models.coordinator;
+  const effort = roleEffort(cfg, 'coordinator');
+  const startupPrompt = opts.startupPrompt;
+  // Telegram: the minions channel server, the only MCP server of the launch (both runtimes).
+  const ownServer = !!(opts.telegram && opts.channelServer);
+  if (opts.telegram && !opts.channelServer) throw new MinionsError('INTERNAL', 'Telegram launch without the channel server parameters.');
+  const { channelServer: _cs, extraPrompt: _ep, ...settingsOpts } = opts;
   return {
     cmd: 'claude',
     cwd: paths.repo,
     args: [
       '--plugin-dir', paths.pluginDir,
       '--append-system-prompt', prompt,
-      '--permission-mode', effectivePermissionMode(cfg, onHost, opts.permissionModes),
+      '--permission-mode', effectivePermissionMode(cfg, opts.permissionModes),
       // Host runtime: no user/project/local settings (their hooks, MCP servers, plugins, permission
       // rules and sandbox exclusions would apply outside the sandbox) and no MCP servers at all;
       // only --settings below, managed settings and the minions plugin apply. The agents' clone and
       // state are the extra working dirs (needed with blockReadsOutsideWorkingDirectories).
       ...(onHost ? HOST_CLAUDE_FLAGS : []),
+      // Only our server, inline (no agent-writable file), plus the development channel flag (task-2 spike form).
+      ...(ownServer ? minionsChannelArgs(opts.channelServer!) : []),
       ...(onHost ? ['--add-dir', paths.workspace, paths.state] : []),
-      ...(cfg.models.coordinator ? ['--model', cfg.models.coordinator] : []),
-      ...(roleEffort(cfg, 'coordinator') ? ['--effort', roleEffort(cfg, 'coordinator')!] : []),
+      ...(model ? ['--model', model] : []),
+      ...(effort ? ['--effort', effort] : []),
       // Startup context trim (task-48). One comma-separated value: the option is variadic.
       ...(disallowed.length ? ['--disallowedTools', disallowed.join(',')] : []),
-      '--settings', JSON.stringify(coordinatorSettings(cfg, { ...opts, paths })),
-      ...(opts.telegram ? ['--channels', TELEGRAM_CHANNEL_SPEC] : []),
-      // After `--` so a variadic option (--channels) cannot swallow the prompt.
-      ...(opts.startupPrompt ? ['--', opts.startupPrompt] : []),
+      '--settings', JSON.stringify(coordinatorSettings(cfg, { ...settingsOpts, paths })),
+      // After `--` so a variadic option cannot swallow the prompt.
+      ...(startupPrompt ? ['--', startupPrompt] : []),
     ],
   };
 }
@@ -509,12 +587,15 @@ export async function readMountedToken(file: string, readText: (p: string) => Pr
   try { return { state: 'ok', ...checkTelegramTokenFormat(text) }; } catch { return { state: 'invalid', detail: 'not a Telegram bot token' }; }
 }
 
-export interface TelegramDecision { enabled: boolean; reason: string }
-
-export { HOST_TELEGRAM_REASON };
+export interface TelegramDecision {
+  enabled: boolean;
+  reason: string;
+  /** The server an enabled launch uses (absent: the official plugin, as recorded by older launches). */
+  server?: TelegramServer;
+}
 
 /** Channel facts inside the runtime: the mounted token, the runtime kind, the network, and the probe (when run). */
-export function runtimeChannelFacts(cfg: MinionsConfig, token: MountedToken, probe: TelegramProbeReport | null | undefined, hostRuntime = runtimeMode() === 'host-runtime'): ChannelFacts {
+export function runtimeChannelFacts(cfg: MinionsConfig, token: MountedToken, probe: ChannelFacts['probe'], hostRuntime = runtimeMode() === 'host-runtime'): ChannelFacts {
   return {
     token: token.state, ...(token.state === 'invalid' ? { tokenDetail: `mounted but ${token.detail}` } : {}),
     runtime: hostRuntime ? 'host' : 'docker', network: cfg.container.network, probe,
@@ -525,9 +606,10 @@ export function runtimeChannelFacts(cfg: MinionsConfig, token: MountedToken, pro
  * Whether this coordinator launch gets --channels and the token (communication.channel resolved by
  * resolveChannel, src/telegram/channel.ts). Every "no" carries a precise reason.
  */
-export function decideTelegram(cfg: MinionsConfig, token: MountedToken, probe: TelegramProbeReport | null, hostRuntime = runtimeMode() === 'host-runtime'): TelegramDecision {
+export function decideTelegram(cfg: MinionsConfig, token: MountedToken, probe: ChannelFacts['probe'], hostRuntime = runtimeMode() === 'host-runtime'): TelegramDecision {
   const r = resolveChannel(cfg.communication.channel, runtimeChannelFacts(cfg, token, probe, hostRuntime));
-  if (r.effective === 'telegram') return { enabled: true, reason: `Telegram enabled${r.configured === 'auto' ? ' (communication.channel auto: bot token stored)' : ''}: ${TELEGRAM_CHANNEL_SPEC}` };
+  const auto = r.configured === 'auto' ? ' (communication.channel auto: bot token stored)' : '';
+  if (r.effective === 'telegram') return { enabled: true, server: 'minions', reason: `Telegram enabled${auto}: minions channel server ${MINIONS_CHANNEL_SPEC}` };
   return { enabled: false, reason: r.reason };
 }
 
@@ -548,6 +630,8 @@ export interface LaunchRecord {
   fingerprint: string;
   channel: MinionsConfig['communication']['channel'];
   telegram: TelegramDecision;
+  /** The launch id the wrapper also passes to the minions channel server (MINIONS_COORDINATOR_LAUNCH); not a secret. Written by host runtime Telegram launches (task-6). */
+  launchId?: string;
 }
 
 export async function readLaunchRecord(paths: RuntimePaths = runtimePaths()): Promise<LaunchRecord | null> {
@@ -592,7 +676,6 @@ export interface RunCoordinatorDeps {
   paths?: RuntimePaths;
   env?: NodeJS.ProcessEnv;
   spawn?: SpawnLike;
-  probe?: () => Promise<TelegramProbeReport>;
   readText?: (p: string) => Promise<string>;
   log?: (line: string) => void;
   signals?: SignalTarget;
@@ -600,14 +683,55 @@ export interface RunCoordinatorDeps {
   startupPrompt?: string;
   /** Timer for the signal escalation (injectable for tests); returns a cancel function. */
   timer?: (fn: () => void, ms: number) => () => void;
-  /** The installed Claude Code's --permission-mode choices (default: `claude --help`); asked only when auto is configured. */
+  /** The installed Claude Code's --permission-mode choices (default: `claude --help`); asked unless acceptEdits is configured in the container (permissionModesNeeded). */
   permissionModes?: () => Promise<string[] | null>;
   /** Pre-spawn signal guard of coordinatorWrapper: a signal before claude starts cancels the launch. */
   preSpawn?: PreSpawnGuard;
   /** Process table for stopping claude's MCP children on SIGKILL (default: /proc). */
   proc?: ProcessControl;
-  /** Turns the Telegram plugin off at user scope before claude starts (default: disableTelegramAtUserScope on paths.claudeUserSettings). */
-  userScope?: (file: string, opts: { create: boolean }) => Promise<UserScopeResult>;
+  /** Host runtime: `claude --version` output for the channel server check (default: runs it; null when it fails). */
+  claudeVersion?: () => Promise<string | null>;
+  /** Host runtime: whether a file exists (the shim that starts the channel server; default: existsSync). */
+  exists?: (p: string) => boolean;
+  /** Host runtime: the launch id of this launch (default: a random UUID). */
+  newLaunchId?: () => string;
+}
+
+/** Placeholder for the launch id in `minions coordinator --print-command` (each launch makes its own). */
+export const PRINT_LAUNCH_ID = '<launch-id>';
+
+/** The channel server parameters of a launch from the runtime paths (launchId: this launch's id). */
+export function channelServerLaunch(paths: Pick<RuntimePaths, 'minionsShim' | 'telegramTokenFile' | 'telegramStateDir'>, launchId: string): ChannelServerLaunch | undefined {
+  return { command: paths.minionsShim ?? 'minions', launchId, tokenFile: paths.telegramTokenFile, stateDir: paths.telegramStateDir };
+}
+
+/** `--print-command` on the host: the argv with a placeholder launch id (shim missing: the plain `minions` command). */
+export function printChannelServer(paths: Pick<RuntimePaths, 'minionsShim' | 'telegramTokenFile' | 'telegramStateDir'>): ChannelServerLaunch {
+  return channelServerLaunch(paths, PRINT_LAUNCH_ID) ?? { command: 'minions', launchId: PRINT_LAUNCH_ID, tokenFile: paths.telegramTokenFile, stateDir: paths.telegramStateDir };
+}
+
+/** `claude --version`, or null when it fails. */
+export async function claudeVersionText(runner: Runner = run): Promise<string | null> {
+  const r = await runner('claude', ['--version'], { allowFailure: true, timeoutMs: 30_000 }).catch(() => null);
+  return r && r.code === 0 ? r.stdout.trim() : null;
+}
+
+/**
+ * Host runtime (task-6): the minions channel server check before a Telegram launch (Claude Code version for the
+ * development channel flag, the token file, the shim). Not run when Telegram is not intended or the token is unusable
+ * (resolveChannel then names that reason).
+ */
+export async function hostChannelProbe(cfg: MinionsConfig, token: MountedToken, paths: RuntimePaths, deps: Pick<RunCoordinatorDeps, 'claudeVersion' | 'exists'> = {}): Promise<HostChannelServerReport | undefined> {
+  if (cfg.communication.channel === 'terminal' || token.state !== 'ok') return undefined;
+  return hostChannelReport(token, paths, deps);
+}
+
+/** The channel server check report (`minions telegram probe` in the host runtime). */
+export async function hostChannelReport(token: MountedToken, paths: Pick<RuntimePaths, 'minionsShim'>, deps: Pick<RunCoordinatorDeps, 'claudeVersion' | 'exists'> = {}): Promise<HostChannelServerReport> {
+  const version = await (deps.claudeVersion ?? (() => claudeVersionText()))().catch(() => null);
+  const exists = deps.exists ?? existsSync;
+  // The container has `minions` on PATH; the host runtime starts the server through its shim.
+  return hostChannelServerProbe({ claudeVersion: version, token: token.state, command: !paths.minionsShim || exists(paths.minionsShim) });
 }
 
 /** Signals that end the wrapper cleanly before claude starts (Ctrl-C there is meant for the wrapper). */
@@ -662,9 +786,9 @@ export function installPreSpawnGuard(signals: SignalTarget = process): PreSpawnG
  *
  * MCP children (task-38): claude stops its MCP servers (the Telegram poller) itself on SIGHUP/SIGTERM.
  * SIGKILL gives it no chance, so right before the SIGKILL the wrapper SIGKILLs claude's descendants,
- * deepest first, each re-verified through its /proc parent while claude has not exited (so none was
+ * deepest first, each re-verified through its parent (/proc, or `ps` on macOS) while claude has not exited (so none was
  * reparented or reused). The pane's process group is not signalled: claude shares it with the pane's
- * foreground job, and task-17 keeps Ctrl-C there. Without /proc no descendant is found; those servers
+ * foreground job, and task-17 keeps Ctrl-C there. Without a process table no descendant is found; those servers
  * then rely on the stdin EOF they get when claude dies.
  */
 export const ESCALATE_TERM_MS = 4000;
@@ -681,41 +805,47 @@ export async function runCoordinator(cfg: MinionsConfig, deps: RunCoordinatorDep
   const paths = deps.paths ?? runtimePaths();
   const log = deps.log ?? ((l: string) => process.stderr.write(l + '\n'));
   const token = await readMountedToken(paths.telegramTokenFile, deps.readText);
-  let probe: TelegramProbeReport | null = null;
-  if (cfg.communication.channel !== 'terminal' && cfg.container.network !== 'none' && token.state === 'ok' && runtimeMode() !== 'host-runtime') {
-    try { probe = await (deps.probe ?? (() => probeTelegram()))(); } catch { probe = null; }
-  }
+  const probe: ChannelFacts['probe'] = await hostChannelProbe(cfg, token, paths, deps).catch(() => null) ?? null;
   // A signal during the probe window cancels the launch (see PreSpawnGuard); checked after every await.
   const cancelled = () => (deps.preSpawn?.signal ? exitCodeOf(null, deps.preSpawn.signal) : null);
   if (cancelled() !== null) return cancelled()!;
   const decision = decideTelegram(cfg, token, probe);
   // Intended Telegram (telegram, or auto with a token) says why it is off; auto without a token is plain terminal mode.
   const intended = resolveChannel(cfg.communication.channel, runtimeChannelFacts(cfg, token, probe)).wantsTelegram;
-  if (decision.enabled) log(`minions: ${decision.reason}`);
-  else if (intended) log(`minions: Telegram disabled for this session: ${decision.reason}. Terminal mode is active.`);
+  if (decision.enabled) {
+    log(`minions: ${decision.reason}`);
+    if (await seedOwnerAccess(paths.telegramStateDir, join(dirname(paths.configJson), 'project.json')).catch(() => false)) {
+      log('minions: Telegram access allowlisted to the owner from `minions defaults` (no pairing needed).');
+    }
+  } else if (intended) log(`minions: Telegram disabled for this session: ${decision.reason}. Terminal mode is active.`);
   else if (cfg.communication.channel === 'auto') log(`minions: terminal mode (${decision.reason}).`);
-  // Auto mode only where this Claude Code offers it; otherwise acceptEdits with a clear message.
-  const permissionModes = configuredPermissionMode(cfg) === 'auto' && runtimeMode() !== 'host-runtime'
+  // Auto mode only where this Claude Code offers it; otherwise acceptEdits with a clear message. The
+  // strict mode (host runtime, legacy "default") is passed under the name this Claude Code lists.
+  const permissionModes = permissionModesNeeded(cfg)
     ? await (deps.permissionModes ?? (() => claudePermissionModes()))().catch(() => null) : undefined;
   if (cancelled() !== null) return cancelled()!;
   const perm = decidePermissionMode(cfg, { modes: permissionModes });
   if (perm.fallback) log(`minions: ${perm.reason}`);
-  const c = await buildClaudeCommand(cfg, paths, { telegram: decision.enabled, startupPrompt: deps.startupPrompt, permissionModes });
+  // The launch id ties our channel server to this launch (it activates only when the record matches).
+  const ownServer = decision.enabled && decision.server === 'minions';
+  const launchId = ownServer ? (deps.newLaunchId ?? randomUUID)() : undefined;
+  const channelServer = ownServer && launchId ? channelServerLaunch(paths, launchId) : undefined;
+  // Coordinator sessions with the minions channel server: the gateway replaces the router claude (docs/design/autonomy.md
+  // Decision 7); no model holds the chat.
+  const gateway = isGatewayLaunch(cfg, decision) && channelServer ? channelServer : null;
+  if (gateway) log('minions: coordinator sessions on: the Telegram gateway routes owner messages (no router model).');
+  else if (sessionsOn(cfg)) log('minions: coordinator sessions need Telegram; without it this is the single coordinator.');
+  else if (ownServer) log(`minions: ${DEV_CHANNELS_DIALOG_NOTE}.`);
+  const c = gateway ? { cmd: gateway.command, args: ['telegram', 'gateway'], cwd: paths.workspace }
+    : await buildClaudeCommand(cfg, paths, { telegram: decision.enabled, startupPrompt: deps.startupPrompt, permissionModes, ...(channelServer ? { channelServer } : {}) });
   if (cancelled() !== null) return cancelled()!;
-  // Task-51: the plugin stays off at user scope, so only this launch (its --settings enabledPlugins)
-  // loads it. Re-applied on every launch: existing setups get it on the next start, restart or upgrade.
-  // The host runtime loads no user settings at all.
-  if (runtimeMode() !== 'host-runtime') {
-    const u = await (deps.userScope ?? disableTelegramAtUserScope)(paths.claudeUserSettings, { create: decision.enabled }).catch((e: unknown) => ({ state: 'error' as const, detail: (e as Error).message }));
-    if (u.state === 'disabled') log(`minions: ${u.detail}.`);
-    else if (u.state === 'error') log(`minions: warning: could not turn the Telegram plugin off at user scope (${u.detail}); other claude sessions in this container may take over the bot.`);
-  }
   // Before the launch record: a cancelled wrapper must not overwrite its successor's record.
   if (cancelled() !== null) return cancelled()!;
   const env: NodeJS.ProcessEnv = { ...(deps.env ?? process.env) };
+  // The channel server reads the token from its file: it is never in the claude env, nor in argv.
   delete env[TELEGRAM_TOKEN_ENV];
-  if (decision.enabled && token.state === 'ok') env[TELEGRAM_TOKEN_ENV] = token.token;
-  const record: LaunchRecord = { version: 1, pid: process.pid, startedAt: new Date().toISOString(), fingerprint: launchFingerprint(cfg, token), channel: cfg.communication.channel, telegram: decision };
+  if (gateway) Object.assign(env, { [TOKEN_FILE_ENV]: gateway.tokenFile, [LAUNCH_ENV]: gateway.launchId, TELEGRAM_STATE_DIR: gateway.stateDir });
+  const record: LaunchRecord = { version: 1, pid: process.pid, startedAt: new Date().toISOString(), fingerprint: launchFingerprint(cfg, token), channel: cfg.communication.channel, telegram: decision, ...(launchId ? { launchId } : {}) };
   await atomicWrite(paths.coordinatorLaunch, JSON.stringify(record, null, 2) + '\n').catch(() => { /* state not writable: restart detection degrades */ });
   const spawn = deps.spawn ?? (nodeSpawn as unknown as SpawnLike);
   const signals = deps.signals ?? process;
@@ -802,9 +932,10 @@ export type LockAlive = (pid: number, lock?: Pick<CoordinatorLock, 'start'>) => 
 
 /**
  * Lock holder liveness (task-38): the pid exists, its start time matches the one recorded in the lock
- * (when both are known), and (where /proc exists) it still runs a coordinator wrapper. The start time
- * is what tells a reused pid apart: a tmux client's argv also contains `coordinator run`. Without /proc
- * (macOS host runtime) a live pid counts as the holder: a second coordinator is refused, never signalled.
+ * (when both are known), and (where its command line is readable: /proc, or `ps` on macOS) it still runs a
+ * coordinator wrapper. The start time is what tells a reused pid apart: a tmux client's argv also contains
+ * `coordinator run`. When neither can be read a live pid counts as the holder: a second coordinator is refused,
+ * never signalled.
  */
 export function coordinatorPidAlive(pid: number, lock?: Pick<CoordinatorLock, 'start'>, pc: Pick<ProcessControl, 'alive' | 'cmdline' | 'startTime'> = systemProcessControl): boolean {
   if (!pc.alive(pid)) return false;
@@ -821,8 +952,13 @@ function procCmdline(pid: number): string | null {
   try { return readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').join(' ').trim(); } catch { return null; }
 }
 
-/** /proc/<pid>/stat field 22 (starttime, clock ticks since boot); null without /proc. */
+/**
+ * /proc/<pid>/stat field 22 (starttime, clock ticks since boot); on darwin the `ps` start time (epoch seconds, see
+ * src/runtime/process-facts.ts); null when unreadable.
+ */
 export function procStartTime(pid: number): string | null {
+  const ps = systemProcessFacts();
+  if (ps) return ps.process(pid)?.startTime ?? null;
   try {
     const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
     const v = stat.slice(stat.lastIndexOf(')') + 2).split(' ')[19];
@@ -893,18 +1029,20 @@ export async function waitForLockRelease(store: Pick<CoordinatorLockStore, 'coor
 // again. A pid is signalled only when, re-checked right before that signal: it is still the pid this
 // project's runtime DB lock names with the recorded start time (or a descendant of it, verified through
 // the /proc parent chain), it is alive, and its /proc cmdline is a coordinator wrapper (`coordinator
-// run`) or claude. Without /proc (macOS host runtime) nothing can be verified, so nothing is signalled
+// run`) or claude (macOS: the same facts from `ps`). When they cannot be read nothing can be verified, so nothing is signalled
 // and the restart fails with a clear error instead of relaunching onto a held lock.
 
 /** Process inspection and signalling (injectable for tests). */
 export interface ProcessControl {
   alive: (pid: number) => boolean;
-  /** argv joined by spaces; null when unreadable (no /proc). */
+  /** argv joined by spaces; null when unreadable. */
   cmdline: (pid: number) => string | null;
   parentOf: (pid: number) => number | null;
-  /** Process start time (see procStartTime); null when unreadable (no /proc). */
+  /** Process start time (see procStartTime); null when unreadable. */
   startTime: (pid: number) => string | null;
   pids: () => number[];
+  /** Every pid with its parent from one snapshot, when the backend has that cheaper than pids() + parentOf() (ps). */
+  table?: () => { pid: number; parent: number | null }[];
   kill: (pid: number, signal: NodeJS.Signals) => void;
 }
 
@@ -920,18 +1058,39 @@ function procPids(): number[] {
   try { return readdirSync('/proc').filter((n) => /^\d+$/.test(n)).map(Number); } catch { return []; }
 }
 
-export const systemProcessControl: ProcessControl = {
+const procfsProcessControl: ProcessControl = {
   alive: pidAlive, cmdline: procCmdline, parentOf: procParent, startTime: procStartTime, pids: procPids, kill: (pid, s) => { process.kill(pid, s); },
 };
+
+/** ProcessControl from `ps` (macOS, no /proc). Every fact is read fresh, so a re-check right before a signal is current. */
+export function psProcessControl(facts: ProcessFacts): ProcessControl {
+  return {
+    alive: pidAlive,
+    cmdline: (pid) => facts.process(pid)?.cmdline ?? null,
+    parentOf: (pid) => facts.process(pid)?.ppid ?? null,
+    startTime: (pid) => facts.process(pid)?.startTime ?? null,
+    pids: () => facts.list().map((p) => p.pid),
+    table: () => facts.list().map((p) => ({ pid: p.pid, parent: p.ppid })),
+    kill: (pid, s) => { process.kill(pid, s); },
+  };
+}
+
+/** The process view for a platform: `ps` on darwin (or `facts` when given), /proc elsewhere. */
+export function processControlFor(platform: NodeJS.Platform = process.platform, facts?: ProcessFacts): ProcessControl {
+  const ps = facts ?? systemProcessFacts(platform);
+  return ps ? psProcessControl(ps) : procfsProcessControl;
+}
+
+export const systemProcessControl: ProcessControl = processControlFor();
 
 /**
  * Descendants of `root` from one /proc snapshot, deepest first, each with the parent it was found under.
  * Killing in this order keeps every parent alive (and unreaped) while its children are re-verified.
  */
-export function descendantsOf(pc: Pick<ProcessControl, 'pids' | 'parentOf'>, root: number): { pid: number; parent: number }[] {
+export function descendantsOf(pc: Pick<ProcessControl, 'pids' | 'parentOf' | 'table'>, root: number): { pid: number; parent: number }[] {
   const children = new Map<number, number[]>();
-  for (const p of pc.pids()) {
-    const pp = pc.parentOf(p);
+  const rows = pc.table ? pc.table() : pc.pids().map((pid) => ({ pid, parent: pc.parentOf(pid) }));
+  for (const { pid: p, parent: pp } of rows) {
     if (pp !== null && pp !== p) (children.get(pp) ?? children.set(pp, []).get(pp)!).push(p);
   }
   const out: { pid: number; parent: number }[] = [];
@@ -1015,11 +1174,34 @@ export interface CoordinatorWrapperDeps extends RunCoordinatorDeps {
    */
   exitAfterSignal?: (code: number) => void;
   /**
-   * Startup work run once the lock is held, before claude starts (the CLI passes the GitHub intake
-   * sync). Failures are logged and never stop the coordinator. It runs inside the pre-spawn guard:
+   * Startup work run once the lock is held, before claude starts (the CLI passes process-run recovery and the
+   * scratch sweep). Failures are logged and never stop the coordinator. It runs inside the pre-spawn guard:
    * `stop` is aborted on a signal, and the wrapper does not wait for it after that.
    */
   onStart?: (cfg: MinionsConfig, log: (line: string) => void, stop: AbortSignal) => Promise<void>;
+  /**
+   * The routine clock (docs/design/unattended-delivery.md decision 2): started once the lock is held, right before
+   * claude is spawned, and stopped when the wrapper ends. Returns its stop function. It must never block claude:
+   * the CLI passes startRoutineClock (src/runtime/routine.ts), whose ticks run the pass as a bounded child process.
+   */
+  routineClock?: (log: (line: string) => void) => () => void;
+  /**
+   * The session supervisor watch (docs/design/coordinator-sessions.md decision 7): started next to the routine clock
+   * and stopped when the wrapper ends (the supervisor itself keeps running: it is detached). The CLI passes
+   * startSupervisorWatch (src/runtime/supervisor.ts), which does nothing at all with coordinator.sessions.enabled off.
+   */
+  supervisorWatch?: (cfg: MinionsConfig, log: (line: string) => void) => () => void;
+  /**
+   * The local integration backstop (docs/design/local-auto-integration.md, task-82.4): started next to the routine
+   * clock, it starts `minions work integrate` when queued integrations have no live integrator (a lost detached
+   * start, a dead holder). The CLI passes wrapperIntegrationWatch (src/runtime/commands.ts). Returns its stop function.
+   */
+  integrationWatch?: (cfg: MinionsConfig, log: (line: string) => void) => () => void;
+  /**
+   * The autopilot dispatcher watch (docs/design/autonomy.md Decisions 1 and 10): keeps `minions work dispatch` running,
+   * always. The CLI passes wrapperDispatchWatch. Returns its stop function.
+   */
+  dispatchWatch?: (cfg: MinionsConfig, log: (line: string) => void) => () => void;
 }
 
 /**
@@ -1035,6 +1217,10 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
   let db: RuntimeDb | undefined;
   let held: CoordinatorLock | undefined;
   let guard: PreSpawnGuard | undefined;
+  let stopClock: (() => void) | undefined;
+  let stopWatch: (() => void) | undefined;
+  let stopIntegration: (() => void) | undefined;
+  let stopDispatch: (() => void) | undefined;
   const store = (): CoordinatorLockStore => deps.lock ?? (db ??= openDb(paths.db));
   let code: number;
   try {
@@ -1042,7 +1228,7 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
     // Before runCoordinator: a refused duplicate must not overwrite the running coordinator's launch record.
     const log = deps.log ?? ((l: string) => process.stderr.write(l + '\n'));
     // Before the lock is awaited (task-40): every hop from taking the lock until claude is spawned is
-    // covered (see PreSpawnGuard), the startup step (GitHub intake) included. A signal while waiting for
+    // covered (see PreSpawnGuard), the startup step included. A signal while waiting for
     // a previous holder ends the wait; one right after the lock was taken releases it below.
     guard = installPreSpawnGuard(deps.signals ?? process);
     const g = guard;
@@ -1063,6 +1249,18 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
       }
       // A signal during the startup step: the race below has already ended the wrapper; never spawn.
       if (g.signal) return exitCodeOf(null, g.signal);
+      if (deps.routineClock) {
+        try { stopClock = deps.routineClock(log); } catch (e) { log(`minions: the routine clock did not start: ${redact((e as Error).message).slice(0, 300)}`); }
+      }
+      if (deps.supervisorWatch) {
+        try { stopWatch = deps.supervisorWatch(cfg, log); } catch (e) { log(`minions: the session supervisor watch did not start: ${redact((e as Error).message).slice(0, 300)}`); }
+      }
+      if (deps.integrationWatch) {
+        try { stopIntegration = deps.integrationWatch(cfg, log); } catch (e) { log(`minions: the integration watch did not start: ${redact((e as Error).message).slice(0, 300)}`); }
+      }
+      if (deps.dispatchWatch) {
+        try { stopDispatch = deps.dispatchWatch(cfg, log); } catch (e) { log(`minions: the dispatcher watch did not start: ${redact((e as Error).message).slice(0, 300)}`); }
+      }
       return runCoordinator(cfg, { ...deps, preSpawn: g });
     })();
     // Errors still reach us through the race; after a pre-spawn signal a late one no longer matters.
@@ -1073,6 +1271,10 @@ export async function coordinatorWrapper(loadConfig: () => Promise<MinionsConfig
     await write({ code: 1, error: redact((e as Error).message).slice(0, 1000) });
     throw e;
   } finally {
+    try { stopClock?.(); } catch { /* best effort */ }
+    try { stopWatch?.(); } catch { /* best effort */ }
+    try { stopIntegration?.(); } catch { /* best effort */ }
+    try { stopDispatch?.(); } catch { /* best effort */ }
     guard?.dispose();
     if (held) { try { store().releaseCoordinatorLock(held.session, held.pid); } catch { /* a dead holder is taken over next time */ } }
     db?.close();
@@ -1101,7 +1303,7 @@ export interface SyncDeps {
   paths?: RuntimePaths;
   runner?: Runner;
   activeLeases: () => { id: string }[];
-  recordRestart?: (info: { at: string; reason: string; leases: string[]; recover?: boolean }) => void;
+  recordRestart?: (info: { at: string; reason: string; leases: string[]; recover?: boolean; wake?: boolean }) => void;
   readText?: (p: string) => Promise<string>;
   /** How long a detached start waits before re-checking that the wrapper is still alive (default 2000ms). */
   settleMs?: number;
@@ -1143,17 +1345,37 @@ export async function coordinatorLaunchStatus(cfg: MinionsConfig, deps: { paths?
     : 'Telegram configuration changed since the coordinator launched (bot token or network)' };
 }
 
+/** How to get the minions channel server back (host runtime). */
+export const MINIONS_POLLER_RECOVERY_HINT = 'In the coordinator terminal (attach with `minions start`) run /mcp and reconnect minions-telegram; '
+  + 'or, when no worker is running, restart the coordinator: `minions coordinator restart --recover`. Its log (logs/telegram-channel.log in the state dir) says why it is not polling.';
+
+/**
+ * Host runtime (task-6): the minions channel server polls only while it holds channel.lock for the running launch
+ * (src/telegram/channel/server.ts); bot.pid does not apply. Never throws for a missing or foreign lock.
+ */
+export async function minionsChannelPollerStatus(rec: LaunchRecord, paths: Pick<RuntimePaths, 'telegramStateDir'>, proc: Pick<ProcessControl, 'alive' | 'startTime'>): Promise<PollerCheck> {
+  if (!proc.alive(rec.pid)) return { state: 'not-applicable', detail: 'coordinator is not running' };
+  const lock = await readChannelLock(join(paths.telegramStateDir, 'channel.lock'));
+  const hint = MINIONS_POLLER_RECOVERY_HINT;
+  if (!lock) return { state: 'missing', detail: 'the minions channel server holds no channel.lock, so the coordinator\'s channel is not receiving messages', hint };
+  if (!rec.launchId || lock.launchId !== rec.launchId) return { state: 'missing', detail: 'channel.lock belongs to another coordinator launch; the running coordinator\'s channel server is not polling', hint };
+  if (lock.released) return { state: 'missing', detail: 'the minions channel server of this launch stopped (channel.lock released)', hint };
+  const start = lock.start ? proc.startTime(lock.pid) : null;
+  if (!proc.alive(lock.pid) || (start !== null && start !== lock.start)) return { state: 'dead', pid: lock.pid, detail: `minions channel server pid ${lock.pid} (channel.lock) has exited`, hint };
+  return { state: 'ok', pid: lock.pid, detail: `minions channel server pid ${lock.pid} polls for the coordinator (channel.lock of this launch)` };
+}
+
 /**
  * Task-51: whether the Telegram poller (bot.pid in the plugin's state dir) is the running coordinator's.
  * Applies only when the launch record says the coordinator has Telegram; the record's pid is the
  * wrapper, an ancestor of claude's MCP servers. Never throws.
  */
-export async function telegramPollerStatus(deps: { paths?: RuntimePaths; proc?: Pick<ProcessControl, 'alive' | 'cmdline' | 'parentOf'>; readText?: (p: string) => Promise<string> } = {}): Promise<PollerCheck> {
+export async function telegramPollerStatus(deps: { paths?: RuntimePaths; proc?: Pick<ProcessControl, 'alive' | 'cmdline' | 'parentOf'> & Partial<Pick<ProcessControl, 'startTime'>>; readText?: (p: string) => Promise<string> } = {}): Promise<PollerCheck> {
   const paths = deps.paths ?? runtimePaths();
   const rec = await readLaunchRecord(paths);
   if (!rec) return { state: 'not-applicable', detail: 'no coordinator launch recorded' };
-  return checkTelegramPoller({ pidFile: join(paths.telegramStateDir, 'bot.pid'), coordinatorPid: rec.pid, telegram: rec.telegram.enabled, proc: deps.proc ?? systemProcessControl, readText: deps.readText })
-    .catch((e: unknown) => ({ state: 'unknown' as const, detail: (e as Error).message }));
+  if (!rec.telegram.enabled) return { state: 'not-applicable', detail: 'the coordinator runs without Telegram' };
+  return minionsChannelPollerStatus(rec, paths, { ...systemProcessControl, ...(deps.proc ?? {}) }).catch((e: unknown) => ({ state: 'unknown' as const, detail: (e as Error).message }));
 }
 
 /**
@@ -1163,7 +1385,8 @@ export async function telegramPollerStatus(deps: { paths?: RuntimePaths; proc?: 
  * the runtime DB for `recover`. `startDetached` then (re)starts the session without a terminal, so
  * Telegram works with nobody attached.
  */
-export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: { force?: boolean; startDetached?: boolean; restart?: boolean; recover?: boolean } = {}): Promise<SyncResult> {
+export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: { force?: boolean; startDetached?: boolean; restart?: boolean; recover?: boolean; wake?: boolean } = {}): Promise<SyncResult> {
+  const mode = { ...(opts.recover ? { recover: true } : {}), ...(opts.wake ? { wake: true } : {}) };
   const paths = deps.paths ?? runtimePaths();
   const runner = deps.runner ?? run;
   let running = await tmuxHas(runner, paths);
@@ -1180,7 +1403,7 @@ export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: 
     if (leases.length && !opts.force) {
       return { action: 'restart-pending', running, reason: `${reason}; restart deferred: ${leases.length} active worker lease(s) (${leases.join(', ')}). Rerun with --force, or after they finish.`, telegram: rec?.telegram ?? null };
     }
-    deps.recordRestart?.({ at: new Date().toISOString(), reason, leases, ...(opts.recover ? { recover: true } : {}) });
+    deps.recordRestart?.({ at: new Date().toISOString(), reason, leases, ...mode });
     await runner('tmux', [...tmuxBase(paths), 'kill-session', '-t', TMUX_SESSION], { allowFailure: true, timeoutMs: 10_000 });
     // The old wrapper releases the lock once claude has exited; relaunching before that would race it.
     if (deps.lock && !(await waitForLockRelease(deps.lock, { alive: deps.lockAlive, waitMs: deps.lockReleaseWaitMs, sleep: deps.sleep }))) {
@@ -1199,8 +1422,8 @@ export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: 
     reason = 'coordinator is running without a launch record (started by an older minions); restart it to apply Telegram settings';
   }
   if (!running && opts.startDetached) {
-    if (opts.restart && action === 'none') deps.recordRestart?.({ at: new Date().toISOString(), reason: 'restart requested; coordinator was not running', leases: deps.activeLeases().map((l) => l.id), ...(opts.recover ? { recover: true } : {}) });
-    const c = await buildCoordinatorCommand(cfg, paths, { detached: true, recover: opts.recover });
+    if (opts.restart && action === 'none') deps.recordRestart?.({ at: new Date().toISOString(), reason: 'restart requested; coordinator was not running', leases: deps.activeLeases().map((l) => l.id), ...mode });
+    const c = await buildCoordinatorCommand(cfg, paths, { detached: true, recover: opts.recover, wake: opts.wake });
     await rm(paths.coordinatorExit, { force: true }).catch(() => { /* a stale record only weakens the message */ });
     const prior = deps.lock?.coordinatorLock();
     const r = await runner(c.cmd, c.args, { cwd: c.cwd, allowFailure: true, timeoutMs: 30_000 });
@@ -1234,6 +1457,7 @@ export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: 
     running = true;
     if (action === 'none') { action = 'started'; reason = 'coordinator started detached'; } else reason += '; coordinator relaunched detached';
     if (opts.recover) reason += ' with the recovery prompt';
+    if (opts.wake) reason += ' with the wake prompt';
     reason += lockNote;
   }
   return { action, running, reason, telegram: rec?.telegram ?? null };
@@ -1245,7 +1469,7 @@ export async function syncCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: 
  * runs the recover skill and resumes the queue. Refuses while worker leases are active in a running
  * session (their workers would die) unless `force`; the leases stay recorded for recovery either way.
  */
-export async function restartCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: { force?: boolean; recover?: boolean } = {}): Promise<SyncResult> {
+export async function restartCoordinator(cfg: MinionsConfig, deps: SyncDeps, opts: { force?: boolean; recover?: boolean; wake?: boolean } = {}): Promise<SyncResult> {
   const r = await syncCoordinator(cfg, deps, { ...opts, restart: true, startDetached: true });
   if (r.action === 'restart-pending') {
     throw new MinionsError('PRECONDITION', `Coordinator restart refused: ${r.reason}`,
@@ -1277,7 +1501,8 @@ export interface DetachedRestartDeps {
  * also refuses unless `force` (task-49): the upgrade behind it restarts the coordinator itself. Only this
  * self-restart checks the drain; plain `coordinator restart` (what the host upgrade runs) does not.
  */
-export function scheduleDetachedRestart(deps: DetachedRestartDeps, opts: { force?: boolean; recover?: boolean } = {}): { action: 'restart-scheduled'; log: string; pid: number | null; reason: string } {
+export function scheduleDetachedRestart(deps: DetachedRestartDeps, opts: { force?: boolean; recover?: boolean; wake?: boolean } = {}): { action: 'restart-scheduled'; log: string; pid: number | null; reason: string } {
+  if (opts.recover && opts.wake) throw new MinionsError('PRECONDITION', 'Use --recover or --wake, not both.');
   const leases = deps.activeLeases().map((l) => l.id);
   if (leases.length && !opts.force) {
     throw new MinionsError('PRECONDITION', `Coordinator restart refused: ${leases.length} active worker lease(s) (${leases.join(', ')}).`,
@@ -1292,12 +1517,36 @@ export function scheduleDetachedRestart(deps: DetachedRestartDeps, opts: { force
   const fd = open(deps.log);
   try {
     const spawn: DetachedSpawn = deps.spawn ?? ((c, a, o) => nodeSpawn(c, a, o));
-    const child = spawn('minions', ['coordinator', 'restart', ...(opts.recover ? ['--recover'] : []), ...(opts.force ? ['--force'] : [])],
+    const child = spawn('minions', ['coordinator', 'restart', ...(opts.recover ? ['--recover'] : []), ...(opts.wake ? ['--wake'] : []), ...(opts.force ? ['--force'] : [])],
       { cwd: deps.cwd, detached: true, stdio: ['ignore', fd, fd], env: deps.env ?? process.env });
     child.on('error', () => { /* the log shows nothing then; the caller's session keeps running and can retry */ });
     child.unref();
     return { action: 'restart-scheduled', log: deps.log, pid: child.pid ?? null,
-      reason: `coordinator restart${opts.recover ? ' --recover' : ''} runs detached; this session ends when it kills the tmux session (output: ${deps.log})` };
+      reason: `coordinator restart${opts.recover ? ' --recover' : ''}${opts.wake ? ' --wake' : ''} runs detached; this session ends when it kills the tmux session (output: ${deps.log})` };
+  } finally {
+    try { closeSync(fd); } catch { /* the child holds its own copy */ }
+  }
+}
+
+/**
+ * The routine pass's crash start (task-68.2): the coordinator is not running and its exit was a crash. Separate from
+ * the wake on purpose: nothing runs that a restart could kill, so the lease check does not apply, but a drain or an
+ * upgrade in progress refuses (that upgrade starts the coordinator itself). Spawns `minions coordinator restart
+ * --recover` detached (never --force: if a coordinator came up meanwhile, the restart's own lease check applies).
+ */
+export function scheduleCrashStart(deps: Omit<DetachedRestartDeps, 'activeLeases'> & { upgrade?: () => string | null }): { action: 'start-scheduled'; log: string; pid: number | null; reason: string } {
+  const drain = deps.drain();
+  if (drain) throw new MinionsError('PRECONDITION', `Coordinator start refused: a drain is in progress (${drain.reason}).`, 'The upgrade behind it starts the coordinator itself.');
+  const up = deps.upgrade?.() ?? null;
+  if (up) throw new MinionsError('PRECONDITION', `Coordinator start refused: an upgrade is in progress (${up}).`, 'The upgrade starts the coordinator itself.');
+  const open = deps.openLog ?? ((f: string) => { mkdirSync(dirname(f), { recursive: true }); return openSync(f, 'a', 0o600); });
+  const fd = open(deps.log);
+  try {
+    const spawn: DetachedSpawn = deps.spawn ?? ((c, a, o) => nodeSpawn(c, a, o));
+    const child = spawn('minions', ['coordinator', 'restart', '--recover'], { cwd: deps.cwd, detached: true, stdio: ['ignore', fd, fd], env: deps.env ?? process.env });
+    child.on('error', () => { /* the next pass sees it still down and counts the next try */ });
+    child.unref();
+    return { action: 'start-scheduled', log: deps.log, pid: child.pid ?? null, reason: `coordinator restart --recover runs detached (output: ${deps.log})` };
   } finally {
     try { closeSync(fd); } catch { /* the child holds its own copy */ }
   }
@@ -1315,6 +1564,8 @@ export interface RuntimeProbe {
 /**
  * Verifies the installed Claude Code and tmux support what the launcher needs, and which permission
  * mode the launch will use (auto falls back to acceptEdits when this Claude Code lacks it; not an error).
+ * The strict mode (host runtime, legacy "default") maps to `manual` where only that is listed and is an
+ * INCOMPATIBLE_RUNTIME error when neither name is listed.
  */
 export async function probeRuntime(cfg?: Pick<MinionsConfig, 'models' | 'permissionMode' | 'coordinator'>, opts: { runner?: Runner } = {}): Promise<RuntimeProbe> {
   const exec = opts.runner ?? run;
@@ -1341,7 +1592,7 @@ export async function probeRuntime(cfg?: Pick<MinionsConfig, 'models' | 'permiss
     throw new MinionsError('INCOMPATIBLE_RUNTIME', `tmux is not available ${onHost ? 'on the host' : 'in the container'}.`, onHost ? 'Install it: `brew install tmux`.' : 'Rebuild the minions image.');
   }
   const permissionModes = parsePermissionModes(text);
-  const permission = decidePermissionMode(cfg ?? {}, { hostRuntime: onHost, modes: permissionModes });
+  const permission = decidePermissionMode(cfg ?? {}, { modes: permissionModes });
   return { claudeVersion: ver.stdout.trim(), tmuxVersion: tmux.stdout.trim(), permissionModes, permission };
 }
 

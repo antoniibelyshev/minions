@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -10,6 +10,8 @@ import { RuntimeDb } from '../../src/runtime/db.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
 import { workspaceLayout, type WorkspaceLayout } from '../../src/runtime/worktree.js';
 import { defaults } from '../helpers.js';
+import { fromTemplate } from '../repo-template.js';
+import { fakeGitActive, fakeGitSync, fakeInitRepo } from './fake-git.js';
 
 Object.assign(process.env, {
   GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 'test@example.com',
@@ -19,15 +21,20 @@ Object.assign(process.env, {
 
 export const tmp = (prefix = 'minions-rt-') => mkdtempSync(join(tmpdir(), prefix));
 
-export const gitSync = (cwd: string, ...args: string[]) =>
+/** git in `cwd`; on the in-memory fake when the test file installed it (./fake-git.ts). */
+export const gitSync = (cwd: string, ...args: string[]) => fakeGitActive() ? fakeGitSync(cwd, ...args) :
   execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
+/** A repository with one commit (README.md) on `branch`; returns its SHA. Copied from a per-file template (task-104). */
 export function initRepo(dir: string, branch = 'main'): string {
-  execFileSync('git', ['init', '-q', '-b', branch, dir]);
-  writeFileSync(join(dir, 'README.md'), '# test\n');
-  gitSync(dir, 'add', '.');
-  gitSync(dir, 'commit', '-q', '-m', 'init');
-  return gitSync(dir, 'rev-parse', 'HEAD');
+  if (fakeGitActive()) return fakeInitRepo(dir, branch);
+  return fromTemplate(`runtime-init:${branch}`, dir, (d) => {
+    execFileSync('git', ['init', '-q', '-b', branch, d]);
+    writeFileSync(join(d, 'README.md'), '# test\n');
+    gitSync(d, 'add', '.');
+    gitSync(d, 'commit', '-q', '-m', 'init');
+    return gitSync(d, 'rev-parse', 'HEAD');
+  });
 }
 
 export function commitFile(dir: string, file: string, content: string, msg = `edit ${file}`): string {
@@ -50,7 +57,7 @@ export class FakeBacklog implements BacklogAdapter {
       locator: `backlogmd:${partial.id}`, title: `Task ${partial.id}`, description: 'Do the thing.',
       acceptanceCriteria: [{ text: 'works', done: false }], status: 'ready', priority: 'medium',
       dependencies: [], parent: null, externalLinks: [], labels: [], authorized: true, branch: null,
-      commits: [], prUrl: null, provenance: 'user-decision', version: '', ...partial,
+      commits: [], provenance: 'user-decision', version: '', ...partial,
     };
     this.tasks.set(t.id, this.bump(t));
     return structuredClone(t);
@@ -69,10 +76,11 @@ export class FakeBacklog implements BacklogAdapter {
   }
   async getTask(id: string) { return structuredClone(this.must(id)); }
   async createTask(input: CreateTaskInput) {
-    const t = this.add({ id: `task-${this.tasks.size + 1}`, title: input.title, status: input.status ?? 'idea', ...(input.workflow ? { workflow: input.workflow } : {}) });
+    const t = this.add({ id: `task-${this.tasks.size + 1}`, title: input.title, status: input.status ?? 'idea', ...(input.workflow ? { workflow: input.workflow } : {}),
+      ...(input.labels ? { labels: input.labels } : {}), ...(input.description ? { description: input.description } : {}) });
     return { task: t, created: true };
   }
-  async updateTask(id: string, expectedVersion: string, patch: Partial<Pick<Task, 'status' | 'title' | 'description' | 'priority' | 'labels' | 'branch' | 'prUrl'>> & { workflow?: string | null }) {
+  async updateTask(id: string, expectedVersion: string, patch: Partial<Pick<Task, 'status' | 'title' | 'description' | 'priority' | 'labels' | 'branch'>> & { workflow?: string | null }) {
     const t = this.must(id);
     if (t.version !== expectedVersion) throw new MinionsError('CONFLICT', `version mismatch for ${id}`);
     const { workflow, ...rest } = patch;
@@ -89,22 +97,35 @@ export class FakeBacklog implements BacklogAdapter {
 
 export interface Env { root: string; layout: WorkspaceLayout; db: RuntimeDb; backlog: FakeBacklog; config: MinionsConfig; sched: Scheduler; baseSha: string }
 
+/** A default workflow with a tester stage (a custom flow), which the pipeline tests exercise. */
+export const TESTER_FLOW = ['engineer', 'tester', 'reviewer'];
+
 /**
- * Runtime env on the project-owner defaults, except `verification.testerRequired: true` so the existing
- * pipeline tests keep exercising the full engineer → tester → reviewer flow (the opt-in old behaviour).
- * Use makeDefaultEnv for the profile's real default (risk-based testing, testerRequired false).
+ * Runtime env on the project-owner defaults, except a `workflows.default` with a tester stage (TESTER_FLOW) so the
+ * pipeline tests keep exercising engineer → tester → reviewer. Use makeDefaultEnv for the real default (engineer →
+ * reviewer).
  */
 export function makeEnv(mutate?: (c: MinionsConfig) => void): Env {
-  return makeDefaultEnv((c) => { c.verification.testerRequired = true; mutate?.(c); });
+  return makeDefaultEnv((c) => { c.workflows = { ...c.workflows, default: [...TESTER_FLOW] }; mutate?.(c); });
 }
 
-export function makeDefaultEnv(mutate?: (c: MinionsConfig) => void): Env {
+/**
+ * A runtime env with no git repository (the unit tier, task-137.2.2): the DB, fake backlog, config and
+ * scheduler for code that never reaches the workspace git (sync over a fake gh, gates over recorded rows).
+ * baseSha is a placeholder.
+ */
+export function makeDbEnv(mutate?: (c: MinionsConfig) => void): Env {
+  return makeDefaultEnv((c) => { c.workflows = { ...c.workflows, default: [...TESTER_FLOW] }; mutate?.(c); }, { git: false });
+}
+
+export function makeDefaultEnv(mutate?: (c: MinionsConfig) => void, o: { git?: boolean } = {}): Env {
   const root = tmp();
   const layout = workspaceLayout(join(root, 'workspace'));
-  const baseSha = initRepo(layout.repo);
+  const baseSha = o.git === false ? '0'.repeat(40) : initRepo(layout.repo);
   const db = new RuntimeDb(join(root, 'state', 'minions.db'));
   const backlog = new FakeBacklog();
-  const config = defaults('project-owner');
+  const config = defaults('independent');
+  config.execution.maxActiveTasks = 2; // the scheduler scenarios are sized for two task slots
   mutate?.(config);
   const sched = new Scheduler({ db, backlog, config, layout, handoff: { briefs: join(root, 'state', 'briefs'), results: join(root, 'state', 'results') } });
   return { root, layout, db, backlog, config, sched, baseSha };
@@ -130,4 +151,46 @@ export function approvalKeys() {
     ...pair, publicKeyFile,
     sign: (taskId: string, head: string, o: { by?: string; now?: Date; ttlMs?: number } = {}) => signApproval(pair.privateKeyPem, { taskId, head, ...o }).token,
   };
+}
+
+/**
+ * The server side of the verified origin reads (task-71): `gh api ... /repos/<o>/<r>/branches/<b>` answered
+ * from a local bare repository that stands in for GitHub (git reaches it through the `serverUrl` seam,
+ * `() => bare`). Returns null for any other gh call, so a test's fake gh can delegate to it first.
+ */
+export function ghBranchApi(bare: string, args: string[]): { code: number; stdout: string; stderr: string } | null {
+  if (args[0] !== 'api') return null;
+  const path = args.find((a) => a.startsWith('/repos/')) ?? '';
+  const m = /^\/repos\/[^/]+\/[^/]+\/branches\/(.+)$/.exec(path);
+  if (!m) return null;
+  const branch = m[1]!.split('/').map(decodeURIComponent).join('/');
+  try {
+    const sha = execFileSync('git', ['-C', bare, 'rev-parse', '--verify', '--quiet', `refs/heads/${branch}`], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+    return { code: 0, stdout: JSON.stringify({ name: branch, commit: { sha } }), stderr: '' };
+  } catch {
+    return { code: 1, stdout: '', stderr: 'gh: Branch not found (HTTP 404)' };
+  }
+}
+
+/** The fixed base SHA of a unit env (makeUnitEnv): no repository exists to have a real one. */
+export const UNIT_BASE_SHA = 'b'.repeat(40);
+
+/**
+ * makeEnv / makeDefaultEnv for the unit tier (task-137.2.5): the same runtime env, but `layout.repo` is a plain
+ * directory, not a git repository, and `baseSha` is UNIT_BASE_SHA. For tests whose code path never reads git.
+ */
+export function makeUnitEnv(mutate?: (c: MinionsConfig) => void): Env {
+  return makeUnitDefaultEnv((c) => { c.workflows = { ...c.workflows, default: [...TESTER_FLOW] }; mutate?.(c); });
+}
+
+export function makeUnitDefaultEnv(mutate?: (c: MinionsConfig) => void): Env {
+  const root = tmp();
+  const layout = workspaceLayout(join(root, 'workspace'));
+  mkdirSync(layout.repo, { recursive: true });
+  const db = new RuntimeDb(join(root, 'state', 'minions.db'));
+  const backlog = new FakeBacklog();
+  const config = defaults('independent');
+  mutate?.(config);
+  const sched = new Scheduler({ db, backlog, config, layout, handoff: { briefs: join(root, 'state', 'briefs'), results: join(root, 'state', 'results') } });
+  return { root, layout, db, backlog, config, sched, baseSha: UNIT_BASE_SHA };
 }

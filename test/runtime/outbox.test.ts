@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { RuntimeDb } from '../../src/runtime/db.js';
 import {
-  ack, BACKOFF_BASE_MS, BACKOFF_MAX_MS, backoffMs, counts, enqueue, fail, flush, MAX_TEXT_LENGTH, pending, redactError,
+  ack, BACKOFF_BASE_MS, BACKOFF_MAX_MS, backoffMs, counts, enqueue, fail, flush, formatCounts, MAX_TEXT_LENGTH, pending, redactError,
   type NotificationTransport, type OutboxItem,
 } from '../../src/runtime/outbox.js';
 import { collectStatus } from '../../src/runtime/commands.js';
@@ -59,7 +59,7 @@ describe('notification outbox', () => {
     // The coordinator re-records the same events while the channel is down: dedup keeps one row each.
     expect(enqueue(db, { key: 'goal-ack:101', kind: 'goal-ack', text: 'Got it: dark mode. Planning now.' }, c.now).created).toBe(false);
     expect(enqueue(db, { key: 'delivered:task-7:abc123', kind: 'delivered', text: 'again' }, c.now).created).toBe(false);
-    expect(counts(db, c.now)).toMatchObject({ pending: 3, waiting: 1, due: 2, delivered: 0 });
+    expect(counts(db, c.now)).toMatchObject({ pending: 3, waiting: 1, held: 0, retrying: 1, due: 2, delivered: 0 });
 
     // A later wake during the outage: the backed-off item waits, the others are tried and fail again.
     const r2 = await flush(db, transport, {}, c.now);
@@ -88,6 +88,29 @@ describe('notification outbox', () => {
     await flush(db, transport, {}, c.now);
     expect(transport.delivered.map((i) => i.key)).toEqual(['goal-ack:101', 'delivered:task-7:abc123', 'blocker:task-8:1']);
     expect(counts(db, c.now)).toMatchObject({ pending: 0, delivered: 3 });
+    db.close();
+  });
+
+  it('counts and status split rows held for the digest from failed sends waiting to retry', () => {
+    const db = new RuntimeDb(dbPath());
+    const c = clock();
+    const later = new Date(c.now().getTime() + 3_600_000).toISOString();
+    enqueue(db, { key: 'held:1', kind: 'delivered', text: 'held one', holdUntil: later }, c.now);
+    enqueue(db, { key: 'held:2', kind: 'delivered', text: 'held two', holdUntil: later }, c.now);
+    enqueue(db, { key: 'retry:1', kind: 'blocker', text: 'failed one' }, c.now);
+    fail(db, 'retry:1', 'network down', c.now);
+    enqueue(db, { key: 'due:1', kind: 'blocker', text: 'due one' }, c.now);
+    const n = counts(db, c.now);
+    expect(n).toMatchObject({ pending: 4, due: 1, waiting: 3, held: 2, retrying: 1 });
+    expect(formatCounts(n)).toBe(`notifications: 4 pending (2 held for digest, 1 waiting to retry), oldest ${n.oldestPendingAt}`);
+    // Only digest holds: no "waiting to retry".
+    expect(formatCounts({ ...n, waiting: 2, retrying: 0 })).toMatch(/\(2 held for digest\),/);
+    // An older status JSON without the split keeps its old wording.
+    const { held: _h, retrying: _r, ...old } = n;
+    expect(formatCounts(old as typeof n)).toMatch(/\(3 waiting to retry\)/);
+    // The hold (and the backoff) end: all due, nothing held.
+    c.advance(3_600_001);
+    expect(counts(db, c.now)).toMatchObject({ held: 0, waiting: 0, due: 4 }); // the retry's backoff ended too
     db.close();
   });
 
@@ -147,7 +170,7 @@ describe('notification outbox', () => {
   it('minions status reports pending notifications so nothing is lost if the channel never returns', async () => {
     const db = new RuntimeDb(dbPath());
     enqueue(db, { key: 'blocker:task-1:1', kind: 'blocker', taskId: 'task-1', text: 'blocked' });
-    const s = await collectStatus({ db, config: defaults('project-owner'), backlog: async () => { throw new Error('no backlog'); } });
+    const s = await collectStatus({ db, config: defaults('independent'), backlog: async () => { throw new Error('no backlog'); } });
     expect(s.notifications).toMatchObject({ pending: 1, delivered: 0 });
   });
 });

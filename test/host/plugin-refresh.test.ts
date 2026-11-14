@@ -4,10 +4,11 @@
 // Templates are switched with MINIONS_TEMPLATES to stand for an old and a new installed package.
 import { appendFileSync, cpSync, existsSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import { projectPaths } from '../../src/core/paths.js';
 import { pluginDoctorCheck } from '../../src/host/doctor.js';
-import { checkPlugin, pluginMismatch, refreshDerived, runInit } from '../../src/host/install.js';
+import { checkPlugin, goalsSourcePath, pluginMismatch, refreshDerived, runInit } from '../../src/host/install.js';
 import { loadEffectiveConfig, loadProjectJson } from '../../src/host/project.js';
 import { dockerUp, makeRepo, tempDir, withHome } from './fixtures.js';
 
@@ -45,7 +46,7 @@ afterEach(() => {
 async function initOld() {
   process.env.MINIONS_TEMPLATES = oldPkg;
   const repo = makeRepo(home.root);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+  const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
   const project = await loadProjectJson(r.plan.projectId);
   const config = (await loadEffectiveConfig(project)).config;
   return { project, config, dir: projectPaths(project.projectId).pluginDir };
@@ -130,5 +131,28 @@ describe('plugin refresh from the installed package', () => {
 
   it('the doctor check reports a comparison failure as a warning, not a crash', () => {
     expect(pluginDoctorCheck(new Error('Plugin templates not found at /x'))).toMatchObject({ name: 'plugin', status: 'warn', detail: expect.stringContaining('could not compare') });
+  });
+});
+
+describe('the goals file (docs/design/autonomy.md Decision 16)', () => {
+  it('next to the project config; refreshDerived copies it into the runtime config dir, follows edits and removes the copy with it', async () => {
+    const { project, config } = await initOld();
+    const pp = projectPaths(project.projectId);
+    const src = goalsSourcePath(project);
+    const copy = join(pp.runtimeDir, 'goals.md');
+    expect(src).toBe(join(pp.dir, 'goals.md')); // private install: the project dir
+    expect(goalsSourcePath({ ...project, visibility: 'shared' })).toBe(join(project.repoPath, '.minions', 'goals.md'));
+    expect(existsSync(copy)).toBe(false);
+    writeFileSync(src, '## Win more games\nMeasure: 55%\n');
+    expect(await refreshDerived(project, config)).toEqual([]);
+    expect(readFileSync(copy, 'utf8')).toBe('## Win more games\nMeasure: 55%\n');
+    writeFileSync(src, '## Win more games\nStatus: done\n');
+    expect(await refreshDerived(project, config)).toEqual([]);
+    expect(readFileSync(copy, 'utf8')).toContain('Status: done');
+    rmSync(src);
+    expect(await refreshDerived(project, config)).toEqual([]);
+    expect(existsSync(copy)).toBe(false);
+    const manifest = JSON.parse(readFileSync(pp.manifestJson, 'utf8')) as { files: { path: string }[] };
+    expect(manifest.files.map((f) => f.path)).not.toContain(copy);
   });
 });

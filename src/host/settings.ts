@@ -12,8 +12,7 @@
 // - `recreate` settings are compose, image or mount settings: `minions upgrade` applies them (container recreated;
 //   its files step copies the container limits into project.json, which compose is generated from).
 // Each setting also carries its class (live / restart / recreate) and hostOwned flag, consistent with the schema
-// classification (src/config/setting-classes.ts); a change request from the runtime (src/runtime/change-requests.ts)
-// for a hostOwned key is refused when recorded and again by the host (src/host/change-requests.ts).
+// classification (src/config/setting-classes.ts).
 // Writes go to the host-only config.local.json by default; the shared .minions/config.json (a sensitive,
 // committed path) only with an explicit `shared` choice on a shared install. Values are validated with the
 // full config schema (resolveEffective) before anything is written. Secrets are never read or shown: token
@@ -28,7 +27,7 @@ import { COORDINATOR_DISALLOWED_TOOLS } from '../config/coordinator-tools.js';
 import type { Source } from '../config/resolve.js';
 import { HARNESS_IDS, HARNESSES, isHarnessId, isProcessHarness } from '../config/harnesses.js';
 import { COORDINATOR_ROLE, ROLE_NAME_PATTERN, workerRole, workerRoleNames } from '../config/roles.js';
-import { EFFORTS, type CapabilityRule, type MinionsConfig } from '../config/schema.js';
+import { COORDINATOR_PERMISSION_MODES, EFFORTS, type CapabilityRule, type MinionsConfig } from '../config/schema.js';
 import { classifyKey, type SettingClass } from '../config/setting-classes.js';
 import { MinionsError } from '../core/errors.js';
 import { usdPerMTok } from '../runtime/spend.js';
@@ -37,6 +36,7 @@ import { projectPaths } from '../core/paths.js';
 import { editProjectConfig, revisionConflict } from './config-write.js';
 import { loadCredentialRefs, type CredentialsJson } from './credentials.js';
 import { refreshDerived } from './install.js';
+import { mergeOverlay } from './control-overlay.js';
 import { loadEffectiveConfig, projectConfigPath, resolveEffective, type ProjectJson } from './project.js';
 
 export const SETTING_GROUPS = ['Delivery', 'Verification', 'Reporting', 'Models', 'Concurrency', 'Policy', 'Permissions', 'Integrations', 'Pause', 'Agents', 'Container'] as const;
@@ -54,7 +54,7 @@ export const applyClass = (apply: SettingApply): Exclude<SettingClass, 'fixed'> 
 export type TakesEffect = 'now' | 'restart' | 'upgrade';
 export const takesEffectOf = (cls: SettingClass): TakesEffect | null =>
   cls === 'live' ? 'now' : cls === 'restart' ? 'restart' : cls === 'recreate' ? 'upgrade' : null;
-export type SettingType = 'enum' | 'int' | 'number' | 'bool' | 'model' | 'models' | 'list' | 'secret' | 'control';
+export type SettingType = 'enum' | 'int' | 'number' | 'bool' | 'model' | 'models' | 'list' | 'text' | 'secret' | 'control';
 export type SettingLayer = 'local' | 'shared';
 
 type Value = unknown;
@@ -69,6 +69,10 @@ export interface SettingDef {
   min?: number;
   /** May be unset (value `default` removes it from the layer). */
   optional?: boolean;
+  /** `off` sets null (a cap that is off, overriding a lower layer); the value shows as `off` when null or unset. */
+  nullable?: boolean;
+  /** List entries are separated by this (default ','); shell commands use ';' since they may contain commas. */
+  separator?: ';';
   apply: SettingApply;
   /** How a change takes effect (from apply; the guard test checks it against the schema classification). */
   class: SettingClass;
@@ -86,6 +90,13 @@ const RESTART_WHY: Record<SettingApply, string> = {
 };
 
 const more = (what: string) => (from: Value, to: Value) => (typeof from === 'number' && typeof to === 'number' && to > from ? `${what} (${from} -> ${to})` : null);
+/** A spend cap raised or turned off (a value of `off` or unset is no cap). */
+const looserCap = (what: string) => (from: Value, to: Value) => {
+  const cap = (v: Value) => (typeof v === 'number' ? v : null);
+  const f = cap(from); const t = cap(to);
+  if (f === null) return null;
+  return t === null ? `${what} is turned off (was ${f}): no stop at that spend` : t > f ? `${what} is raised (${f} -> ${t}; higher spend)` : null;
+};
 const turnsOff = (what: string) => (from: Value, to: Value) => (from === true && to === false ? what : null);
 const turnsOn = (what: string) => (from: Value, to: Value) => (from !== true && to === true ? what : null);
 const price = (m: Value) => (typeof m === 'string' ? usdPerMTok(m) : null);
@@ -130,25 +141,28 @@ const withClass = (d: DeclaredSetting): SettingDef =>
 
 const DECLARED: readonly DeclaredSetting[] = [
   // ---- Delivery
-  { key: 'delivery.mode', group: 'Delivery', label: 'Delivery mode', type: 'enum', choices: ['local', 'branch', 'pull-request'], apply: 'prompt',
-    description: 'local: commits stay in the runtime; branch: push agent/<slug>; pull-request: push and open a PR',
-    loosens: (f, t) => (f === 'local' && t !== 'local' ? `agents push agent/<slug> branches to GitHub${t === 'pull-request' ? ' and open pull requests' : ''}` : f === 'branch' && t === 'pull-request' ? 'agents open pull requests on GitHub' : null) },
-  { key: 'delivery.merge', group: 'Delivery', label: 'Merge mode', type: 'enum', choices: ['disabled', 'manual', 'auto-when-eligible'], apply: 'prompt',
-    description: 'whether minions merges pull requests: never, on request, or automatically when CI and approvals pass',
-    loosens: (f, t) => (t === 'auto-when-eligible' ? 'pull requests that pass every gate are merged on GitHub without asking' : f === 'disabled' && t === 'manual' ? 'minions may merge pull requests on GitHub when asked' : null) },
-  { key: 'delivery.requiredChecksConfigured', group: 'Delivery', label: 'Required checks configured', type: 'bool', apply: 'live',
-    description: 'true records that required status checks on the base branch gate merging (auto-merge needs it; minions doctor reports ci.requiredChecks)',
-    loosens: turnsOn('auto-merge may arm for pull requests once their required checks pass (with delivery.merge auto-when-eligible)') },
+  { key: 'delivery.merge', group: 'Delivery', label: 'Merge mode', type: 'enum', choices: ['disabled', 'auto-when-eligible'], apply: 'prompt',
+    description: 'whether the runtime merges approved work: never (the coordinator or you merge), or automatically: the local integrator merges the approved head into the base after its own verification (base.merge policy)',
+    loosens: (_f, t) => (t === 'auto-when-eligible' ? 'approved branches that pass verification are merged into the base without asking' : null) },
   // ---- Verification
-  { key: 'verification.testerRequired', group: 'Verification', label: 'Tester on every task', type: 'bool', apply: 'prompt',
-    description: 'true: every task gets a tester stage; false: only tasks that need QA (labels, sensitive paths, reviewer request)',
-    loosens: turnsOff('tasks without a QA need are delivered without a tester stage') },
+  // Shell commands may contain commas: entries are separated with ';' (task-136: the runtime can request them).
+  { key: 'verification.commands', group: 'Verification', label: 'Verification commands', type: 'list', separator: ';', apply: 'live',
+    description: 'the fast tier (unit tests, typecheck, lint): run on every engineer head before review and on the merged tree before it lands; \';\'-separated',
+    loosens: (f, t) => {
+      const to = Array.isArray(t) ? (t as string[]) : [];
+      const dropped = (Array.isArray(f) ? (f as string[]) : []).filter((c) => !to.includes(c));
+      return dropped.length ? `changes are verified without ${dropped.map((c) => `\`${c}\``).join(', ')}` : null;
+    } },
+  { key: 'verification.setupCommands', group: 'Verification', label: 'Integration setup commands', type: 'list', separator: ';', optional: true, apply: 'live',
+    description: 'dependency install before verifying, e.g. npm ci; \';\'-separated',
+    loosens: (f, t) => {
+      const from = Array.isArray(f) ? (f as string[]) : [];
+      const added = (Array.isArray(t) ? (t as string[]) : []).filter((c) => !from.includes(c));
+      return added.length ? `the runtime runs ${added.map((c) => `\`${c}\``).join(', ')} in its verification worktrees` : null;
+    } },
   { key: 'verification.reviewerRequired', group: 'Verification', label: 'Reviewer required', type: 'bool', apply: 'prompt',
     description: 'whether every task needs an independent reviewer approval before delivery',
     loosens: turnsOff('tasks can be delivered without a reviewer approval') },
-  { key: 'verification.ciAuthority', group: 'Verification', label: 'CI authority', type: 'enum', choices: ['none', 'github'], apply: 'prompt',
-    description: 'github: passing required CI checks may replace the full local verification; none: local only',
-    loosens: (f, t) => (f === 'none' && t === 'github' ? 'testers and reviewers may rely on passing GitHub CI instead of re-running verification locally' : null) },
   // ---- Reporting
   { key: 'communication.progress', group: 'Reporting', label: 'Progress reports', type: 'enum', choices: ['milestones', 'tasks', 'quiet'], apply: 'prompt',
     description: 'what the coordinator reports unprompted: feature milestones, every task, or only blockers' },
@@ -194,11 +208,77 @@ const DECLARED: readonly DeclaredSetting[] = [
   { key: 'architecture', group: 'Policy', label: 'Architecture decisions', type: 'enum', choices: ['decide', 'propose'], apply: 'prompt',
     description: 'decide: agents make and record architecture decisions within a task; propose: they ask first',
     loosens: (f, t) => (f === 'propose' && t === 'decide' ? 'agents make architecture decisions without asking' : null) },
-  { key: 'coordinator.permissionMode', group: 'Policy', label: 'Coordinator permission mode', type: 'enum', choices: ['auto', 'acceptEdits'], optional: true, apply: 'launch',
-    description: 'auto: a classifier may approve actions outside the allow list; acceptEdits: prompt for every other Bash call',
-    loosens: (f, t) => ((f === 'acceptEdits') && (t === 'auto' || t === undefined) ? 'a classifier may approve coordinator actions outside the allow list without prompting' : null) },
+  { key: 'coordinator.permissionMode', group: 'Policy', label: 'Coordinator permission mode', type: 'enum', choices: [...COORDINATOR_PERMISSION_MODES], optional: true, apply: 'launch',
+    description: 'auto: a classifier may approve actions outside the allow list; acceptEdits: prompt for every other Bash call; bypassPermissions: never prompt (fully unattended, local config only)',
+    loosens: (f, t) => {
+      const rank = (m: unknown) => (m === 'bypassPermissions' ? 2 : m === 'acceptEdits' ? 0 : 1);
+      if (rank(t) <= rank(f)) return null;
+      return t === 'bypassPermissions' ? 'the coordinator and its workers run every tool call without asking (only the deny rules and, in the host runtime, the sandbox remain)'
+        : 'a classifier may approve coordinator actions outside the allow list without prompting';
+    } },
+  { key: 'coordinator.sandbox', group: 'Policy', label: 'Host runtime sandbox', type: 'bool', optional: true, apply: 'launch',
+    description: 'host runtime: Bash runs in the Claude Code sandbox (writes limited to the workspace and state, network to npm); false: unsandboxed, as your user (local config only)',
+    loosens: (f, t) => (f !== false && t === false ? 'agent commands run on your host without the sandbox, with your full user access' : null) },
+  { key: 'coordinator.sshHosts', group: 'Policy', label: 'SSH hosts', type: 'list', optional: true, apply: 'launch',
+    description: 'host runtime: user@host targets that ssh, scp and rsync may reach from agent commands, outside the sandbox with your SSH keys (local config only)',
+    loosens: (f, t) => {
+      const added = (Array.isArray(t) ? t : []).filter((h) => !(Array.isArray(f) ? f : []).includes(h));
+      return added.length ? `agent commands may run anything on ${added.join(', ')} over SSH, and scp/rsync from there write outside the sandbox` : null;
+    } },
+  { key: 'coordinator.allowedDomains', group: 'Policy', label: 'Sandbox network hosts', type: 'list', optional: true, apply: 'launch',
+    description: 'host runtime: hosts sandboxed agent commands may reach besides the npm registry, e.g. crates.io, static.crates.io, index.crates.io, pypi.org, files.pythonhosted.org, github.com (local config only)',
+    loosens: (f, t) => {
+      const added = (Array.isArray(t) ? t : []).filter((d) => !(Array.isArray(f) ? f : []).includes(d));
+      return added.length ? `sandboxed agent commands may reach ${added.join(', ')}` : null;
+    } },
+  { key: 'coordinator.unsandboxedCommands', group: 'Policy', label: 'Unsandboxed commands', type: 'list', separator: ';', optional: true, apply: 'launch',
+    description: 'host runtime: command patterns (e.g. "uv run python -m train *") that agent commands run outside the sandbox, as your user, e.g. for the GPU (the sandbox blocks Metal/MPS) (local config only)',
+    loosens: (f, t) => {
+      const added = (Array.isArray(t) ? t : []).filter((c) => !(Array.isArray(f) ? f : []).includes(c));
+      return added.length ? `agent commands matching ${added.map((c) => `"${c}"`).join(', ')} run on your host without the sandbox, with your full user access` : null;
+    } },
   { key: 'coordinator.contextReset.enabled', group: 'Policy', label: 'Routine context resets', type: 'bool', apply: 'live',
     description: 'the coordinator hands off and restarts with a fresh context when idle' },
+  { key: 'coordinator.sessions.enabled', group: 'Policy', label: 'Coordinator sessions', type: 'bool', optional: true, apply: 'launch',
+    description: 'a router holds Telegram and hands messages to separate headless sessions (one per thread, one per task)',
+    loosens: turnsOn('the runtime starts headless coordinator sessions on its own (model spend)') },
+  { key: 'routine.enabled', group: 'Policy', label: 'Unattended routine', type: 'bool', apply: 'live',
+    description: 'a routine pass every few minutes syncs, merges and wakes the coordinator (a fresh session) only when a model is needed',
+    loosens: turnsOn('the runtime starts coordinator sessions on its own (wakes for runnable work, crash starts): model spend without you') },
+  { key: 'routine.tickMinutes', group: 'Policy', label: 'Routine interval (minutes)', type: 'int', min: 1, optional: true, apply: 'live',
+    description: 'minutes between routine passes (default 15)' },
+  { key: 'routine.minWakeGapMinutes', group: 'Policy', label: 'Minimum minutes between wakes', type: 'int', min: 1, optional: true, apply: 'live',
+    description: 'the routine wakes the coordinator at most once per this many minutes (default 30)',
+    loosens: (f, t) => ((typeof t === 'number' ? t : 30) < (typeof f === 'number' ? f : 30) ? `the coordinator may be woken more often (every ${String(t)} min; higher spend)` : null) },
+  { key: 'routine.maxWakesPerDay', group: 'Policy', label: 'Coordinator wakes per day', type: 'int', min: 0, optional: true, apply: 'live',
+    description: 'routine wakes of the coordinator per day in routine.timezone (default 8; the digest wake always counts)',
+    loosens: (f, t) => ((typeof t === 'number' ? t : 8) > (typeof f === 'number' ? f : 8) ? `more coordinator wakes per day (${typeof f === 'number' ? f : 8} -> ${String(t)}; higher spend)` : null) },
+  { key: 'routine.digestAt', group: 'Policy', label: 'Digest times', type: 'list', optional: true, apply: 'live',
+    description: 'local times (HH:MM, comma-separated, in routine.timezone) of the owner digest that batches held updates and questions (default 08:00)',
+    loosens: (f, t) => (Array.isArray(t) && t.length > (Array.isArray(f) ? f.length : 1) ? `more digests a day (${t.length}: one coordinator wake each)` : null) },
+  { key: 'routine.timezone', group: 'Policy', label: 'Routine time zone', type: 'text', optional: true, apply: 'live',
+    description: 'IANA time zone of the digest times and the routine\'s days (default Europe/Berlin)' },
+  // Spend caps (docs/design/autonomy.md Decisions 13 and 15): only the owner changes them (here or /budget in Telegram).
+  { key: 'budgets.dailyTokens', group: 'Policy', label: 'Daily token cap', type: 'int', min: 1, optional: true, nullable: true, apply: 'live',
+    description: 'tokens of the coordinator and workers per day (from midnight in routine.timezone); at the cap no new stage starts. Enforced on any billing; off = no cap',
+    loosens: looserCap('the daily token cap') },
+  { key: 'budgets.taskTokens', group: 'Policy', label: 'Per-task token cap', type: 'int', min: 1, optional: true, nullable: true, apply: 'live',
+    description: "tokens of one task's workers (all attempts); at the cap its next stage waits and the coordinator decides. Enforced on any billing; off = no cap",
+    loosens: looserCap('the per-task token cap') },
+  { key: 'budgets.dailyUsd', group: 'Policy', label: 'Daily USD cap', type: 'number', nullable: true, apply: 'live',
+    description: 'estimated USD of the coordinator and workers per day (from midnight in routine.timezone); enforced with API-key billing only; off = no cap',
+    loosens: looserCap('the daily USD cap') },
+  { key: 'budgets.taskUsd', group: 'Policy', label: 'Per-task USD cap', type: 'number', nullable: true, apply: 'live',
+    description: "estimated USD of one task's workers; enforced with API-key billing only; off = no cap",
+    loosens: looserCap('the per-task USD cap') },
+  { key: 'routine.planWhenIdle', group: 'Policy', label: 'Plan toward goals when idle', type: 'bool', optional: true, apply: 'live',
+    description: 'with the queue empty and an open goal in goals.md (next to the project config), wake the coordinator to plan the next tasks (default: on in independent mode, off in supervised)',
+    loosens: turnsOn('the runtime wakes the coordinator to plan and start new work toward the goals on its own: model spend without you') },
+  { key: 'routine.maxPlanWakesPerDay', group: 'Policy', label: 'Planning wakes per day', type: 'int', min: 0, optional: true, apply: 'live',
+    description: 'planning wakes per day in routine.timezone (default 4; each also counts as a wake)',
+    loosens: (f, t) => ((typeof t === 'number' ? t : 4) > (typeof f === 'number' ? f : 4) ? `more planning wakes per day (${typeof f === 'number' ? f : 4} -> ${String(t)}; higher spend)` : null) },
+  { key: 'routine.minPlanGapMinutes', group: 'Policy', label: 'Minimum minutes between planning wakes', type: 'int', min: 1, optional: true, apply: 'live',
+    description: 'the routine wakes the coordinator to plan at most once per this many minutes (default 120)' },
   { key: 'coordinator.disallowedTools', group: 'Policy', label: 'Coordinator tool trim', type: 'list', optional: true, apply: 'launch',
     description: 'Claude Code tools removed from the coordinator session (default: the built-in trim; none: keep every tool; tools it needs cannot be listed)',
     loosens: (f, t) => {
@@ -217,8 +297,6 @@ const DECLARED: readonly DeclaredSetting[] = [
     loosens: (f, t) => (capRank(t) < capRank(f) ? `${cap} becomes "${String(t)}" (was ${JSON.stringify(f)}): ${t === 'allow' ? 'agents may do it without asking' : 'agents may do it with your approval'}` : null),
   })),
   // ---- Integrations (never shows a secret)
-  { key: 'secrets.github', group: 'Integrations', label: 'GitHub token', type: 'secret', apply: 'live', hostOwned: true,
-    description: 'GitHub token for branch/PR delivery (`minions auth github`)' },
   { key: 'secrets.telegram', group: 'Integrations', label: 'Telegram bot token', type: 'secret', apply: 'launch', hostOwned: true,
     description: 'Telegram bot token for the Telegram channel (`minions auth telegram`)' },
   // ---- Pause (runtime controls)
@@ -242,6 +320,10 @@ const DECLARED: readonly DeclaredSetting[] = [
     description: 'maximum number of processes in the project container (compose pids_limit)' },
   { key: 'container.tmpSizeMiB', group: 'Container', label: 'Container /tmp size (MiB)', type: 'int', min: 64, optional: true, apply: 'recreate',
     description: 'size cap of the /tmp tmpfs (RAM, counted against the memory limit; default 1024)' },
+  { key: 'container.gpus', group: 'Container', label: 'Container GPUs', type: 'enum', choices: ['auto', 'nvidia', 'none'], optional: true, apply: 'recreate',
+    description: 'GPUs in the project container: auto = NVIDIA GPUs when the host has the NVIDIA container toolkit (Linux); Docker on macOS cannot pass Metal (MPS) through' },
+  { key: 'container.aptPackages', group: 'Container', label: 'Extra Debian packages', type: 'list', optional: true, apply: 'recreate',
+    description: 'Debian packages added to the runtime image (Docker runtime; `minions upgrade`, or `minions start` of a stopped container, builds the derived image). The coordinator\'s `minions control set container.aptPackages` takes precedence' },
 ];
 
 export const SETTINGS: readonly SettingDef[] = DECLARED.map(withClass);
@@ -275,13 +357,55 @@ export const settingDef = (key: string): SettingDef | undefined => {
 
 export function requireSetting(key: string): SettingDef {
   const d = settingDef(key);
-  if (!d) throw new MinionsError('INVALID_CONFIG', `Unknown setting: ${key}`, 'Run `minions settings --list` for the settings that can be changed.', { path: key });
+  if (!d) {
+    const suggestions = closestSettingKeys(key);
+    throw new MinionsError('INVALID_CONFIG', `Unknown setting: ${key}${suggestions.length ? `. Did you mean: ${suggestions.join(', ')}?` : ''}`,
+      'Run `minions settings --list` for the settings that can be changed.', { path: key, suggestions });
+  }
   return d;
+}
+
+/** Levenshtein distance (small strings: setting keys). */
+function editDistance(a: string, b: string): number {
+  let prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    const cur = [i];
+    for (let j = 1; j <= b.length; j++) cur[j] = Math.min(prev[j]! + 1, cur[j - 1]! + 1, prev[j - 1]! + (a[i - 1] === b[j - 1] ? 0 : 1));
+    prev = cur;
+  }
+  return prev[b.length]!;
+}
+
+/**
+ * The keys closest to an unknown one, best first (at most `max`): first keys that contain it (`base.merge` ->
+ * `capabilities.base.merge`), then keys whose last segment contains its last segment (or the reverse), then keys within a
+ * small edit distance of it (whole key or last segment: typos). Case-insensitive. `keys`: the catalog by default.
+ */
+export function closestSettingKeys(input: string, keys: readonly string[] = SETTINGS.map((s) => s.key), max = 3): string[] {
+  const q = input.trim().toLowerCase();
+  if (!q) return [];
+  const last = (k: string) => k.slice(k.lastIndexOf('.') + 1);
+  const qLast = last(q);
+  const scored: { key: string; tier: number; score: number }[] = [];
+  for (const key of keys) {
+    const k = key.toLowerCase();
+    const kLast = last(k);
+    let tier: number; let score: number;
+    if (k.includes(q)) { tier = 0; score = k.length - q.length; }
+    else if (qLast.length >= 3 && (kLast.includes(qLast) || (kLast.length >= 3 && qLast.includes(kLast)))) { tier = 1; score = Math.abs(kLast.length - qLast.length); }
+    else {
+      const d = q.includes('.') ? editDistance(q, k) : Math.min(editDistance(q, k), editDistance(q, kLast));
+      if (d > Math.max(2, Math.floor(q.length / 4))) continue;
+      tier = 2; score = d;
+    }
+    scored.push({ key, tier, score });
+  }
+  return scored.sort((a, b) => a.tier - b.tier || a.score - b.score || a.key.localeCompare(b.key)).slice(0, max).map((x) => x.key);
 }
 
 // ---------------------------------------------------------------- reading
 
-export type SourceLabel = 'profile default' | 'shared config' | 'project config' | 'local override' | 'session' | 'credential store' | 'runtime';
+export type SourceLabel = 'mode default' | 'shared config' | 'project config' | 'local override' | 'session' | 'credential store' | 'runtime' | 'coordinator overlay';
 
 export interface SettingView {
   key: string;
@@ -292,6 +416,8 @@ export interface SettingView {
   choices?: readonly string[];
   /** May be unset (`default`). */
   optional?: boolean;
+  /** List separator when it is not ','. */
+  separator?: ';';
   /** Current effective value; secrets: "provisioned" / "missing"; controls: "paused" / "running" / null (runtime not reachable). */
   value: Value;
   source: SourceLabel;
@@ -318,6 +444,8 @@ export interface SettingsContext {
   credentials: CredentialsJson;
   /** Runtime pause flags; null when the runtime is not running or did not answer. */
   paused: { intake: boolean; starts: boolean } | null;
+  /** Why the coordinator's control overlay is not part of `config` (unreadable or invalid); absent otherwise. */
+  overlayWarning?: string;
 }
 
 export function getPath(obj: unknown, path: string): Value {
@@ -352,11 +480,12 @@ function sourceOf(def: SettingDef, ctx: SettingsContext): SourceLabel {
   if (prov === 'local') return 'local override';
   if (prov === 'project') return ctx.project.visibility === 'shared' ? 'shared config' : 'project config';
   if (prov === 'session') return 'session';
-  return 'profile default';
+  if (prov === 'control') return 'coordinator overlay';
+  return 'mode default';
 }
 
 /** The credential kind of a `secrets.<kind>` item. */
-export const secretKind = (key: string): 'github' | 'telegram' | 'codex' => key.slice('secrets.'.length) as 'github' | 'telegram' | 'codex';
+export const secretKind = (key: string): 'telegram' | 'codex' => key.slice('secrets.'.length) as 'telegram' | 'codex';
 
 export function currentValue(def: SettingDef, ctx: SettingsContext): Value {
   if (def.type === 'secret') return ctx.credentials[secretKind(def.key)] ? 'provisioned' : 'missing';
@@ -367,7 +496,10 @@ export function currentValue(def: SettingDef, ctx: SettingsContext): Value {
   const v = getPath(ctx.config, def.key);
   if (def.key === 'coordinator.contextReset.enabled' && v === undefined) return true; // unset = on
   if (def.key === 'coordinator.toolSearch' && v === undefined) return true; // unset = on
+  if (def.key === 'routine.enabled' && v === undefined) return false; // unset = off
+  if (def.key === 'routine.planWhenIdle' && v === undefined) return ctx.config.mode === 'independent'; // unset = by the mode
   if (def.key === 'coordinator.bundledSkills' && v === undefined) return false; // unset = off
+  if (def.nullable && (v === null || v === undefined)) return 'off';
   return v;
 }
 
@@ -375,7 +507,7 @@ export function viewSetting(def: SettingDef, ctx: SettingsContext): SettingView 
   const isConfig = def.type !== 'secret' && def.type !== 'control';
   return {
     key: def.key, group: def.group, label: def.label, description: def.description, type: def.type,
-    ...(def.choices ? { choices: def.choices } : {}), ...(def.optional ? { optional: true } : {}),
+    ...(def.choices ? { choices: def.choices } : {}), ...(def.optional ? { optional: true } : {}), ...(def.separator ? { separator: def.separator } : {}),
     value: currentValue(def, ctx), source: sourceOf(def, ctx), apply: def.apply, class: def.class, hostOwned: def.hostOwned,
     needsRegenerate: isConfig, needsRestart: isConfig && def.class === 'restart', needsUpgrade: isConfig && def.class === 'recreate',
     effect: isConfig ? RESTART_WHY[def.apply] : def.type === 'secret' ? `run \`minions auth ${def.key.slice('secrets.'.length)}\` to change it` : 'applied to the running runtime at once',
@@ -390,13 +522,25 @@ export const listSettings = (ctx: SettingsContext): SettingView[] =>
 export interface SettingsDeps {
   /** Pause flags of the running runtime (null when it is not running or did not answer). */
   pausedState?: (project: ProjectJson) => Promise<SettingsContext['paused']>;
+  /**
+   * The coordinator's control overlay text (src/host/control-overlay.ts; null: none or not reachable). Given only for
+   * the listing: its keys then show the overlay's value with source "coordinator overlay". Changes are planned on the
+   * host layers without it.
+   */
+  controlOverlay?: (project: ProjectJson) => Promise<string | null>;
 }
 
 export async function loadSettingsContext(project: ProjectJson, deps: SettingsDeps = {}): Promise<SettingsContext> {
   const eff = await loadEffectiveConfig(project);
   const credentials = await loadCredentialRefs(project.projectId).catch((): CredentialsJson => ({ version: 1 }));
   const paused = deps.pausedState ? await deps.pausedState(project).catch(() => null) : null;
-  return { project, config: eff.config, provenance: eff.provenance, credentials, paused };
+  if (!deps.controlOverlay) return { project, config: eff.config, provenance: eff.provenance, credentials, paused };
+  let text: string | null = null;
+  let readError: string | undefined;
+  try { text = await deps.controlOverlay(project); } catch (e) { readError = `the coordinator's control overlay could not be read (${(e as Error).message.slice(0, 200)})`; }
+  const m = mergeOverlay(eff, text);
+  const overlayWarning = readError ?? m.warning;
+  return { project, config: m.config, provenance: m.provenance, credentials, paused, ...(overlayWarning ? { overlayWarning } : {}) };
 }
 
 // ---------------------------------------------------------------- parsing
@@ -408,6 +552,7 @@ export function parseSettingValue(def: SettingDef, input: string): Value {
   const s = input.trim();
   const bad = (msg: string) => new MinionsError('INVALID_CONFIG', `${def.key}: ${msg} (got "${s}")`, def.choices ? `Choices: ${def.choices.join(', ')}${def.optional ? ', default' : ''}` : undefined, { path: def.key });
   if (def.optional && (s === 'default' || s === '')) return undefined;
+  if (def.nullable && (s === 'off' || s === 'none')) return null;
   switch (def.type) {
     case 'int': {
       if (!/^\d+$/.test(s)) throw bad('must be a whole number');
@@ -431,11 +576,12 @@ export function parseSettingValue(def: SettingDef, input: string): Value {
       if (!def.choices!.includes(s)) throw bad('not one of the choices');
       return s;
     case 'model':
+    case 'text':
       if (!s) throw bad('must not be empty');
       return s;
     case 'list': {
       if (s === 'none') return [];
-      const list = s.split(',').map((x) => x.trim()).filter(Boolean);
+      const list = s.split(def.separator ?? ',').map((x) => x.trim()).filter(Boolean);
       if (!list.length) throw bad('must list at least one entry, or none');
       return list;
     }

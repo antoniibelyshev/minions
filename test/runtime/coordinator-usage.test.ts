@@ -3,18 +3,22 @@
 // `work spend`. Fixture transcripts only (temp files); no live Claude run.
 import { appendFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { collectStatus, currentSessionKey, humanStatus, spendCommand } from '../../src/runtime/commands.js';
 import { noteTranscript } from '../../src/runtime/context-reset.js';
 import {
   completeOpenSessions, foldTranscriptLines, newSessionState, noteResetRequest, readIncrement, readSessionState, trackCoordinatorUsage, USAGE_META_PREFIX,
 } from '../../src/runtime/coordinator-usage.js';
 import { RuntimeDb } from '../../src/runtime/db.js';
+import { writeHolds } from '../../src/runtime/dispatch-state.js';
 import { stopHook } from '../../src/runtime/hooks.js';
 import { RECOVERY_PROMPT } from '../../src/runtime/coordinator.js';
 import { humanBaseline, humanSpend, spendReport } from '../../src/runtime/spend.js';
 import { defaults } from '../helpers.js';
-import { makeEnv, tmp, type Env } from './fixtures.js';
+import { makeUnitEnv, tmp, type Env } from './fixtures.js';
+import { assistantLine, jsonl, ownerLine, skillBodyLine, slashCommandLine } from './transcript-shapes.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const cfg = defaults();
 
@@ -90,6 +94,43 @@ describe('transcript folding', () => {
       { content: [{ type: 'tool_use', name: 'Bash', input: { command: 'minions work claim task-1 --role engineer --json' } }] })]));
     expect(t.recovered).toBe(false);
     expect(t.overhead).toBe(0);
+  });
+
+  it('counts real plugin owner messages (source="plugin:telegram:telegram") and the task-67 form; not text that only mentions a tag', () => {
+    const s = newSessionState('s1', '/x.jsonl', new Date());
+    foldTranscriptLines(s, jsonl([
+      slashCommandLine('minions:orchestrate', ''),
+      assistantLine('m1'),
+      ownerLine("how's it going?"),
+      assistantLine('m2'),
+      ownerLine('ship it', { source: 'telegram' }),
+      user('the owner wrote <channel source="plugin:telegram:telegram" chat_id="1">hi</channel> earlier'),
+      user('<channel source="plugin:slack:slack" chat_id="1">not telegram</channel>'),
+      assistantLine('m3'),
+    ]));
+    expect(s.ownerMessages).toBe(2);
+    expect(s.recovered).toBe(false);
+    expect(s.woken).toBe(false);
+  });
+
+  it('detects recovery and wakes in the expanded slash-command form (any tag order) as well as the raw form', () => {
+    const first = (line: unknown, ...more: unknown[]) => {
+      const s = newSessionState('s', '/x.jsonl', new Date());
+      foldTranscriptLines(s, jsonl([line, ...more, assistantLine('a1')]));
+      return { recovered: s.recovered, woken: s.woken };
+    };
+    const recoverArgs = 'The coordinator was just restarted (minions coordinator restart --recover). First read the previous session\'s handoff.';
+    expect(first(slashCommandLine('minions:recover', recoverArgs), skillBodyLine('# Recover\n...'))).toEqual({ recovered: true, woken: false });
+    expect(first(slashCommandLine('minions:recover', recoverArgs, { order: ['args', 'name', 'message'] }))).toEqual({ recovered: true, woken: false });
+    expect(first(user(RECOVERY_PROMPT))).toEqual({ recovered: true, woken: false });
+    expect(first(slashCommandLine('minions:orchestrate', 'wake'), skillBodyLine('# Orchestrate'))).toEqual({ recovered: false, woken: true });
+    expect(first(slashCommandLine('minions:orchestrate', ' wake\n', { order: ['name', 'args', 'message'] }))).toEqual({ recovered: false, woken: true });
+    expect(first(user('/minions:orchestrate wake'))).toEqual({ recovered: false, woken: true });
+    // Not a wake: other args, no args, another command; not a recovery: a mention inside other text.
+    expect(first(slashCommandLine('minions:orchestrate', 'wake the queue'))).toEqual({ recovered: false, woken: false });
+    expect(first(slashCommandLine('minions:orchestrate', ''))).toEqual({ recovered: false, woken: false });
+    expect(first(slashCommandLine('minions:status', 'wake'))).toEqual({ recovered: false, woken: false });
+    expect(first(user('please run <command-name>/minions:recover</command-name>'))).toEqual({ recovered: false, woken: false });
   });
 
   it('ignores malformed lines and zero-usage (synthetic) messages', () => {
@@ -231,9 +272,9 @@ describe('Stop hook integration', () => {
   const loader = (env: Env) => () => ({ db: env.db, backlog: env.backlog, config: env.config });
 
   it('records usage on every Stop without changing the decision or defeating the no-progress guard', async () => {
-    const env = makeEnv();
+    const env = makeUnitEnv();
     env.db.acquireCoordinatorLock('coordinator', 4242, () => false);
-    env.backlog.add({ id: 'task-1' });
+    writeHolds(env.db, { 'task-1': { taskId: 'task-1', kind: 'blocked', message: 'stuck', leaseId: null, at: '2026-10-31T00:00:00.000Z', status: 'blocked' } });
     const file = transcriptFile(lines([asst('m1', usage(1, 100, 0, 1))]));
     const inp = { transcript_path: file, session_id: 'sess-a' };
     const decisions: (string | null)[] = [];
@@ -250,7 +291,7 @@ describe('Stop hook integration', () => {
   });
 
   it('a throwing state store never changes the Stop decision', async () => {
-    const env = makeEnv();
+    const env = makeUnitEnv();
     env.db.acquireCoordinatorLock('coordinator', 4242, () => false);
     const file = transcriptFile(lines([asst('m1', usage(1, 100, 0, 1))]));
     const db = new Proxy(env.db, {
@@ -261,7 +302,7 @@ describe('Stop hook integration', () => {
       },
     });
     const o = await stopHook({ transcript_path: file, session_id: 'sess-a' }, () => ({ db, backlog: env.backlog, config: env.config }));
-    expect(o.reason).toMatch(/^allow: no runnable tasks/);
+    expect(o.reason).toMatch(/^allow: the autopilot dispatcher runs the stages; no decision waits/);
   });
 });
 
@@ -285,7 +326,7 @@ describe('work spend and status', () => {
     track(db, 'sess-a', file);
     expect(spendReport({ db, config: cfg, billing: 'subscription' }).coordinator.tokens).toBe(20_000);
 
-    const env = makeEnv();
+    const env = makeUnitEnv();
     env.db.acquireCoordinatorLock('coordinator', 4242, () => false);
     track(env.db, 'sess-z', transcriptFile(lines([asst('m1', usage(1, 2000, 0, 3))])));
     const s = await collectStatus({ db: env.db, config: env.config, backlog: async () => env.backlog });

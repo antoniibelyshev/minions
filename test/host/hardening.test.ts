@@ -33,7 +33,7 @@ const { hookLog } = await import('../../src/runtime/hooks.js');
 const { copyRegularFileNoFollow, ensureRealDir } = await import('../../src/core/fsutil.js');
 const Cred = await import('../../src/host/credentials.js');
 const { ClaudeAuthSchema } = await import('../../src/host/auth.js');
-const { defaults } = await import('../helpers.js');
+const { defaults, shq } = await import('../helpers.js');
 const { dockerDown, makeRepo, withHome } = await import('./fixtures.js');
 
 let env: ReturnType<typeof withHome>;
@@ -49,7 +49,7 @@ const ok = (stdout = ''): RunResult => ({ code: 0, stdout, stderr: '' });
 
 async function hostProject() {
   const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
+  const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
   return { repo, id: r.plan.projectId, project: await loadProjectJson(r.plan.projectId) };
 }
 
@@ -66,17 +66,18 @@ describe('host runtime claude launch (H1, M8)', () => {
     return { MINIONS_PLUGIN_DIR: join(dir, 'plugin'), MINIONS_STATE_DIR: join(dir, 'state'), MINIONS_WORKSPACE: join(dir, 'ws'), MINIONS_SECRETS_DIR: join(dir, 'secrets') };
   }
 
-  it('host: no user/project/local settings, no MCP servers, workspace+state as working dirs, permission mode forced to default', async () => {
+  it('host: no user/project/local settings, no MCP servers, workspace+state as working dirs, permission mode as configured', async () => {
     Object.assign(process.env, hostEnv(), { MINIONS_RUNTIME: 'host' });
     const cfg = { ...defaults(), permissionMode: 'acceptEdits' as const, coordinator: { permissionMode: 'auto' as const } };
-    const c = await C.buildClaudeCommand(cfg, runtimePaths(), { permissionModes: ['acceptEdits', 'auto'] });
+    // Claude Code 2.1.292 lists the default mode only as `manual`; older versions list `default`.
+    const c = await C.buildClaudeCommand(cfg, runtimePaths(), { permissionModes: ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'] });
+    expect(c.args[c.args.indexOf('--permission-mode') + 1]).toBe('auto');
     expect(c.args).toContain('--setting-sources=');
     expect(c.args).toContain('--strict-mcp-config');
     expect(c.args).not.toContain('--mcp-config');
     const i = c.args.indexOf('--add-dir');
     expect(c.args.slice(i + 1, i + 3)).toEqual([join(env.root, 'ws'), join(env.root, 'state')]);
     expect(c.args[i + 3]!.startsWith('--')).toBe(true); // the variadic --add-dir ends before the next flag
-    expect(c.args[c.args.indexOf('--permission-mode') + 1]).toBe('default');
     expect(c.args[c.args.indexOf('--append-system-prompt') + 1]).toMatch(/CLAUDE\.md is not loaded automatically/);
   });
 
@@ -122,9 +123,9 @@ describe('host runtime sandbox settings (H4, M3, M5, M7, L1)', () => {
   const fs = s.sandbox.filesystem as { allowWrite: string[]; denyWrite: string[]; denyRead: string[]; allowRead: string[] };
   const net = s.sandbox.network as Record<string, unknown>;
 
-  it('data root unreadable to sandboxed commands; only this project\'s dirs, config, plugin and GitHub token re-opened', () => {
+  it('data root unreadable to sandboxed commands; only this project\'s dirs, config and plugin re-opened', () => {
     expect(fs.denyRead).toEqual(expect.arrayContaining([h.hostRoot, h.credentialsDir, `${h.secretsDir}/anthropic-api-key`, `${h.secretsDir}/telegram-bot-token`]));
-    expect(fs.allowRead).toEqual(expect.arrayContaining([h.workspace, h.state, `${h.projectDir}/host/bin`, `${h.projectDir}/runtime`, h.pluginDir, `${h.secretsDir}/github-token`, '/Users/u/.nvm/versions/node/v22']));
+    expect(fs.allowRead).toEqual(expect.arrayContaining([h.workspace, h.state, `${h.projectDir}/host/bin`, `${h.projectDir}/runtime`, h.pluginDir, '/Users/u/.nvm/versions/node/v22']));
     expect(fs.allowRead).not.toContain(h.secretsDir);
     expect(s.deny).toEqual(expect.arrayContaining([`Read(//${h.hostRoot.slice(1)}/*.json)`, `Read(//${h.otherProjects[0]!.slice(1)}/**)`, `Edit(//${h.projectDir.slice(1)}/runtime/**)`]));
     expect(s.blockReadsOutsideWorkingDirectories).toBe(true);
@@ -190,11 +191,11 @@ describe('host-runtime git hardening (H2)', () => {
     mkdirSync(join(repo, 'hooks'));
     for (const hk of ['post-merge', 'post-checkout', 'pre-push', 'reference-transaction']) { writeFileSync(join(repo, 'hooks', hk), `#!/bin/sh\ntouch '${marker}'-hook-${hk}\n`); chmodSync(join(repo, 'hooks', hk), 0o755); }
     rawGit(repo, 'config', 'core.hooksPath', join(repo, 'hooks'));
-    rawGit(repo, 'config', 'core.fsmonitor', `${evil} fsmonitor`);
-    rawGit(repo, 'config', 'filter.evil.smudge', `${evil} smudge`);
-    rawGit(repo, 'config', 'filter.evil.clean', `${evil} clean`);
-    rawGit(repo, 'config', 'credential.helper', `!${evil} cred`);
-    rawGit(repo, 'config', 'core.sshCommand', `${evil} ssh`);
+    rawGit(repo, 'config', 'core.fsmonitor', `${shq(evil)} fsmonitor`);
+    rawGit(repo, 'config', 'filter.evil.smudge', `${shq(evil)} smudge`);
+    rawGit(repo, 'config', 'filter.evil.clean', `${shq(evil)} clean`);
+    rawGit(repo, 'config', 'credential.helper', `!${shq(evil)} cred`);
+    rawGit(repo, 'config', 'core.sshCommand', `${shq(evil)} ssh`);
     writeFileSync(join(repo, '.gitattributes'), '* filter=evil\n');
     return { repo, marker };
   }
@@ -233,11 +234,11 @@ describe('host-runtime git hardening (H2)', () => {
   });
 
   it('argv/env: hooks off, only https (+file for bundles), no file transport for network ops, helpers reset, no system config', () => {
-    const a = G.hardenedGitArgs({ credentialHelper: '!/x/minions git-credential' });
-    for (const v of ['core.hooksPath=/dev/null', 'core.fsmonitor=false', 'credential.helper=', 'credential.https://github.com.helper=!/x/minions git-credential',
+    const a = G.hardenedGitArgs();
+    for (const v of ['core.hooksPath=/dev/null', 'core.fsmonitor=false', 'credential.helper=',
       'protocol.allow=never', 'protocol.https.allow=always', 'protocol.file.allow=always', 'protocol.ssh.allow=never', 'protocol.ext.allow=never', 'submodule.recurse=false', 'gc.auto=0'])
       expect(a).toContain(v);
-    expect(a.indexOf('credential.helper=')).toBeLessThan(a.indexOf('credential.https://github.com.helper=!/x/minions git-credential'));
+    expect(a.some((v) => v.startsWith('credential.https://'))).toBe(false);
     expect(G.hardenedGitArgs({ network: true })).toContain('protocol.file.allow=never');
     expect(G.isNetworkOp(['push', '--porcelain', 'https://github.com/a/b.git', 'x:y'])).toBe(true);
     expect(G.isNetworkOp(['ls-remote', 'origin'])).toBe(true);
@@ -360,7 +361,7 @@ describe('host runtime environment (M4, L2, L3)', () => {
     const { project } = await hostProject();
     const cli = join(env.root, 'fake cli.mjs');
     writeFileSync(cli, 'process.stdout.write(JSON.stringify(process.env))\n');
-    await prepareHostRuntime(project, { target: { node: process.execPath, cli }, pathEnv: '/usr/bin:/bin', runner: async () => ok() });
+    await prepareHostRuntime(project, { target: { node: process.execPath, cli }, runner: async () => ok() });
     const shim = hostRuntimePaths(project.projectId).minionsShim;
     expect(minionsShim(project, { node: '/n', cli: '/c' })).toMatch(/unset .*AWS|sed -n -E/);
     const out = execFileSync(shim, [], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin', AWS_SESSION_TOKEN: 'x', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_COUNT: '1', NODE_OPTIONS: '--x', KEEP_ME: '1' } });
@@ -388,31 +389,32 @@ describe('Keychain avoidance (H3)', () => {
     };
     return { runner, calls };
   }
-  const TOKEN = 'github_pat_' + 'A'.repeat(40);
+  const TOKEN = 'sk-proj-' + 'A'.repeat(40);
 
   it('selectStore uses the file store while any project uses the host runtime', async () => {
     const { runner } = fakeSecurity(new Map());
-    expect((await Cred.selectStore({ runner, platform: 'darwin', env: {} })).backend).toBe('keychain');
+    const kind = Cred.CODEX_CREDENTIAL;
+    expect((await Cred.selectStore({ kind, runner, platform: 'darwin', env: {} })).backend).toBe('keychain');
     await hostProject();
-    expect((await Cred.selectStore({ runner, platform: 'darwin', env: {} })).backend).toBe('file');
-    expect((await Cred.selectStore({ runner, platform: 'darwin', env: { MINIONS_CREDENTIAL_STORE: 'keychain' } })).backend).toBe('file');
+    expect((await Cred.selectStore({ kind, runner, platform: 'darwin', env: {} })).backend).toBe('file');
+    expect((await Cred.selectStore({ kind, runner, platform: 'darwin', env: { MINIONS_CREDENTIAL_STORE: 'keychain' } })).backend).toBe('file');
   });
 
   it('prepareHostRuntime moves Keychain tokens of every project to the 0600 file store', async () => {
     const items = new Map<string, string>();
     const { runner } = fakeSecurity(items);
     const other = makeRepo(env.root, 'docker-repo');
-    const r = await runInit({ path: other, yes: true, visibility: 'private', dockerProbe: async () => ({ daemon: true, serverVersion: '1', compose: true, composeVersion: '1' }) });
+    const r = await runInit({ mode: 'independent', path: other, yes: true, visibility: 'private', dockerProbe: async () => ({ daemon: true, serverVersion: '1', compose: true, composeVersion: '1' }) });
     const otherId = r.plan.projectId;
-    await Cred.provisionGithubToken({ projectId: otherId, token: TOKEN, repoPath: other, verify: false, runner, platform: 'darwin', env: {} });
-    expect((await Cred.loadCredentialRefs(otherId)).github?.backend).toBe('keychain');
+    await Cred.provisionCodexKey({ projectId: otherId, token: TOKEN, repoPath: other, runner, platform: 'darwin', env: {} });
+    expect((await Cred.loadCredentialRefs(otherId)).codex?.backend).toBe('keychain');
     const { project } = await hostProject();
     const prep = await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/x' }, runner });
-    expect(prep.movedToFileStore).toEqual([{ projectId: otherId, kind: 'github' }]);
-    expect((await Cred.loadCredentialRefs(otherId)).github?.backend).toBe('file');
+    expect(prep.movedToFileStore).toEqual([{ projectId: otherId, kind: 'codex' }]);
+    expect((await Cred.loadCredentialRefs(otherId)).codex?.backend).toBe('file');
     expect(items.size).toBe(0);
-    expect(await Cred.readGithubToken(otherId, runner)).toBe(TOKEN);
-    expect(lstatSync(new Cred.FileStore().path(otherId)).mode & 0o777).toBe(0o600);
+    expect(await Cred.readCodexKey(otherId, runner)).toBe(TOKEN);
+    expect(lstatSync(new Cred.FileStore(Cred.CODEX_CREDENTIAL).path(otherId)).mode & 0o777).toBe(0o600);
     expect(projectPaths(otherId).dir).toBeTruthy();
   });
 });
@@ -420,10 +422,10 @@ describe('Keychain avoidance (H3)', () => {
 // ---------------------------------------------------------------- L5 / Telegram
 
 describe('Telegram in the host runtime', () => {
-  it('is disabled with a precise reason (user plugins are not loaded)', () => {
+  it('uses the minions channel server (task-6), not the official plugin', () => {
     const cfg = { ...defaults(), communication: { ...defaults().communication, channel: 'telegram' as const } };
     const d = C.decideTelegram(cfg, { state: 'ok', token: 'x', botId: '1' }, { available: true, summary: '', items: [] } as never, true);
-    expect(d).toEqual({ enabled: false, reason: C.HOST_TELEGRAM_REASON });
+    expect(d).toMatchObject({ enabled: true, server: 'minions' });
     expect(C.decideTelegram(cfg, { state: 'ok', token: 'x', botId: '1' }, { available: true, summary: '', items: [] } as never, false).enabled).toBe(true);
   });
 });

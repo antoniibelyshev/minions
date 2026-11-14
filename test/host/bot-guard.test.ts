@@ -7,7 +7,7 @@ import { assertBotFree, dockerCoordinatorPollsBot, findBotConflict, ownCoordinat
 import { provisionTelegramToken } from '../../src/host/credentials.js';
 import type { ProjectJson } from '../../src/host/project.js';
 import { saveRegistry } from '../../src/host/registry.js';
-import { projectPaths } from '../../src/core/paths.js';
+import { hostRuntimePaths, projectPaths } from '../../src/core/paths.js';
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 import { MinionsError } from '../../src/core/errors.js';
 import { defaults } from '../helpers.js';
@@ -21,7 +21,7 @@ const OTHER_BOT = '987654321:CCHotherbototherbototherbotother_-55';
 const SECRET = TOKEN.split(':')[1]!;
 
 const project = (projectId: string, over: Partial<ProjectJson> = {}): ProjectJson => ({
-  version: 1, projectId, repoPath: `/r/${projectId}`, gitCommonDir: `/r/${projectId}/.git`, visibility: 'private', profile: 'project-owner',
+  version: 1, projectId, repoPath: `/r/${projectId}`, gitCommonDir: `/r/${projectId}/.git`, visibility: 'private', mode: 'independent',
   imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null, gitIdentity: { name: 'Ada', email: 'ada@example.com' },
   container: { cpus: 2, memoryMiB: 4096, pidsLimit: 512, publishPorts: [], network: 'outbound-internet' }, ...over,
 });
@@ -171,5 +171,51 @@ describe('minions start during a bot conflict', () => {
     expect(await ownCoordinatorRunning(A, runner(true, true))).toBe(true);
     expect(await ownCoordinatorRunning(A, runner(true, false))).toBe(false);
     expect(await ownCoordinatorRunning(A, runner(false, true))).toBe(false);
+  });
+});
+
+describe('host-runtime coordinators (fake tmux and shim)', () => {
+  type Call = { cmd: string; args: string[] };
+  function host(s: { session: boolean; status?: string }) {
+    const calls: Call[] = [];
+    const runner = async (cmd: string, args: string[]): Promise<RunResult> => {
+      calls.push({ cmd, args });
+      if (cmd === 'tmux' && args.includes('has-session')) return { code: s.session ? 0 : 1, stdout: '', stderr: '' };
+      if (args[0] === 'telegram') return { code: 0, stdout: s.status ?? '', stderr: '' };
+      return { code: 1, stdout: '', stderr: 'unexpected' };
+    };
+    return { calls, runner };
+  }
+  const status = (enabled: boolean) => JSON.stringify({ ok: true, data: { coordinator: { telegram: { enabled } } } });
+  const writeProject = (p: ProjectJson) => {
+    const file = projectPaths(p.projectId).projectJson;
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, JSON.stringify(p));
+  };
+
+  it('findBotConflict counts a running host coordinator launched with Telegram (its own tmux server, status via the shim)', async () => {
+    await threeProjectsSharingABot();
+    writeProject(project(B, { runtime: 'host' }));
+    const h = host({ session: true, status: status(true) });
+    expect(await findBotConflict(A, { runner: h.runner })).toEqual({ botId: '123456789', projects: [B] });
+    const tmux = h.calls.find((c) => c.cmd === 'tmux')!;
+    expect(tmux.args).toEqual(['-L', expect.stringMatching(/^minions-/), 'has-session', '-t', 'coordinator']);
+    const st = h.calls.find((c) => c.args[0] === 'telegram')!;
+    expect(st.cmd).toBe(hostRuntimePaths(B).minionsShim);
+    expect(st.args).toEqual(['telegram', 'status', '--json']);
+    // Not running, or running without Telegram: no conflict. Unreadable status: counted (fail safe).
+    expect(await findBotConflict(A, { runner: host({ session: false, status: status(true) }).runner })).toBeNull();
+    expect(await findBotConflict(A, { runner: host({ session: true, status: status(false) }).runner })).toBeNull();
+    expect(await findBotConflict(A, { runner: host({ session: true, status: 'garbage' }).runner })).toEqual({ botId: '123456789', projects: [B] });
+  });
+
+  it("startBotCheck attaches when this host project's own coordinator runs, and refuses otherwise", async () => {
+    await threeProjectsSharingABot();
+    const me = project(A, { runtime: 'host' });
+    const polls = async () => true;
+    expect(await startBotCheck(me, cfg('telegram'), { coordinatorPollsBot: polls, runner: host({ session: true }).runner })).toMatchObject({ action: 'attach-existing' });
+    await expect(startBotCheck(me, cfg('telegram'), { coordinatorPollsBot: polls, runner: host({ session: false }).runner })).rejects.toMatchObject({ code: 'CONFLICT' });
+    writeProject(me);
+    expect(await ownCoordinatorRunning(A, host({ session: true }).runner)).toBe(true);
   });
 });

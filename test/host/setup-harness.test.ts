@@ -4,6 +4,7 @@
 // file credential store, fake container runtime; no Docker, no network.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
@@ -81,7 +82,7 @@ describe('setup: which agent does the work', () => {
   it('Codex: stores the key without echo, writes harnesses.default and the codex-reviewer pilot after the Claude reviewer', async () => {
     const repo = makeRepo(env.root);
     const a = scripted({ ...base, [AGENT_Q]: 'codex', 'Codex model': 'gpt-pilot' }, [OPENAI_KEY]);
-    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: fakeRuntime(), dockerProbe: dockerUp });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: false, io: a.io, runtime: fakeRuntime(), dockerProbe: dockerUp });
 
     // Asked after Telegram and before the container, the key through the hidden prompt.
     const at = (q: string) => a.asked.findIndex((x) => x.startsWith(q));
@@ -104,7 +105,7 @@ describe('setup: which agent does the work', () => {
     const local = localOf(r);
     expect(local.harnesses).toEqual({ default: 'codex', codex: { models: { default: 'gpt-pilot', allowed: ['gpt-pilot'] } } });
     expect(local.roles['codex-reviewer']).toMatchObject({ contract: 'gate', harness: 'codex' });
-    expect(local.workflows).toEqual({ default: ['engineer', { role: 'tester', when: 'qa' }, 'reviewer', 'codex-reviewer'] });
+    expect(local.workflows).toEqual({ default: ['engineer', 'reviewer', 'codex-reviewer'] });
     expect(r.localConfig.changed).toEqual(expect.arrayContaining(['harnesses.default', 'harnesses.codex', 'roles.codex-reviewer', 'workflows']));
     expect(readFileSync(projectConfigPath(await loadProjectJson(r.projectId)), 'utf8')).not.toContain('codex');
 
@@ -114,26 +115,26 @@ describe('setup: which agent does the work', () => {
 
     // A rerun with the same answers keeps everything (the stored key is offered to keep).
     const again = scripted({ ...base, 'Project configuration': 'keep', [AGENT_Q]: 'codex', 'Codex model': 'gpt-pilot' });
-    const r2 = await runSetup({ path: repo, yes: false, io: again.io, runtime: fakeRuntime(), dockerProbe: dockerUp });
+    const r2 = await runSetup({ mode: 'independent', path: repo, yes: false, io: again.io, runtime: fakeRuntime(), dockerProbe: dockerUp });
     expect(again.asked.some((q) => q.startsWith('An OpenAI API key for Codex is stored. Keep it or change it?'))).toBe(true);
     expect(again.asked.some((q) => q.startsWith('secret:'))).toBe(false);
     expect(step(r2, 'harness')).toMatchObject({ status: 'kept', detail: expect.stringContaining('OpenAI API key already stored') });
     expect(r2.localConfig.changed).toEqual([]);
     // The question now defaults to the current harness.
     const def = scripted({ ...base, 'Project configuration': 'keep' });
-    const r3 = await runSetup({ path: repo, yes: false, io: def.io, runtime: fakeRuntime(), dockerProbe: dockerUp });
+    const r3 = await runSetup({ mode: 'independent', path: repo, yes: false, io: def.io, runtime: fakeRuntime(), dockerProbe: dockerUp });
     expect(step(r3, 'harness').status).toBe('kept');
     expect((await effective(r3)).harnesses?.default).toBe('codex');
   });
 
   it('puts the pilot stage into the workflow the owner picks (stage hints kept)', async () => {
     const repo = makeRepo(env.root);
-    const first = await runSetup({ path: repo, yes: true, visibility: 'private', runtime: fakeRuntime(), dockerProbe: dockerUp });
+    const first = await runSetup({ mode: 'independent', path: repo, yes: true, visibility: 'private', runtime: fakeRuntime(), dockerProbe: dockerUp });
     const file = projectConfigPath(await loadProjectJson(first.projectId));
     const raw = JSON.parse(readFileSync(file, 'utf8'));
     writeFileSync(file, JSON.stringify({ ...raw, workflows: { careful: ['engineer', 'tester', { role: 'reviewer', model: 'opus' }] } }, null, 2));
     const a = scripted({ ...base, 'Project configuration': 'keep', [AGENT_Q]: 'codex', 'Which workflow': 'careful' }, [OPENAI_KEY]);
-    const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: fakeRuntime(), dockerProbe: dockerUp });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: false, io: a.io, runtime: fakeRuntime(), dockerProbe: dockerUp });
     expect(a.asked.find((q) => q.startsWith('Which workflow'))).toContain('(default/careful)');
     expect(step(r, 'harness').detail).toContain('in workflow careful');
     expect(step(r, 'harness').lines!.join('\n')).not.toContain('workflows.default is now written out');
@@ -148,16 +149,16 @@ describe('setup: which agent does the work', () => {
     const repo = makeRepo(env.root);
     for (const answer of [undefined, 'claude', 'junie', 'later']) {
       const a = scripted({ ...base, 'Project configuration': 'keep', ...(answer ? { [AGENT_Q]: answer } : {}) });
-      const r = await runSetup({ path: repo, yes: false, io: a.io, runtime: fakeRuntime(), dockerProbe: dockerUp });
+      const r = await runSetup({ mode: 'independent', path: repo, yes: false, io: a.io, runtime: fakeRuntime(), dockerProbe: dockerUp });
       expect(a.asked.find((q) => q.startsWith(AGENT_Q))).toBe(`${AGENT_Q} (claude/codex/junie/later)`);
       expect(step(r, 'harness').status, String(answer)).toBe('skipped');
       if (answer === 'junie') expect(step(r, 'harness').detail).toMatch(/Junie is not supported yet/);
       expect(a.asked.some((q) => q.startsWith('secret:'))).toBe(false);
       expect(existsSync(projectPaths(r.projectId).configLocalJson)).toBe(false);
     }
-    const on = await runSetup({ path: repo, yes: false, io: scripted({ ...base, 'Project configuration': 'keep', [AGENT_Q]: 'codex' }, [OPENAI_KEY]).io, runtime: fakeRuntime(), dockerProbe: dockerUp });
+    const on = await runSetup({ mode: 'independent', path: repo, yes: false, io: scripted({ ...base, 'Project configuration': 'keep', [AGENT_Q]: 'codex' }, [OPENAI_KEY]).io, runtime: fakeRuntime(), dockerProbe: dockerUp });
     expect(step(on, 'harness').status).toBe('done');
-    const off = await runSetup({ path: repo, yes: false, io: scripted({ ...base, 'Project configuration': 'keep', [AGENT_Q]: 'claude' }).io, runtime: fakeRuntime(), dockerProbe: dockerUp });
+    const off = await runSetup({ mode: 'independent', path: repo, yes: false, io: scripted({ ...base, 'Project configuration': 'keep', [AGENT_Q]: 'claude' }).io, runtime: fakeRuntime(), dockerProbe: dockerUp });
     expect(step(off, 'harness')).toMatchObject({ status: 'changed', detail: 'harnesses.default codex -> claude' });
     // The pilot role names its own harness, so it stays on Codex; the step says how to move it back.
     expect(step(off, 'harness').lines!.join('\n')).toContain('minions settings set roles.codex-reviewer.harness claude');
@@ -166,36 +167,36 @@ describe('setup: which agent does the work', () => {
 
   it('is not asked with --yes or in the host runtime', async () => {
     const a = scripted({ 'Installation visibility': 'private' });
-    const host = await runSetup({ path: makeRepo(env.root), yes: false, io: a.io, runtime: fakeRuntime('host'), dockerProbe: dockerUp });
+    const host = await runSetup({ mode: 'independent', path: makeRepo(env.root), yes: false, io: a.io, runtime: fakeRuntime('host'), dockerProbe: dockerUp });
     expect(a.asked.some((q) => q.startsWith(AGENT_Q))).toBe(false);
     expect(step(host, 'harness')).toMatchObject({ status: 'skipped', detail: expect.stringContaining('host runtime') });
-    const yes = await runSetup({ path: makeRepo(env.root, 'other'), yes: true, visibility: 'private', runtime: fakeRuntime(), dockerProbe: dockerUp });
+    const yes = await runSetup({ mode: 'independent', path: makeRepo(env.root, 'other'), yes: true, visibility: 'private', runtime: fakeRuntime(), dockerProbe: dockerUp });
     expect(step(yes, 'harness')).toMatchObject({ status: 'skipped', detail: 'every worker runs on Claude Code' });
-    const dry = await runSetup({ path: makeRepo(env.root, 'dry'), yes: false, dryRun: true, io: scripted().io, runtime: fakeRuntime(), dockerProbe: dockerUp });
+    const dry = await runSetup({ mode: 'independent', path: makeRepo(env.root, 'dry'), yes: false, dryRun: true, io: scripted().io, runtime: fakeRuntime(), dockerProbe: dockerUp });
     expect(step(dry, 'harness')).toMatchObject({ status: 'planned', detail: expect.stringContaining('Which agent should do the work?') });
   });
 
   it('records nothing when the planned config does not validate, or the key is refused', async () => {
     const repo = makeRepo(env.root);
-    const first = await runSetup({ path: repo, yes: true, visibility: 'private', runtime: fakeRuntime(), dockerProbe: dockerUp });
+    const first = await runSetup({ mode: 'independent', path: repo, yes: true, visibility: 'private', runtime: fakeRuntime(), dockerProbe: dockerUp });
     const file = projectConfigPath(await loadProjectJson(first.projectId));
     const raw = JSON.parse(readFileSync(file, 'utf8'));
     // A project gate that edits: harnesses.default would move it onto Codex, which a read-only process gate forbids.
     writeFileSync(file, JSON.stringify({ ...raw, roles: { auditor: { description: 'Audit.', promptText: 'Audit.', contract: 'gate', worktree: 'branch', edits: 'any' } } }, null, 2));
-    const r = await runSetup({ path: repo, yes: false, io: scripted({ ...base, 'Project configuration': 'keep', [AGENT_Q]: 'codex' }, [OPENAI_KEY]).io, runtime: fakeRuntime(), dockerProbe: dockerUp });
+    const r = await runSetup({ mode: 'independent', path: repo, yes: false, io: scripted({ ...base, 'Project configuration': 'keep', [AGENT_Q]: 'codex' }, [OPENAI_KEY]).io, runtime: fakeRuntime(), dockerProbe: dockerUp });
     expect(step(r, 'harness')).toMatchObject({ status: 'failed', detail: expect.stringMatching(/do not validate: [\s\S]*roles\.auditor\.edits[\s\S]*nothing was recorded \(OpenAI API key stored in/) });
     expect(existsSync(projectPaths(r.projectId).configLocalJson)).toBe(false);
     expect(step(r, 'container').status).toBe('skipped'); // the rest of setup continues
 
     // A non-gate role named codex-reviewer is refused.
     writeFileSync(file, JSON.stringify({ ...raw, roles: { 'codex-reviewer': { description: 'X.', promptText: 'X.', contract: 'producer' } } }, null, 2));
-    const r2 = await runSetup({ path: repo, yes: false, io: scripted({ ...base, 'Project configuration': 'keep', [AGENT_Q]: 'codex', 'An OpenAI API key': 'keep' }).io, runtime: fakeRuntime(), dockerProbe: dockerUp });
+    const r2 = await runSetup({ mode: 'independent', path: repo, yes: false, io: scripted({ ...base, 'Project configuration': 'keep', [AGENT_Q]: 'codex', 'An OpenAI API key': 'keep' }).io, runtime: fakeRuntime(), dockerProbe: dockerUp });
     expect(step(r2, 'harness')).toMatchObject({ status: 'failed', detail: expect.stringContaining('a producer role named codex-reviewer exists') });
 
     // A malformed key: nothing stored, nothing recorded, the key never echoed.
     writeFileSync(file, JSON.stringify(raw, null, 2));
     const repo3 = makeRepo(env.root, 'third');
-    const r3 = await runSetup({ path: repo3, yes: false, io: scripted({ ...base, [AGENT_Q]: 'codex' }, ['not a key']).io, runtime: fakeRuntime(), dockerProbe: dockerUp });
+    const r3 = await runSetup({ mode: 'independent', path: repo3, yes: false, io: scripted({ ...base, [AGENT_Q]: 'codex' }, ['not a key']).io, runtime: fakeRuntime(), dockerProbe: dockerUp });
     expect(step(r3, 'harness')).toMatchObject({ status: 'failed', detail: expect.stringContaining('nothing was stored') });
     expect((await loadCredentialRefs(r3.projectId)).codex).toBeUndefined();
     expect(JSON.stringify(r3)).not.toContain('not a key');
@@ -204,15 +205,15 @@ describe('setup: which agent does the work', () => {
 });
 
 describe('withPilotStage', () => {
-  const cfg = (v: Partial<{ testerRequired: boolean; reviewerRequired: boolean }>) => {
+  const cfg = (v: Partial<{ reviewerRequired: boolean }>) => {
     const c = defaults();
     Object.assign(c.verification, v);
     c.roles = { 'codex-reviewer': H.pilotRole() } as never;
     return c;
   };
   it('goes after the last reviewer stage of the derived default, or at the end without one; null when present', () => {
-    expect(H.withPilotStage(cfg({ testerRequired: true }), 'default')).toEqual(['engineer', 'tester', 'reviewer', 'codex-reviewer']);
-    expect(H.withPilotStage(cfg({ reviewerRequired: false }), 'default')).toEqual(['engineer', { role: 'tester', when: 'qa' }, 'codex-reviewer']);
+    expect(H.withPilotStage(cfg({}), 'default')).toEqual(['engineer', 'reviewer', 'codex-reviewer']);
+    expect(H.withPilotStage(cfg({ reviewerRequired: false }), 'default')).toEqual(['engineer', 'codex-reviewer']);
     const c = cfg({});
     c.workflows = { x: ['engineer', { role: 'reviewer', model: 'sonnet' }, 'codex-reviewer'] };
     expect(H.withPilotStage(c, 'x')).toBeNull();

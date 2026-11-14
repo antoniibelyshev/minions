@@ -172,8 +172,15 @@ export async function resolveOnPath(cmd: string, pathEnv: string | undefined = p
 
 // ---------------------------------------------------------------- defaults.json
 
-/** Host-wide defaults for new projects. `runtime` (docker|host) is host-only, like claudeAuth. */
-export const DefaultsSchema = z.object({ claudeAuth: ClaudeAuthSchema.optional(), runtime: RuntimeKindSchema.optional() }).strict();
+/** Host-wide defaults for new projects (`minions defaults`). `runtime` (docker|host) is host-only, like claudeAuth. */
+export const DefaultsSchema = z.object({
+  claudeAuth: ClaudeAuthSchema.optional(),
+  runtime: RuntimeKindSchema.optional(),
+  /** Author of agent commits; wins over the repository's git config at init. */
+  git: z.object({ name: z.string().min(1).optional(), email: z.string().min(1).optional() }).strict().optional(),
+  /** Telegram user id that a new project's bot allowlists on its first start (no pairing). */
+  telegram: z.object({ owner: z.string().regex(/^\d{1,20}$/, 'must be a numeric Telegram user id').optional() }).strict().optional(),
+}).strict();
 export type Defaults = z.infer<typeof DefaultsSchema>;
 export const loadDefaults = async (): Promise<Defaults> => (await readJsonIfExists(defaultsPath(), DefaultsSchema)) ?? {};
 export async function saveDefaults(d: Defaults): Promise<void> { await writeJson(defaultsPath(), d, { mode: 0o600 }); }
@@ -182,8 +189,13 @@ export async function saveDefaults(d: Defaults): Promise<void> { await writeJson
 
 export const expandHome = (p: string) => (p === '~' || p.startsWith('~/') ? join(homedir(), p.slice(1)) : p);
 
-export function describeSource(a: ClaudeAuth): string {
-  if (a.method === 'login') return 'interactive /login inside the container (state in the project claude volume)';
+/** `runtime`: the project's runtime; `login` means the host's own Claude Code login in the host runtime. */
+export function describeSource(a: ClaudeAuth, runtime: 'docker' | 'host' = 'docker'): string {
+  if (a.method === 'login') {
+    return runtime === 'host'
+      ? 'your Claude Code login on this Mac (host runtime: no key handoff; `claude` and /login once if not logged in)'
+      : 'interactive /login inside the container (state in the project claude volume)';
+  }
   if (a.method === 'helper') return `host command ${JSON.stringify(a.command)} (argv, no shell)`;
   const s = a.source;
   if (s.type === 'file') return `host file ${s.path}`;

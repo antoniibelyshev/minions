@@ -4,6 +4,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 import { CONTAINER, projectPaths } from '../../src/core/paths.js';
 import { Compose } from '../../src/host/docker.js';
@@ -53,6 +54,8 @@ interface World {
   mounts: { Type: string; Source: string; Destination: string; RW: boolean }[] | null;
   cliVersion: string | null;
   launch: { state: string; reason: string } | null | 'no-status';
+  /** The control overlay the container prints (default `{}`; null: the read fails). */
+  overlay?: string | null;
 }
 
 function world(projectId: string, over: Partial<World> = {}): World {
@@ -88,6 +91,7 @@ function fakeDocker(w: World, calls: string[] = []) {
         configRevision: 1, profile: 'p', deliveryMode: 'local', capacity: null, ...(w.launch ? { coordinatorLaunch: w.launch } : {}) } }) + '\n');
     }
     if (a.endsWith('claude auth status') || a.endsWith('backlog --version')) return ok('1.0\n');
+    if (a.includes('exec -T app sh -c') && a.endsWith('/state/control/overlay.json')) return w.overlay === null ? fail('cat: denied') : ok(w.overlay ?? '{}');
     return fail();
   };
 }
@@ -176,7 +180,7 @@ describe('checkRestartRequired', () => {
 describe('doctor and status integration', () => {
   it('doctor reports the restart check and restartRequired (--json data); never a FAIL', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const { projectId } = await projectForPath(repo);
     const base = world(projectId);
     let r = await runDoctor({ cwd: repo, probe: dockerUp, runner: fakeDocker(base), fingerprint: FP, version: HOST_VERSION });
@@ -202,7 +206,7 @@ describe('doctor and status integration', () => {
 
   it('doctor with Docker unavailable reports unknown', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const { dockerDown } = await import('./fixtures.js');
     const r = await runDoctor({ cwd: repo, probe: dockerDown, runner: fakeDocker(world('x')), fingerprint: FP, version: HOST_VERSION });
     expect(r.restartRequired).toMatchObject({ state: 'unknown', detail: 'Docker unavailable' });
@@ -211,7 +215,7 @@ describe('doctor and status integration', () => {
 
   it('host status merges the container status with restartRequired', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const { projectId } = await projectForPath(repo);
     const h = await hostStatus({ cwd: repo, runner: fakeDocker(world(projectId, { containerLabel: 'old' })), fingerprint: FP, version: HOST_VERSION });
     expect(h.kind).toBe('report');

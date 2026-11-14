@@ -4,13 +4,17 @@ import { Option, type Command } from 'commander';
 import { action, globalOpts, requireMode } from '../core/cli-helpers.js';
 import { MinionsError } from '../core/errors.js';
 import { parseWith } from '../core/fsutil.js';
-import { emit } from '../core/output.js';
+import { emit, redact } from '../core/output.js';
 import { CONTAINER, defaultsPath, projectPaths } from '../core/paths.js';
 import {
   API_KEY_HELPER, ClaudeAuthSchema, PRESETS, PRESET_NAMES, authOf, checkUrl, ensureSecretsDir, isKeyAuth, loadAuthState,
   loadDefaults, parseEnvPairs, refreshKey, removeKeyFile, resolveOnPath, saveDefaults, secretStatus, summarize,
   type AuthState, type AuthSummary, type ClaudeAuth, type Runner, type SecretStatus,
 } from './auth.js';
+import {
+  checkClaudeTokenFormat, claudeHeadlessCredentialStatus, codexCredentialStatus, provisionClaudeHeadlessToken, removeClaudeHeadlessToken,
+  type ClaudeHeadlessCredentialStatus, type ClaudeTokenKind, type CredentialStatus,
+} from './credentials.js';
 import { projectJsonBytes, refreshDerived, writeGenerated } from './install.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { projectForPath } from './registry.js';
@@ -29,6 +33,12 @@ export interface AuthSetFlags {
   rewriteLoopback?: boolean;
   global?: boolean;
   yes?: boolean;
+  /** login: also store a headless token (`claude setup-token`) for minions-launched headless runs (task-96). */
+  headlessToken?: boolean;
+  /** login: delete the stored headless token. */
+  removeHeadlessToken?: boolean;
+  /** With --headless-token: read it from piped stdin instead of the hidden prompt. */
+  stdin?: boolean;
 }
 
 export const AUTH_SET_METHODS = ['login', 'api-key', 'helper', ...PRESET_NAMES];
@@ -56,6 +66,11 @@ export async function buildAuth(method: string, argv: string[], o: AuthSetFlags,
   const helperish = method === 'helper' || PRESETS[method] !== undefined;
   if (!helperish && (refreshMinutes !== undefined || timeoutMs !== undefined)) throw new MinionsError('INVALID_CONFIG', '--refresh-minutes / --timeout-ms apply only to helper methods.');
   if (o.baseUrl !== undefined) checkUrl(o.baseUrl, '--base-url');
+  if ((o.headlessToken || o.removeHeadlessToken) && method !== 'login') {
+    throw new MinionsError('INVALID_CONFIG', '--headless-token / --remove-headless-token apply only to `auth set login`.', 'The key methods need no headless token: headless runs reuse the provisioned key.');
+  }
+  if (o.headlessToken && o.removeHeadlessToken) throw new MinionsError('INVALID_CONFIG', 'Use --headless-token or --remove-headless-token, not both.');
+  if (o.stdin && !o.headlessToken) throw new MinionsError('INVALID_CONFIG', '--stdin applies only with --headless-token.');
 
   let a: ClaudeAuth;
   const preset = PRESETS[method];
@@ -87,20 +102,35 @@ export async function buildAuth(method: string, argv: string[], o: AuthSetFlags,
   return parseWith(ClaudeAuthSchema, a, 'auth set');
 }
 
+/** The headless-token part of an `auth set login` plan (task-96). Never the token. */
+export interface HeadlessTokenPlan {
+  action: 'store' | 'remove';
+  /** Host-side materialized copy (in the bind-mounted secrets dir). */
+  file: string;
+  /** Where `minions coordinator live-run` reads it inside the container. */
+  containerPath: string;
+}
+
 export interface AuthPlan {
   scope: 'project' | 'global';
   projectId: string | null;
   auth: AuthSummary;
   hostReads: string;
   containerSettings: { apiKeyHelper: string } | null;
+  headlessToken: HeadlessTokenPlan | null;
   writes: string[];
   notes: string[];
 }
 
 /** `access` decides the key file mode shown in `writes` (0600, or 0640 with a private group on Linux). */
-export function authPlan(a: ClaudeAuth, projectId: string | null, access: SecretsAccess = probeSecretsAccess()): AuthPlan {
+export function authPlan(a: ClaudeAuth, projectId: string | null, access: SecretsAccess = probeSecretsAccess(), headless: HeadlessTokenPlan['action'] | null = null): AuthPlan {
   const paths = projectId ? projectPaths(projectId) : null;
   const notes: string[] = [];
+  const headlessToken = headless && paths ? { action: headless, file: paths.claudeHeadlessTokenFile, containerPath: CONTAINER.claudeHeadlessTokenFile } : null;
+  if (headlessToken?.action === 'store') {
+    notes.push('The headless token is stored in the host credential store and copied (0600) into the secrets dir; only `minions coordinator live-run` reads it, and passes it to its claude in the environment, never in argv.');
+    notes.push('Like the other mounted secrets it is readable by processes in the container; the worker hooks refuse tool calls that name the secrets dir.');
+  }
   if (isKeyAuth(a)) {
     notes.push('The key is readable by any process in the container (all agents share it).');
     if (a.method === 'helper') notes.push('The helper command runs on the host with your user rights; it is stored only in host-side configuration.');
@@ -114,7 +144,10 @@ export function authPlan(a: ClaudeAuth, projectId: string | null, access: Secret
     hostReads: a.method === 'login' ? 'nothing (no key is provisioned)'
       : `${summarize(a).source}; on every \`minions start\`, \`minions auth refresh\`${a.method === 'helper' ? ` and every ${a.refreshMinutes ?? 30} min while \`minions start\` is attached` : ''}`,
     containerSettings: isKeyAuth(a) ? { apiKeyHelper: API_KEY_HELPER } : null,
-    writes: projectId ? [paths!.projectJson, paths!.composeYaml, ...(isKeyAuth(a) ? [`${paths!.apiKeyFile} (${secretFileMode(access).toString(8).padStart(4, '0')})`] : [])] : [defaultsPath()],
+    headlessToken,
+    writes: projectId ? [paths!.projectJson, paths!.composeYaml, ...(isKeyAuth(a) ? [`${paths!.apiKeyFile} (${secretFileMode(access).toString(8).padStart(4, '0')})`] : []),
+      ...(headlessToken?.action === 'store' ? ['host credential store (Keychain, Secret Service or a 0600 file)', `${headlessToken.file} (${secretFileMode(access).toString(8).padStart(4, '0')})`] : []),
+      ...(headlessToken?.action === 'remove' ? [`host credential store and ${headlessToken.file} (removed)`] : [])] : [defaultsPath()],
     notes,
   };
 }
@@ -128,6 +161,7 @@ export function formatAuthPlan(p: AuthPlan): string {
   L.push(`  container env: ${envLines(p.auth.containerEnv)}`);
   L.push(`  mount: ${p.auth.mount ?? 'none'}`);
   if (p.containerSettings) L.push(`  Claude Code in the container: apiKeyHelper "${p.containerSettings.apiKeyHelper}"`);
+  if (p.headlessToken) L.push(`  headless token (live runs): ${p.headlessToken.action === 'store' ? `store; mounted at ${p.headlessToken.containerPath}` : 'remove'}`);
   L.push(`  writes: ${p.writes.join(', ')}`);
   for (const n of p.notes) L.push(`  note: ${n}`);
   return L.join('\n');
@@ -139,21 +173,38 @@ export interface AuthSetResult {
   plan: AuthPlan;
   provisioned?: { refreshedAt: string } | null;
   removedKeyFile?: boolean;
+  /** The headless token step (never the token). */
+  headless?: { stored: boolean; removed: boolean; kind: ClaudeTokenKind | null; envName: string | null; backend: string | null; appliedToRunningContainer: boolean; restartRequired: boolean } | null;
   warnings: string[];
 }
 
-export interface AuthDeps { cwd: string; runner?: Runner; home?: string; env?: NodeJS.ProcessEnv; confirm?: (plan: string) => Promise<boolean> }
+export interface AuthDeps {
+  cwd: string; runner?: Runner; home?: string; env?: NodeJS.ProcessEnv; confirm?: (plan: string) => Promise<boolean>;
+  /** Reads the headless token (hidden prompt or piped stdin; never argv). Required for --headless-token. */
+  readHeadlessToken?: (o: { stdin: boolean }) => Promise<string>;
+  /** Copies the provisioned secrets into a running container's mount; how the container stands. */
+  applySecrets?: (projectId: string) => Promise<'mounted' | 'restart-required' | 'not-running'>;
+}
 
 export async function runAuthSet(method: string, argv: string[], o: AuthSetFlags & { dryRun?: boolean }, deps: AuthDeps): Promise<AuthSetResult> {
   const a = await buildAuth(method, argv, o, { home: deps.home });
+  const headless = o.headlessToken ? 'store' : o.removeHeadlessToken ? 'remove' : null;
+  if (headless && o.global) throw new MinionsError('INVALID_CONFIG', 'The headless token is per project: run `minions auth set login --headless-token` inside the project, without --global.');
   const ref = o.global ? null : await projectForPath(deps.cwd);
-  const plan = authPlan(a, ref?.projectId ?? null);
+  const plan = authPlan(a, ref?.projectId ?? null, probeSecretsAccess(), headless);
   const warnings: string[] = [];
   if (a.method === 'helper') {
     const cmd = a.command[0]!;
     if (!(await resolveOnPath(cmd, deps.env?.PATH ?? process.env.PATH))) warnings.push(`helper command \`${cmd}\` is not on PATH (or not executable) for this shell.`);
   }
   if (o.dryRun) return { dryRun: true, applied: false, plan, warnings };
+  // Read and check the token before anything changes, so a mistyped token leaves the setting as it was.
+  let token: string | null = null;
+  if (headless === 'store') {
+    if (o.stdin && !o.yes) throw new MinionsError('PRECONDITION', '--stdin carries the token, so it cannot also answer the confirmation.', 'Add --yes (check the plan first with --dry-run).');
+    if (!deps.readHeadlessToken) throw new MinionsError('PRECONDITION', 'No way to read the headless token here.', 'Run `minions auth set login --headless-token` in a terminal, or pipe it with --stdin.');
+    token = checkClaudeTokenFormat(await deps.readHeadlessToken({ stdin: !!o.stdin })).token;
+  }
   if (!o.yes) {
     const ok = deps.confirm ? await deps.confirm(formatAuthPlan(plan)) : false;
     if (!ok) throw new MinionsError('PRECONDITION', 'Not confirmed; nothing was changed.', 'Pass --yes to apply non-interactively, or --dry-run to only show the plan.');
@@ -176,6 +227,20 @@ export async function runAuthSet(method: string, argv: string[], o: AuthSetFlags
   } else {
     result.removedKeyFile = await removeKeyFile(project.projectId);
   }
+  if (headless) {
+    const h: NonNullable<AuthSetResult['headless']> = { stored: false, removed: false, kind: null, envName: null, backend: null, appliedToRunningContainer: false, restartRequired: false };
+    if (token) {
+      const s = await provisionClaudeHeadlessToken({ projectId: project.projectId, token, repoPath: ref.repoPath, runner: deps.runner, env: deps.env });
+      Object.assign(h, { stored: true, kind: s.kind, envName: s.envName, backend: s.backend });
+    } else {
+      const r = await removeClaudeHeadlessToken(project.projectId, deps.runner);
+      Object.assign(h, { removed: r.removed, backend: r.backend });
+    }
+    const vis = deps.applySecrets ? await deps.applySecrets(project.projectId).catch(() => 'not-running' as const) : 'not-running';
+    h.appliedToRunningContainer = vis === 'mounted';
+    h.restartRequired = vis === 'restart-required';
+    result.headless = h;
+  }
   return result;
 }
 
@@ -187,12 +252,16 @@ export interface AuthShowResult {
   secret: SecretStatus | null;
   state: AuthState | null;
   globalDefault: AuthSummary | null;
+  /** The project's OpenAI API key for Codex process workers (presence, format, file mode; never the key). Null for --global. */
+  codex: CredentialStatus | null;
+  /** The headless Claude token of the login method (presence, kind, file mode; never the token). Null for --global. */
+  headless: ClaudeHeadlessCredentialStatus | null;
 }
 
 export async function runAuthShow(o: { global?: boolean }, deps: AuthDeps): Promise<AuthShowResult> {
   const defaults = await loadDefaults();
   if (o.global) {
-    return { scope: 'global', projectId: null, explicit: !!defaults.claudeAuth, auth: summarize(defaults.claudeAuth ?? { method: 'login' }), secret: null, state: null, globalDefault: null };
+    return { scope: 'global', projectId: null, explicit: !!defaults.claudeAuth, auth: summarize(defaults.claudeAuth ?? { method: 'login' }), secret: null, state: null, globalDefault: null, codex: null, headless: null };
   }
   const { projectId } = await projectForPath(deps.cwd);
   const project = await loadProjectJson(projectId);
@@ -203,6 +272,10 @@ export async function runAuthShow(o: { global?: boolean }, deps: AuthDeps): Prom
     secret: isKeyAuth(a) ? await secretStatus(projectId) : null,
     state: isKeyAuth(a) ? await loadAuthState(projectId) : null,
     globalDefault: defaults.claudeAuth ? summarize(defaults.claudeAuth) : null,
+    codex: await codexCredentialStatus(projectId, { runner: deps.runner })
+      .catch((e): CredentialStatus => ({ state: 'invalid', detail: `could not check (${redact(String((e as Error).message ?? e)).split('\n')[0]})` })),
+    headless: await claudeHeadlessCredentialStatus(projectId, { runner: deps.runner })
+      .catch((e): ClaudeHeadlessCredentialStatus => ({ state: 'invalid', detail: `could not check (${redact(String((e as Error).message ?? e)).split('\n')[0]})` })),
   };
 }
 
@@ -215,6 +288,12 @@ export function formatAuthShow(r: AuthShowResult): string {
   if (r.secret) L.push(`  secret file: ${r.secret.present ? `present (mode ${r.secret.mode}), last refreshed ${r.secret.updatedAt}` : 'missing — run `minions auth refresh` or `minions start`'}`);
   if (r.state?.lastError) L.push(`  last refresh error (${r.state.lastAttemptAt}): ${r.state.lastError}`);
   if (r.globalDefault) L.push(`  global default: ${r.globalDefault.method}${r.globalDefault.preset ? ` (${r.globalDefault.preset})` : ''}`);
+  if (r.headless) {
+    L.push(`  headless token (live runs in a fresh config dir): ${r.auth.method === 'login'
+      ? `${r.headless.state} — ${r.headless.detail}${r.headless.state === 'ok' ? '' : ' (store one: `claude setup-token`, then `minions auth set login --headless-token`)'}`
+      : `not needed (${r.auth.method}: headless runs reuse the key through apiKeyHelper)${r.headless.state === 'missing' ? '' : `; stored: ${r.headless.state}`}`}`);
+  }
+  if (r.codex) L.push(`OpenAI API key (Codex): ${r.codex.state} — ${r.codex.detail}${r.codex.state === 'ok' ? '' : ' (set it with `minions auth codex`)'}`);
   return L.join('\n');
 }
 
@@ -230,10 +309,10 @@ const collect = (v: string, prev: string[] = []) => [...prev, v];
 
 /**
  * Registers the `minions auth …` group with the Claude subcommands (show/set/refresh) and returns it,
- * so host credential subcommands (github, telegram, codex) join the same group. `confirm` prints the plan and asks (TTY only).
+ * so host credential subcommands (telegram, codex) join the same group. `confirm` prints the plan and asks (TTY only).
  */
-export function registerAuth(program: Command, confirm: (plan: string) => Promise<boolean>): Command {
-  const auth = program.command('auth').description('Claude authorization (show/set/refresh) and host-held GitHub/Telegram/Codex credentials for this project');
+export function registerAuth(program: Command, confirm: (plan: string) => Promise<boolean>, io: Pick<AuthDeps, 'readHeadlessToken' | 'applySecrets'> = {}): Command {
+  const auth = program.command('auth').description('Claude authorization (show/set/refresh) and host-held Telegram/Codex credentials for this project');
 
   auth.command('show')
     .description('Show the method, source, container env (masked) and secret file status; never the key')
@@ -255,18 +334,23 @@ export function registerAuth(program: Command, confirm: (plan: string) => Promis
     .option('--refresh-minutes <n>', 'helper: re-run interval while `minions start` is attached (default 30)')
     .option('--timeout-ms <n>', 'helper: timeout of one helper run (default 120000)')
     .option('--no-rewrite-loopback', 'keep 127.0.0.1/localhost in env values (default: rewrite to host.docker.internal)')
+    .option('--headless-token', 'login: also store a `claude setup-token` token for minions-launched headless runs (prompted without echo)')
+    .option('--remove-headless-token', 'login: delete the stored headless token')
+    .option('--stdin', 'with --headless-token: read the token from piped stdin (needs --yes)')
     .option('--global', 'set the default for new projects (<MINIONS_HOME>/defaults.json)')
     .option('--dry-run', 'show the plan without changing anything')
     .addOption(new Option('-y, --yes', 'apply without asking'))
     .action(action(async (method: string, argv: string[], o: AuthSetFlags & { dryRun?: boolean }, cmd: Command) => {
       requireMode('host');
       const { json } = globalOpts(cmd);
-      const r = await runAuthSet(method, argv, o, { cwd: process.cwd(), confirm: json ? undefined : confirm });
+      const r = await runAuthSet(method, argv, o, { cwd: process.cwd(), confirm: json ? undefined : confirm, ...io });
       emit(r, { json, human: (d: AuthSetResult) => [
         formatAuthPlan(d.plan),
         d.dryRun ? 'Dry run: nothing was changed.' : 'Saved.',
         ...(d.provisioned ? [`Key provisioned at ${d.provisioned.refreshedAt} (value not shown).`] : []),
         ...(d.removedKeyFile ? ['Removed the previously provisioned key file.'] : []),
+        ...(d.headless?.stored ? [`Stored the headless Claude token (${d.headless.kind}, value not shown) in ${d.headless.backend}; headless runs get it as ${d.headless.envName}. ${d.headless.appliedToRunningContainer ? `Updated ${CONTAINER.claudeHeadlessTokenFile} in the running container.` : d.headless.restartRequired ? 'The running container has no secrets mount; run `minions start` to recreate it.' : `It is mounted at ${CONTAINER.claudeHeadlessTokenFile} on the next \`minions start\`.`}`] : []),
+        ...(d.headless && !d.headless.stored ? [d.headless.removed ? 'Removed the headless Claude token.' : 'No headless Claude token was stored.'] : []),
         ...d.warnings.map((w) => `warning: ${w}`),
         ...(!d.dryRun && d.plan.scope === 'project' ? ['Run `minions start` to apply it to the container.'] : []),
       ].join('\n') });

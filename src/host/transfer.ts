@@ -1,6 +1,7 @@
 // Explicit repository transfer between host and container via Git bundles (spec §3A "Repository access").
-// Import copies committed history of the base branch only; export fetches agent branches into
-// refs/remotes/minions/* on the host (never touches local branches or the working tree).
+// Import copies committed history of the base branch only; export (`minions pull`) fetches agent branches into
+// refs/remotes/minions/* on the host, naming delivered/landed tasks minions/task-<id> (never touches local branches or the
+// working tree; the base fast-forward of `minions pull` is src/host/pull.ts).
 import { chmod, lstat, mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve as resolvePath } from 'node:path';
@@ -66,7 +67,7 @@ export function parseEnvelope<T>(stdout: string, what: string): T {
   return env.data as T;
 }
 
-export interface ImportResult { bundle: string; commit: string; baseBranch: string; warnings: string[]; container: { head?: string; base?: string; imported?: boolean; origin?: { url: string; authenticated: boolean; fetched: boolean; warnings: string[] } } }
+export interface ImportResult { bundle: string; commit: string; baseBranch: string; warnings: string[]; container: { head?: string; base?: string; imported?: boolean } }
 
 export async function importRepo(project: ProjectJson, opts: { runner?: Runner; repoPath?: string; compose?: Compose; target?: TransferTarget } = {}): Promise<ImportResult> {
   const runner = opts.runner ?? run;
@@ -103,15 +104,34 @@ export async function importRepo(project: ProjectJson, opts: { runner?: Runner; 
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
-  const args = ['minions', 'workspace', 'import', `${target.dirs.import}/${file}`, '--base', base];
-  if (project.remoteUrl) args.push('--remote-url', project.remoteUrl);
-  args.push('--json');
-  const r = await target.exec(args, { allowFailure: true, timeoutMs: 600_000 });
+  const r = await target.exec(['minions', 'workspace', 'import', `${target.dirs.import}/${file}`, '--base', base, '--json'], { allowFailure: true, timeoutMs: 600_000 });
   const data = parseEnvelope<ImportResult['container']>(r.stdout, 'workspace import');
   return { bundle: file, commit, baseBranch: base, warnings, container: data ?? {} };
 }
 
-export interface ExportResult { bundle: string; refs: string[]; changes: { ref: string; from: string | null; to: string | null }[] }
+export interface TaskRef { taskId: string; ref: string; source: string }
+export interface ExportResult { bundle: string; refs: string[]; changes: { ref: string; from: string | null; to: string | null }[]; tasks: (TaskRef & { sha: string })[] }
+
+const TASK_ID = /^task-\d+(?:\.\d+)*$/i;
+const AGENT_BRANCH = /^agent\/[A-Za-z0-9._-]+$/;
+
+/**
+ * The refs/remotes/minions/task-<id> refs for the delivered tasks the runtime reported (`workspace export` tasks): only
+ * task ids of the minions form and agent/* branches that were fetched; the first entry per task wins. Runtime output is
+ * agent-influenced, so anything else is dropped.
+ */
+export function taskRefs(tasks: unknown, fetched: ReadonlySet<string>): TaskRef[] {
+  if (!Array.isArray(tasks)) return [];
+  const out = new Map<string, TaskRef>();
+  for (const t of tasks as unknown[]) {
+    const { taskId, branch } = (t ?? {}) as { taskId?: unknown; branch?: unknown };
+    if (typeof taskId !== 'string' || typeof branch !== 'string' || !TASK_ID.test(taskId) || !AGENT_BRANCH.test(branch) || branch.includes('..') || branch.endsWith('.lock')) continue;
+    const id = taskId.toLowerCase();
+    const source = `refs/remotes/minions/${branch}`;
+    if (!out.has(id) && fetched.has(source)) out.set(id, { taskId: id, ref: `refs/remotes/minions/${id}`, source });
+  }
+  return [...out.values()];
+}
 
 async function minionsRefs(runner: Runner, repo: string): Promise<Map<string, string>> {
   const r = await runner('git', [...HOST_GIT, 'for-each-ref', '--format=%(refname) %(objectname)', 'refs/remotes/minions/'], { cwd: repo, allowFailure: true });
@@ -124,7 +144,7 @@ export async function exportRepo(project: ProjectJson, opts: { runner?: Runner; 
   const target = opts.target ?? composeTarget(opts.compose ?? new Compose(project.projectId, runner));
   const file = `export-${new Date().toISOString().replace(/[:.]/g, '-')}.bundle`;
   const r = await target.exec(['minions', 'workspace', 'export', `${target.dirs.exports}/${file}`, '--json'], { allowFailure: true, timeoutMs: 600_000 });
-  const data = parseEnvelope<{ path: string; refs: string[] }>(r.stdout, 'workspace export');
+  const data = parseEnvelope<{ path: string; refs: string[]; tasks?: unknown }>(r.stdout, 'workspace export');
   const exportsDir = projectPaths(project.projectId).exportsDir;
   await ensureDir(exportsDir);
   // The bundle name is chosen here, never taken from container output; the copied file must be a
@@ -143,14 +163,22 @@ export async function exportRepo(project: ProjectJson, opts: { runner?: Runner; 
   }
   const before = await minionsRefs(runner, repo);
   // Remote-tracking refs under refs/remotes/minions/ are minions-owned; forced updates there never touch local branches.
+  // --prune also drops the task refs below (not in the bundle): they are recreated from the fetched branches.
   await runner('git', [...HOST_GIT, 'fetch', '--no-tags', '--no-recurse-submodules', '--prune', local, '+refs/heads/*:refs/remotes/minions/*'], { cwd: repo, timeoutMs: 300_000 });
+  const fetched = await minionsRefs(runner, repo);
+  const tasks: ExportResult['tasks'] = [];
+  for (const t of taskRefs(data.tasks, new Set(fetched.keys()))) {
+    const sha = fetched.get(t.source)!;
+    await runner('git', [...HOST_GIT, 'update-ref', '-m', 'minions pull', t.ref, sha], { cwd: repo, timeoutMs: 60_000 });
+    tasks.push({ ...t, sha });
+  }
   const after = await minionsRefs(runner, repo);
   const changes: ExportResult['changes'] = [];
   for (const ref of new Set([...before.keys(), ...after.keys()])) {
     const from = before.get(ref) ?? null, to = after.get(ref) ?? null;
     if (from !== to) changes.push({ ref, from, to });
   }
-  return { bundle: local, refs: data.refs ?? [], changes: changes.sort((a, b) => a.ref.localeCompare(b.ref)) };
+  return { bundle: local, refs: data.refs ?? [], changes: changes.sort((a, b) => a.ref.localeCompare(b.ref)), tasks };
 }
 
 export interface StateExportHostResult {

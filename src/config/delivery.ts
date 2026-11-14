@@ -1,29 +1,40 @@
-import type { MinionsConfig } from './schema.js';
+import type { TaskStatus } from '../backlog/types.js';
+import type { CapabilityRule, MinionsConfig } from './schema.js';
+
+const baseEffect = (r: CapabilityRule | undefined) => (r === undefined ? undefined : typeof r === 'string' ? r : r.effect);
 
 /**
- * GitHub delivery (`branch` / `pull-request`; validation ties both to provider `github`). Under it
- * origin/<base> is the single source of truth: nothing merges into a local base, the workspace base only
- * fast-forwards from origin before each claim, and `minions upgrade` builds the CLI from origin/<base>.
- * Decision record: docs/design/bootstrap.md, "origin/<base> as the single source of truth".
- */
-export const isGithubDelivery = (cfg: Pick<MinionsConfig, 'delivery'>): boolean => cfg.delivery.mode !== 'local';
-
-/**
- * Why CI-gated auto-merge (delivery.merge "auto-when-eligible") cannot be used with this configuration;
- * empty = the configuration allows it (each merge still passes the per-PR gate in src/runtime/merge.ts:
- * required checks passing for the approved head, PR head == approved head, pr.merge policy, sensitive
- * paths). Shared by the merge gate, `minions doctor` merge.readiness and listUnavailable.
+ * Why local integration (delivery.merge "auto-when-eligible") cannot be used with this configuration; empty = the
+ * configuration allows it. Shared by the integration gates, `minions doctor` merge.readiness and listUnavailable
+ * (docs/design/local-auto-integration.md, Decision 1): the local integrator (src/runtime/integrator.ts) lands approved
+ * heads on the base after its own verification gate; it needs `base.merge` not denied and verification.commands to
+ * run. Each landing still passes the sensitive-path and `base.merge` "ask" approval gate.
  */
 export function autoMergeConfigReasons(cfg: Pick<MinionsConfig, 'delivery'> & Partial<Pick<MinionsConfig, 'verification' | 'capabilities' | 'sensitivePaths'>>): string[] {
   const out: string[] = [];
-  const d = cfg.delivery;
-  if (d.merge !== 'auto-when-eligible') out.push(`delivery.merge is "${d.merge}" (auto-merge is opt-in: set "auto-when-eligible")`);
-  if (d.mode !== 'pull-request' || d.provider !== 'github') out.push(`auto-merge needs pull-request delivery to GitHub (delivery.mode is "${d.mode}")`);
-  if (!d.requiredChecksConfigured) out.push('delivery.requiredChecksConfigured is false (never treated as zero required checks)');
-  if (cfg.verification && cfg.verification.ciAuthority !== 'github') out.push('verification.ciAuthority is not "github": required checks are not read as merge evidence');
-  if (cfg.capabilities) {
-    const r = cfg.capabilities['pr.merge'];
-    if ((typeof r === 'string' ? r : r.effect) === 'deny') out.push('pr.merge is denied by policy');
-  }
+  if (cfg.delivery.merge !== 'auto-when-eligible') out.push(`delivery.merge is "${cfg.delivery.merge}" (local integration is opt-in: set "auto-when-eligible")`);
+  if (cfg.capabilities && baseEffect(cfg.capabilities['base.merge']) === 'deny') out.push('base.merge is denied by policy (the user integrates approved branches)');
+  if (cfg.verification && !cfg.verification.commands.length) out.push(NO_VERIFICATION_COMMANDS);
   return out;
 }
+
+/** Why the integrator refuses to land anything (docs/design/autonomy.md Decision 12: no unverified work on the base). */
+export const NO_VERIFICATION_COMMANDS = 'verification.commands is empty: the integrator never lands unverified work; set the fast checks (unit tests, typecheck, lint) with `minions control set verification.commands \'["..."]\'`, then `minions work publish <taskId>` for each blocked task';
+
+/**
+ * Local integration is on: delivery.merge "auto-when-eligible" and `base.merge` not denied. An approval then queues
+ * the head for the integrator (task -> `merging`) instead of ending `delivered`. Without verification.commands the
+ * integrator refuses every landing (NO_VERIFICATION_COMMANDS): the task is blocked until they are set.
+ */
+export const localIntegrationEnabled = (cfg: Pick<MinionsConfig, 'delivery' | 'capabilities'>): boolean =>
+  autoMergeConfigReasons({ delivery: cfg.delivery, capabilities: cfg.capabilities }).length === 0;
+
+const DONE_ONLY: ReadonlySet<TaskStatus> = new Set(['done']);
+const DONE_OR_DELIVERED: ReadonlySet<TaskStatus> = new Set(['done', 'delivered']);
+
+/**
+ * Statuses that satisfy a dependency. With local integration on only `done` does (the dependency is on the
+ * base, so dependents branch from a base that contains it); otherwise `done` or `delivered`, as before.
+ */
+export const dependencyDoneStatuses = (cfg: Pick<MinionsConfig, 'delivery' | 'capabilities'>): ReadonlySet<TaskStatus> =>
+  localIntegrationEnabled(cfg) ? DONE_ONLY : DONE_OR_DELIVERED;

@@ -6,9 +6,8 @@ import { COMPACT_FIELDS, projectTasks, register as registerBacklog, selectFields
 import type { MinionsError } from '../../src/core/errors.js';
 import { register as registerRuntime } from '../../src/runtime/commands.js';
 import {
-  claimWithBrief, compactClaim, fetchBrief, recordSubmitted, rejectedPath, submissionPath, submitResult, type HandoffPaths,
+  briefPath, claimWithBrief, compactClaim, fetchBrief, recordSubmitted, rejectedPath, submissionPath, submitResult, type HandoffPaths,
 } from '../../src/runtime/handoff.js';
-import { preAgentHook } from '../../src/runtime/hooks.js';
 import { commitFile, makeEnv, result, type Env } from './fixtures.js';
 
 const paths = (env: Env): HandoffPaths => ({ briefs: join(env.root, 'state', 'briefs'), results: join(env.root, 'state', 'results') });
@@ -75,17 +74,6 @@ describe('worker-fetched brief', () => {
     expect(e.hint).toMatch(/paste the brief|reclaim/);
   });
 
-  it('the pre-agent hook accepts a prompt with only the lease marker plus notes (hook unchanged)', async () => {
-    const env = makeEnv();
-    env.backlog.add({ id: 'task-1' });
-    const c = compactClaim(await claimWithBrief(env.sched, paths(env), 'task-1', 'engineer'));
-    const prompt = `${c.briefMarker}\nworktree: ${c.worktree}\n\nCoordinator notes: keep README edits small.`;
-    const load = () => ({ db: env.db, backlog: env.backlog, config: env.config });
-    const ok = await preAgentHook({ tool_input: { subagent_type: 'minions:engineer', prompt } }, load);
-    expect(ok.stdout).toBeUndefined();
-    const denied = await preAgentHook({ tool_input: { subagent_type: 'minions:engineer', prompt: `worktree: ${c.worktree}` } }, load);
-    expect(denied.stdout).toMatch(/deny/);
-  });
 });
 
 describe('file-based result hand-off', () => {
@@ -106,6 +94,7 @@ describe('file-based result hand-off', () => {
     expect(r).toMatchObject({ valid: true, from: 'implementing', to: 'testing' });
     expect(env.backlog.status('task-1')).toBe('testing');
     expect(existsSync(s.path)).toBe(false); // the DB holds the recorded result
+    expect(existsSync(briefPath(paths(env), brief.leaseId))).toBe(false); // an ended lease leaves no hand-off files (task-9)
     expect(JSON.parse(env.db.lease(brief.leaseId)!.result_json!).headSha).toBe(head);
     expect(env.db.events('task-1', 'submit')).toHaveLength(1);
   });

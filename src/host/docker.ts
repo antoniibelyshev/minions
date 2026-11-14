@@ -7,7 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { relayStripped } from '../core/control-chars.js';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
-import { CONTAINER, SERVICE_NAME, composeProjectName, projectPaths, volumeNames } from '../core/paths.js';
+import { APT_PACKAGE } from '../config/schema.js';
+import { CONTAINER, CONTAINER_PATH, SERVICE_NAME, TOOLS_DIR, TOOLS_ENV, composeProjectName, projectPaths, volumeNames } from '../core/paths.js';
 import { KEY_HELPER_TTL_MS, authOf, containerEnv, isKeyAuth } from './auth.js';
 import type { ProjectJson } from './project.js';
 import { probeSecretsAccess, type SecretsAccess } from './secrets-access.js';
@@ -43,7 +44,7 @@ export function composeYaml(p: ProjectJson, access: SecretsAccess = probeSecrets
     `name: ${q(composeProjectName(p.projectId))}`,
     'services:',
     `  ${SERVICE_NAME}:`,
-    `    image: ${q(p.imageTag)}`,
+    `    image: ${q(runtimeImageTag(p))}`,
     '    pull_policy: never',
     '    user: "1000:1000"',
     ...(access.mode === 'group' ? [`    group_add: [${q(access.gid)}]`] : []),
@@ -56,6 +57,8 @@ export function composeYaml(p: ProjectJson, access: SecretsAccess = probeSecrets
     `    mem_limit: ${q(`${c.memoryMiB}m`)}`,
     `    pids_limit: ${c.pidsLimit}`,
     ...(c.network === 'none' ? ['    network_mode: "none"'] : []),
+    ...(c.gpus === 'nvidia' ? ['    deploy:', '      resources:', '        reservations:', '          devices:',
+      '            - driver: "nvidia"', '              count: "all"', '              capabilities: ["gpu"]'] : []),
     // The scratch dir must exist before anything uses TMPDIR; a failed mkdir never stops the container.
     `    command: ["sh", "-c", ${q(`mkdir -p ${CONTAINER.scratch}; exec sleep infinity`)}]`,
     `    working_dir: ${q(CONTAINER.workspace)}`,
@@ -64,10 +67,14 @@ export function composeYaml(p: ProjectJson, access: SecretsAccess = probeSecrets
     `      CLAUDE_CONFIG_DIR: ${q(CONTAINER.claudeHome)}`,
     `      MINIONS_CONFIG: ${q(CONTAINER.configJson)}`,
     '      HOME: "/home/node"',
+    // The tools volume (docs/design/autonomy.md Decision 14): its bin dirs after the system ones, and the toolchain homes.
+    `      PATH: ${q(CONTAINER_PATH)}`,
+    ...Object.entries(TOOLS_ENV).map(([k, v]) => `      ${k}: ${q(v)}`),
     // Claude Code's TUI runs inside tmux: it needs a UTF-8 locale (C.UTF-8 ships with Debian) and a color TERM.
     '      LANG: "C.UTF-8"',
     '      LC_ALL: "C.UTF-8"',
     '      TERM: "xterm-256color"',
+    ...(c.gpus === 'nvidia' ? ['      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"'] : []),
     '      npm_config_cache: "/home/node/.cache/npm"',
     '      XDG_CACHE_HOME: "/home/node/.cache"',
     // Large temp data (test runs, tool scratch) goes to disk, not RAM; inherited by every exec, so workers and verification commands get it.
@@ -91,6 +98,7 @@ export function composeYaml(p: ProjectJson, access: SecretsAccess = probeSecrets
   vol('state', CONTAINER.state);
   vol('claude', CONTAINER.claudeHome);
   vol('cache', CONTAINER.cache);
+  vol('tools', TOOLS_DIR);
   const bind = (source: string, target: string) => L.push(
     '      - type: bind', `        source: ${q(source)}`, `        target: ${q(target)}`, '        read_only: true',
     '        bind:', '          create_host_path: false');
@@ -98,7 +106,7 @@ export function composeYaml(p: ProjectJson, access: SecretsAccess = probeSecrets
   bind(paths.runtimeDir, CONTAINER.configDir);
   // Secrets: a directory mount (never a single-file mount) so a key/token replaced on the host via
   // rename (new inode) is visible without recreating the container. Only the Claude key copy and
-  // materialized GitHub/Telegram tokens live here; the host credential store (Keychain / credentials
+  // materialized tokens live here; the host credential store (Keychain / credentials
   // dir) and the Claude key source are never mounted.
   bind(paths.secretsDir, CONTAINER.secretsDir);
   if (c.publishPorts.length && c.network !== 'none') {
@@ -285,7 +293,7 @@ export async function imageBuildLabel(tag: string, runner: Runner = run): Promis
 
 /** Fingerprint of what goes into the image from the package (null when dist/ is not built). */
 export function buildFingerprint(root: string = packageRoot()): string | null {
-  const files = [join('dist', 'cli.js'), join('docker', 'Dockerfile'), join('docker', 'gh-wrapper.sh'), join('docker', 'minions-sandbox', 'minions-sandbox.c'), 'package.json'];
+  const files = [join('dist', 'cli.js'), join('docker', 'Dockerfile'), join('docker', 'minions-sandbox', 'minions-sandbox.c'), 'package.json'];
   if (!existsSync(join(root, files[0]!))) return null;
   const h = createHash('sha256');
   for (const f of files) h.update(f).update('\0').update(existsSync(join(root, f)) ? readFileSync(join(root, f)) : '').update('\0');
@@ -310,4 +318,78 @@ export async function ensureImage(tag: string, opts: { runner?: Runner; root?: s
     : `Rebuilding image ${tag}: the installed package changed since it was built…`);
   await runner('docker', ['build', '-t', tag, '--label', `${BUILD_LABEL}=${fp}`, '-f', join(root, 'docker', 'Dockerfile'), root], { timeoutMs: 1_800_000 });
   return true;
+}
+
+// ---------------------------------------------------------------- container.gpus
+
+/** Files of the NVIDIA container toolkit and driver on a Linux host (checked without running anything). */
+const NVIDIA_FILES = { toolkit: ['/usr/bin/nvidia-container-toolkit', '/usr/bin/nvidia-container-runtime-hook', '/usr/bin/nvidia-container-runtime'], device: '/dev/nvidiactl' };
+export const nvidiaHost = (platform: NodeJS.Platform = process.platform, exists: (p: string) => boolean = existsSync): boolean =>
+  platform === 'linux' && exists(NVIDIA_FILES.device) && NVIDIA_FILES.toolkit.some(exists);
+
+/** container.gpus for project.json: "nvidia" when configured, or on auto when the host has the toolkit; else none. */
+export function resolveGpus(setting: 'auto' | 'nvidia' | 'none' | undefined, nvidia: () => boolean = nvidiaHost): 'nvidia' | undefined {
+  return setting === 'nvidia' || ((setting ?? 'auto') === 'auto' && nvidia()) ? 'nvidia' : undefined;
+}
+
+// ---------------------------------------------------------------- container.aptPackages (docs/design/autonomy.md Decision 14)
+
+/** Sorted, unique: the form project.json keeps and the image tag hashes. */
+export const normalizeAptPackages = (pkgs: readonly string[] | undefined): string[] => [...new Set(pkgs ?? [])].sort();
+
+/** The image with `pkgs` added: `<base>-apt-<hash>`; the base tag itself when there are none. */
+export function aptImageTag(baseTag: string, pkgs: readonly string[] | undefined): string {
+  const list = normalizeAptPackages(pkgs);
+  return list.length ? `${baseTag}-apt-${createHash('sha256').update(list.join('\n')).digest('hex').slice(0, 12)}` : baseTag;
+}
+
+/** The image the project's container runs (compose.yaml): the base image, or its apt-derived image. */
+export const runtimeImageTag = (p: Pick<ProjectJson, 'imageTag' | 'container'>): string => aptImageTag(p.imageTag, p.container.aptPackages);
+
+/** Dockerfile of the derived image: one apt layer as root on top of the base, then back to the agent user. */
+export function aptDockerfile(baseTag: string, pkgs: readonly string[]): string {
+  const list = normalizeAptPackages(pkgs);
+  // The names reach a shell (RUN): only Debian package names, whatever the caller validated.
+  const bad = list.filter((n) => !APT_PACKAGE.test(n));
+  if (bad.length || !list.length) {
+    throw new MinionsError('INVALID_CONFIG', bad.length
+      ? `container.aptPackages: not a Debian package name: ${bad.slice(0, 3).map((b) => JSON.stringify(b.slice(0, 60))).join(', ')}.`
+      : 'container.aptPackages is empty.', 'Use plain package names, e.g. ["pkg-config","libssl-dev"].');
+  }
+  return [
+    '# Generated by minions from container.aptPackages.',
+    `FROM ${baseTag}`,
+    'USER root',
+    'ARG DEBIAN_FRONTEND=noninteractive',
+    'RUN apt-get update \\',
+    ` && apt-get install -y --no-install-recommends ${list.join(' ')} \\`,
+    ' && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*',
+    'USER node',
+    '',
+  ].join('\n');
+}
+
+/**
+ * Builds the apt-derived image of `baseTag` (which must exist) when it is missing or was built on another base build
+ * (its `minions.build` label differs from the base's). No packages: nothing to build. Returns true if built.
+ */
+export async function ensureAptImage(baseTag: string, pkgs: readonly string[] | undefined, opts: { runner?: Runner; onBuild?: (msg: string) => void } = {}): Promise<boolean> {
+  const list = normalizeAptPackages(pkgs);
+  if (!list.length) return false;
+  const runner = opts.runner ?? run;
+  const tag = aptImageTag(baseTag, list);
+  const base = await imageBuildLabel(baseTag, runner);
+  if (base === null) throw new MinionsError('PRECONDITION', `The base image ${baseTag} is missing.`, 'Run `minions start`: it builds the base image first.');
+  if ((await imageBuildLabel(tag, runner)) === base) return false;
+  const dockerfile = aptDockerfile(baseTag, list);
+  opts.onBuild?.(`Building image ${tag} (container.aptPackages: ${list.join(' ')})…`);
+  // Dockerfile on stdin, no build context.
+  await runner('docker', ['build', '-t', tag, '--label', `${BUILD_LABEL}=${base}`, '-'], { input: dockerfile, timeoutMs: 1_800_000 });
+  return true;
+}
+
+/** The base image, then the project's apt-derived image (container.aptPackages in project.json). True if either was built. */
+export async function ensureRuntimeImage(p: Pick<ProjectJson, 'imageTag' | 'container'>, opts: { runner?: Runner; root?: string; onBuild?: (msg: string) => void } = {}): Promise<boolean> {
+  const built = await ensureImage(p.imageTag, opts);
+  return (await ensureAptImage(p.imageTag, p.container.aptPackages, opts)) || built;
 }

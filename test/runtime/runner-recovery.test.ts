@@ -15,12 +15,13 @@ import { claimWithBrief } from '../../src/runtime/handoff.js';
 import { fakeAdapter } from '../../src/runtime/runner/adapter.js';
 import { hasRunMarker, sweepEscapees } from '../../src/runtime/runner/escapees.js';
 import {
-  acquireOwner, createRunRecord, hostIdentity, openRunsSync, ownerLockPath, ownerToken, procIdentity, readOwner, readRunRecord, runDir, runRecordPath,
+  acquireOwner, createRunRecord, hostIdentity, isAlive, openRunsSync, ownerLockPath, ownerToken, procIdentity, readOwner, readRunRecord, runDir, runRecordPath,
   withOpenRuns, type RunRecord,
 } from '../../src/runtime/runner/record.js';
 import { reapRun, recoverRuns, runLease, type ReapDeps, type RunnerDeps } from '../../src/runtime/runner/run.js';
 import { Scheduler, type TaskBrief } from '../../src/runtime/scheduler.js';
 import { gitSync, makeDefaultEnv, type Env } from './fixtures.js';
+import { HAS_PROCFS } from '../helpers.js';
 
 const SCRIPT = resolve(__dirname, '..', 'fixtures', 'fake-harness.mjs');
 const CODEX = { models: { default: 'gpt-6.1-sol', allowed: ['gpt-6.1-sol'] }, timeoutMinutes: 5 };
@@ -86,7 +87,7 @@ async function strayRecord(r: Rig, leaseId: string, taskId = 'task-1', patch: Pa
 }
 
 describe('work release reaps the run before the lease ends', () => {
-  it('a live runner is cancelled: it checkpoints a wip: commit, and the release response and note name it; the done record is removed', async () => {
+  it.skipIf(!HAS_PROCFS)('a live runner is cancelled: it checkpoints a wip: commit, and the release response and note name it; the done record is removed', async () => {
     const r = rig();
     const b = await claim(r);
     const { p } = await running(r, b, [{ op: 'write', path: 'half.txt', content: 'half\n' }, { op: 'sleep', ms: 60_000 }]);
@@ -106,7 +107,7 @@ describe('work release reaps the run before the lease ends', () => {
     expect(existsSync(join(r.paths.scratch, b.leaseId))).toBe(false);
   });
 
-  it('a lost runner: the worker group is killed and post-exit checkpoints before the lease ends; the old runner backs off', async () => {
+  it.skipIf(!HAS_PROCFS)('a lost runner: the worker group is killed and post-exit checkpoints before the lease ends; the old runner backs off', async () => {
     const r = rig();
     const b = await claim(r);
     const { p, rec } = await running(r, b, [{ op: 'write', path: 'w.txt', content: 'w\n' }, { op: 'sleep', ms: 60_000 }]);
@@ -140,7 +141,7 @@ describe('work release reaps the run before the lease ends', () => {
 });
 
 describe('owner lock: recovery never races the live runner', () => {
-  it('a live reaper holding the lock makes a second reap a CONFLICT; a dead holder is taken over', async () => {
+  it.skipIf(!HAS_PROCFS)('a live reaper holding the lock makes a second reap a CONFLICT; a dead holder is taken over', async () => {
     const r = rig();
     const b = await claim(r);
     await strayRecord(r, b.leaseId);
@@ -158,7 +159,7 @@ describe('owner lock: recovery never races the live runner', () => {
     expect(await readOwner(r.paths.state, b.leaseId)).toBeNull();
   });
 
-  it('a lock from another boot is stale even if its pid is alive here', async () => {
+  it.skipIf(!HAS_PROCFS)('a lock from another boot is stale even if its pid is alive here', async () => {
     const r = rig();
     const b = await claim(r);
     await strayRecord(r, b.leaseId);
@@ -167,7 +168,7 @@ describe('owner lock: recovery never races the live runner', () => {
     expect((await reapRun(b.leaseId, r.reapDeps({ waitMs: 200 }))).action).toBe('recovered');
   });
 
-  it('an unreadable lock fails closed', async () => {
+  it.skipIf(!HAS_PROCFS)('an unreadable lock fails closed', async () => {
     const r = rig();
     const b = await claim(r);
     await strayRecord(r, b.leaseId);
@@ -187,7 +188,7 @@ describe('owner lock: recovery never races the live runner', () => {
 });
 
 describe('re-claim gate in work claim', () => {
-  it('refuses a task while any of its leases has a record that is not done, even after an out-of-order release', async () => {
+  it.skipIf(!HAS_PROCFS)('refuses a task while any of its leases has a record that is not done, even after an out-of-order release', async () => {
     const r = rig();
     const b = await claim(r);
     await strayRecord(r, b.leaseId);
@@ -243,7 +244,7 @@ describe('re-claim gate in work claim', () => {
   });
 });
 
-describe('coordinator start and restarts', () => {
+describe.skipIf(!HAS_PROCFS)('coordinator start and restarts', () => {
   it('coordinator start (scope all) reaps records of active leases too; orphans scope leaves them to their release', async () => {
     const r = rig();
     const b = await claim(r);
@@ -277,7 +278,7 @@ describe('coordinator start and restarts', () => {
   });
 });
 
-describe('lease ended before post-exit (task-14.4 review false positive)', () => {
+describe.skipIf(!HAS_PROCFS)('lease ended before post-exit (task-14.4 review false positive)', () => {
   it('a release without a reap removes the clone mid-run: no harness violation, nothing fetched, the record says why', async () => {
     const r = rig();
     const b = await claim(r);
@@ -386,7 +387,7 @@ describe('escapee sweep (Seccomp_filters above the container baseline, injectabl
     expect(killed).toEqual([]);
   });
 
-  it('reapRun sweeps after killing the recorded group (fake /proc for the sweep, real kills only for the recorded processes)', async () => {
+  it.skipIf(!HAS_PROCFS)('reapRun sweeps after killing the recorded group (fake /proc for the sweep, real kills only for the recorded processes)', async () => {
     const r = rig();
     const b = await claim(r);
     const { p, rec } = await running(r, b, [{ op: 'sleep', ms: 60_000 }]);
@@ -400,6 +401,54 @@ describe('escapee sweep (Seccomp_filters above the container baseline, injectabl
     expect(reaped.killed).toEqual(expect.arrayContaining([rec.pgid, 777]));
     expect(r.db.events('task-1', 'run-recovered').map((e) => e.data)).toContainEqual(expect.objectContaining({ escapees: [777] }));
     await p;
+  });
+});
+
+// ------------------------------------------------------------------- group sweep only under the recorded leader (task-100)
+
+/** A detached process (it leads its own group) with one child in that group; both are this test's to clean up. */
+async function detachedGroup() {
+  const code = "const c = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' }); console.log(c.pid); setInterval(() => {}, 1000);";
+  const leader = spawn(process.execPath, ['-e', code], { detached: true, stdio: ['ignore', 'pipe', 'ignore'], env: { PATH: process.env.PATH } });
+  const memberPid = await new Promise<number>((res, rej) => {
+    let out = '';
+    leader.stdout!.on('data', (d: Buffer) => { out += String(d); if (out.includes('\n')) res(Number(out.trim())); });
+    leader.once('exit', () => rej(new Error('the decoy exited early')));
+  });
+  const ids = await Promise.all([procIdentity(leader.pid!), procIdentity(memberPid)]);
+  if (!ids[0] || !ids[1]) throw new Error('the decoy group never started');
+  return { leader, leaderId: ids[0], memberId: ids[1], cleanup: () => { try { process.kill(-leader.pid!, 'SIGKILL'); } catch { /* gone */ } } };
+}
+
+describe.skipIf(!HAS_PROCFS)('reapRun sweeps the recorded group only while the recorded wrapper still leads it', () => {
+  it('a stale record whose pgid is now a live detached decoy (other start time) leaves the decoy and its group alive', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const g = await detachedGroup();
+    try {
+      // The recorded wrapper died and its pid now leads the decoy's group: the start-time filter alone would match it.
+      await strayRecord(r, b.leaseId, 'task-1', { host: await hostIdentity(), wrapper: { pid: g.leaderId.pid, startTime: '1' }, pgid: g.leaderId.pid } as Partial<RunRecord>);
+      const reaped = await reapRun(b.leaseId, r.reapDeps());
+      expect(reaped).toMatchObject({ action: 'recovered', killed: [] });
+      expect((await readRunRecord(r.paths.state, b.leaseId))?.phase).toBe('done');
+      await sleep(200);
+      expect(await isAlive(g.leaderId)).toBe(true);
+      expect(await isAlive(g.memberId)).toBe(true);
+    } finally { g.cleanup(); }
+  });
+
+  it('a wrapper that still matches the record is killed with the rest of its group', async () => {
+    const r = rig();
+    const b = await claim(r);
+    const g = await detachedGroup();
+    try {
+      await strayRecord(r, b.leaseId, 'task-1', { host: await hostIdentity(), wrapper: g.leaderId, pgid: g.leaderId.pid } as Partial<RunRecord>);
+      const reaped = await reapRun(b.leaseId, r.reapDeps());
+      expect(reaped.action).toBe('recovered');
+      expect(reaped.killed).toEqual(expect.arrayContaining([g.leaderId.pid, g.memberId.pid]));
+      expect(await isAlive(g.leaderId)).toBe(false);
+      expect(await isAlive(g.memberId)).toBe(false);
+    } finally { g.cleanup(); }
   });
 });
 
@@ -417,7 +466,7 @@ async function stuckChild() {
   throw new Error('the child never started');
 }
 
-describe('tester regressions: reapRun against a live runner that ignores the cancel', () => {
+describe.skipIf(!HAS_PROCFS)('tester regressions: reapRun against a live runner that ignores the cancel', () => {
   it('cancel mark, bounded wait, then SIGKILL of the runner and only then the owner lock; record done, lock dropped', async () => {
     const r = rig();
     const b = await claim(r);
@@ -461,7 +510,7 @@ describe('tester regressions: reapRun against a live runner that ignores the can
 });
 
 describe('tester regressions: a refused reap keeps the lease', () => {
-  it('a release while another live reaper holds the lock is a CONFLICT: the lease stays active and the record is not done', async () => {
+  it.skipIf(!HAS_PROCFS)('a release while another live reaper holds the lock is a CONFLICT: the lease stays active and the record is not done', async () => {
     const r = rig();
     const b = await claim(r);
     await strayRecord(r, b.leaseId);

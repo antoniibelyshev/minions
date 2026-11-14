@@ -13,13 +13,16 @@ import { createStateBackup, parseStateBackup, PRE_RESTORE_KEEP } from '../../src
 import { readFileSync } from 'node:fs';
 import { defaults } from '../helpers.js';
 import { tmp } from './fixtures.js';
+// Unit tier: git and (on macOS) process liveness run on fakes (./fake-git.ts, ./fake-process-facts.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
+vi.mock('../../src/runtime/process-facts.js', async (orig) => (await import('./fake-process-facts.js')).mockProcessFacts(await orig()));
 
 let root = '';
 beforeAll(() => {
   root = tmp('minions-restore-qa-');
   mkdirSync(join(root, 'state'), { recursive: true });
   mkdirSync(join(root, 'secrets'), { recursive: true });
-  writeFileSync(join(root, 'config.json'), JSON.stringify(defaults('project-owner')));
+  writeFileSync(join(root, 'config.json'), JSON.stringify(defaults('independent')));
   process.env.MINIONS_RUNTIME = 'container';
   process.env.MINIONS_STATE_DIR = join(root, 'state');
   process.env.MINIONS_SECRETS_DIR = join(root, 'secrets');

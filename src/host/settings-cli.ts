@@ -3,14 +3,15 @@
 // right layer, regeneration of the derived files, and the graceful coordinator restart
 // (`minions coordinator restart --recover` in the runtime, the same call `minions upgrade` makes; it is
 // refused while worker leases are active, so running workers are never interrupted).
-// In the agent runtime, `settings set` and `settings restart` record a change request instead
-// (src/runtime/change-requests.ts); the owner applies it on the host (`settings apply`, src/host/change-requests.ts).
+// `settings requests [--all]` lists the upgrade requests recorded in the runtime (src/runtime/change-requests.ts).
 import type { Command } from 'commander';
+import { projectOverlayText } from './control-overlay.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
 import type { RunResult } from '../core/exec.js';
+import { displayText } from '../core/control-chars.js';
 import { MinionsError } from '../core/errors.js';
 import { emit } from '../core/output.js';
-import { formatRecord, recordRestartRequest, recordSettingRequest, withRequestContext, type RecordResult } from '../runtime/change-requests.js';
+import { formatRequestLine, formatRequests, listChangeRequests, markChangeRequest, withRequestDb, type ChangeRequestView } from '../runtime/change-requests.js';
 import { revisionConflict } from './config-write.js';
 import { Compose } from './docker.js';
 import { loadProjectJson, type ProjectJson } from './project.js';
@@ -205,8 +206,6 @@ export function formatSet(r: SetResult): string {
 
 export interface SettingsCliIO {
   confirm: (q: string) => Promise<boolean | null>;
-  /** Runs the interactive menu (src/host/settings-menu.ts). */
-  menu: (project: ProjectJson, o: { layer: SettingLayer }) => Promise<void>;
 }
 
 async function currentProject(): Promise<ProjectJson> {
@@ -217,33 +216,22 @@ async function currentProject(): Promise<ProjectJson> {
 export function registerSettings(program: Command, io: SettingsCliIO): Command {
   const runtime = defaultSettingsRuntime;
   const cmd = program.command('settings')
-    .description('View and change settings: an interactive menu, or --list / set <key> <value> for scripts')
-    .option('--list', 'list every setting with its value, source and how a change takes effect')
+    .description('List every setting with its value, source and how a change takes effect; change one with set <key> <value>')
+    .option('--list', 'the same list (the default)')
     .option('--shared', 'write to the shared .minions/config.json (shared installs; default: the host-only config.local.json)')
-    .action(action(async (o: { list?: boolean; shared?: boolean }, c: Command) => {
+    .action(action(async (_o: unknown, c: Command) => {
       requireMode('host');
-      const { json } = globalOpts(c);
-      const project = await currentProject();
-      if (o.list || json) {
-        await listAction(project, json, runtime);
-        return;
-      }
-      // Without a TTY the menu degrades to numbered prompts (terminalMenuIO); end of input quits it.
-      await io.menu(project, { layer: o.shared ? 'shared' : 'local' });
+      await listAction(await currentProject(), globalOpts(c).json, runtime);
     }));
   addSetCommand(cmd, io, runtime);
   cmd.command('restart')
-    .description('Restart the coordinator gracefully so prompt/launch settings take effect (refused while workers are active); in the runtime: record a restart request for the owner')
-    .option('--reason <text>', 'runtime: why the restart is needed (shown to the owner)')
-    .option('--dry-run', 'runtime: validate; record nothing')
-    .action(action(async (o: { reason?: string }, c: Command) => {
+    .description('Restart the coordinator gracefully so prompt/launch settings take effect (refused while workers are active)')
+    .option('--dry-run', 'show the restart; run nothing')
+    .action(action(async (_o: unknown, c: Command) => {
       if (runtimeMode() !== 'host') {
-        const { json, dryRun } = globalOpts(c);
-        const r = await withRequestContext((ctx) => recordRestartRequest(ctx, { reason: o.reason, dryRun }));
-        emit(r, { json, human: formatRecord });
-        return;
+        throw new MinionsError('INCOMPATIBLE_RUNTIME', '`settings restart` runs only in the host CLI.',
+          'In the runtime the coordinator restarts itself with a context reset: write the handoff, then `minions coordinator restart --recover --detach --json` (refused while a worker lease is active).');
       }
-      if (o.reason !== undefined) throw new MinionsError('PRECONDITION', '--reason is for restart requests recorded in the runtime; on the host the restart runs directly.');
       if (globalOpts(c).dryRun) {
         const skipped: RestartOutcome = { action: 'skipped', detail: 'dry run: would run `minions coordinator restart --recover` in the runtime (graceful; refused while worker leases are active)' };
         emit(skipped, { json: globalOpts(c).json, human: (x: RestartOutcome) => `coordinator restart: ${x.action} - ${x.detail}` });
@@ -253,13 +241,60 @@ export function registerSettings(program: Command, io: SettingsCliIO): Command {
       emit(r, { json: globalOpts(c).json, human: (x: RestartOutcome) => `coordinator restart: ${x.action} - ${x.detail}` });
       if (r.action === 'refused' || r.action === 'failed') process.exitCode = 1;
     }));
+  registerRequests(cmd, runtime);
   return cmd;
 }
 
+/**
+ * `settings requests [--all]` (runtime: its own DB; host: through the runtime) and the hidden runtime-only
+ * `settings requests mark <id> --status <s>` the host calls with its outcome (scripts/dev/self-update.mjs).
+ */
+function registerRequests(settings: Command, runtime: SettingsRuntime): void {
+  const requests = settings.command('requests')
+    .description('List the upgrade requests recorded in the runtime (`minions upgrade` run there): open ones, or every status with --all')
+    .option('--all', 'include applied, rejected and expired requests')
+    .action(action(async (o: { all?: boolean }, c: Command) => {
+      const { json } = globalOpts(c);
+      if (runtimeMode() !== 'host') {
+        const list = await withRequestDb((db) => listChangeRequests(db, { all: !!o.all }));
+        emit({ requests: list }, { json, human: () => formatRequests(list) });
+        return;
+      }
+      const project = await currentProject();
+      const list = await hostRequests(project, runtime, !!o.all);
+      emit({ projectId: project.projectId, requests: list }, { json, human: () => formatRequests(list) });
+    }));
+  requests.command('mark <requestId>', { hidden: true })
+    .description('Runtime only, called by the host: record the host\'s outcome of an upgrade request')
+    .requiredOption('--status <status>', 'confirmed | applied | failed | rejected | expired')
+    .option('--detail <text>', 'what happened')
+    .action(action(async (id: string, o: { status: string; detail?: string }, c: Command) => {
+      requireMode('runtime');
+      const v = await withRequestDb((db) => markChangeRequest(db, id, o.status, o.detail));
+      emit(v, { json: globalOpts(c).json, human: formatRequestLine });
+    }));
+}
+
+/** The runtime's requests through `minions settings requests --json` in it (the row is untrusted, shown stripped). */
+async function hostRequests(project: ProjectJson, runtime: SettingsRuntime, all: boolean): Promise<ChangeRequestView[]> {
+  if (!(await runtime.running(project))) {
+    throw new MinionsError('PRECONDITION', 'The runtime is not running, so its upgrade requests cannot be read.', 'Run `minions start --no-attach` first (requests live in the runtime database).');
+  }
+  const r = await runtime.exec(project, ['minions', 'settings', 'requests', ...(all ? ['--all'] : []), '--json']);
+  const env = lastJson<{ requests?: ChangeRequestView[] }>(r.stdout);
+  if (!env) throw new MinionsError('INTERNAL', 'upgrade requests: unexpected output from the runtime.', undefined, { stdout: r.stdout.slice(-500), stderr: r.stderr.slice(-500) });
+  if (!env.ok) throw new MinionsError('INTERNAL', `upgrade requests: ${displayText(env.error?.message ?? 'failed in the runtime')}`);
+  return Array.isArray(env.data?.requests) ? env.data.requests : [];
+}
+
 async function listAction(project: ProjectJson, json: boolean, runtime: SettingsRuntime): Promise<void> {
-  const ctx = await loadSettingsContext(project, { pausedState: (p) => runtimePaused(p, runtime) });
+  const ctx = await loadSettingsContext(project, {
+    pausedState: (p) => runtimePaused(p, runtime),
+    controlOverlay: (p) => projectOverlayText(p, { running: () => runtime.running(p), exec: (args) => runtime.exec(p, args) }),
+  });
   const views = listSettings(ctx);
-  emit({ projectId: project.projectId, settings: views }, { json, human: () => formatList(views) });
+  emit({ projectId: project.projectId, settings: views, ...(ctx.overlayWarning ? { overlayWarning: ctx.overlayWarning } : {}) },
+    { json, human: () => [formatList(views), ...(ctx.overlayWarning ? [`warning: ${ctx.overlayWarning}`] : [])].join('\n') });
 }
 
 /** `settings set` (also registered as the `config set` alias). */
@@ -272,20 +307,13 @@ export function addSetCommand(parent: Command, io: Pick<SettingsCliIO, 'confirm'
     .option('--no-restart', 'never restart the coordinator (print how to do it later)')
     .option('--dry-run', 'validate and show the change; write nothing')
     .option('--expect-revision <n>', 'refuse (CONFLICT, nothing written) unless the config is still at this configRevision')
-    .option('--reason <text>', 'runtime (required there): why the change is needed; the change is recorded as a request for the owner, not applied')
-    .action(action(async (key: string, value: string, o: { shared?: boolean; yes?: boolean; restart?: boolean; expectRevision?: string; reason?: string }, c: Command) => {
+    .action(action(async (key: string, value: string, o: { shared?: boolean; yes?: boolean; restart?: boolean; expectRevision?: string }, c: Command) => {
+      if (runtimeMode() !== 'host') {
+        throw new MinionsError('INCOMPATIBLE_RUNTIME', '`settings set` runs only in the host CLI.',
+          'In the runtime the coordinator changes configuration with `minions control set <key> <json> --reason <text> --json`.');
+      }
       const { json, dryRun } = globalOpts(c);
       const shared = !!(o.shared || (c.parent?.opts() as { shared?: boolean } | undefined)?.shared);
-      if (runtimeMode() !== 'host') {
-        const hostOnly = [o.yes ? '--yes' : null, c.getOptionValueSource('restart') === 'cli' ? (o.restart ? '--restart' : '--no-restart') : null, o.expectRevision !== undefined ? '--expect-revision' : null].filter(Boolean);
-        if (hostOnly.length) {
-          throw new MinionsError('PRECONDITION', `${hostOnly.join(', ')}: host-only option(s); in the runtime \`settings set\` only records a change request.`, 'Drop them: the owner confirms and applies the request on the host.');
-        }
-        const r: RecordResult = await withRequestContext((ctx) => recordSettingRequest(ctx, key, value, { layer: shared ? 'shared' : 'local', reason: o.reason, dryRun }));
-        emit(r, { json, human: formatRecord });
-        return;
-      }
-      if (o.reason !== undefined) throw new MinionsError('PRECONDITION', '--reason is for change requests recorded in the runtime; on the host the change is made directly.');
       const expectRevision = o.expectRevision === undefined ? undefined : parseRevision(o.expectRevision);
       const project = await currentProject();
       const def = requireSetting(key);

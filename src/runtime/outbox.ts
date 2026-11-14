@@ -1,14 +1,14 @@
 // Notification outbox (spec §611, docs/design/telegram.md#notification-outbox): every notification the
-// coordinator owes the owner (goal acknowledgements, deliveries with links, blockers, approvals,
-// on-demand status) is recorded in the runtime DB under a dedup key *before* it is sent and acknowledged
-// after. A channel outage therefore loses nothing: pending rows are retried on the next interaction or
-// `minions sync`, and a key that was delivered once is never sent again. Nothing here wakes an LLM: the
-// outbox is only read when the coordinator is awake anyway. Transport-agnostic: Telegram (the plugin's
-// `reply` tool, called by the coordinator) is one transport; tests use a fake one.
+// coordinator owes the owner (goal acknowledgements, deliveries, blockers, approvals, on-demand status) is
+// recorded in the runtime DB under a dedup key *before* it is sent and acknowledged after. A channel outage
+// therefore loses nothing: pending rows are retried on the next interaction, and a key that was delivered once is
+// never sent again. Nothing here wakes an LLM: the outbox is only read when the coordinator is awake anyway.
+// Transport-agnostic: Telegram (the plugin's `reply` tool, called by the coordinator) is one transport; tests use a
+// fake one.
 import type { RuntimeDb } from './db.js';
 import { MinionsError } from '../core/errors.js';
 
-export const NOTIFICATION_KINDS = ['goal-ack', 'delivered', 'feature', 'blocker', 'approval', 'question', 'status', 'other'] as const;
+export const NOTIFICATION_KINDS = ['goal-ack', 'delivered', 'feature', 'blocker', 'approval', 'question', 'status', 'digest', 'other'] as const;
 export type NotificationKind = (typeof NOTIFICATION_KINDS)[number];
 
 /** Telegram's message limit is 4096 characters; keep notifications short and below it. */
@@ -24,17 +24,34 @@ export interface OutboxItem {
   key: string; kind: NotificationKind; taskId: string | null; text: string; createdAt: string;
   attempts: number; lastError: string | null; nextAttemptAt: string | null;
   deliveredAt: string | null; deliveredVia: string | null;
+  /** The coordinator session that enqueued it (`general`, `task:<id>`; null: the single coordinator or the router). */
+  session: string | null;
+  /** A question the owner answered (the router routed the answer back to its session). */
+  answeredAt: string | null;
+  /** A question's choices (2 to 10): the router sends it as a native poll. */
+  options?: string[];
 }
 
 interface OutboxRow {
   dedup_key: string; kind: string; task_id: string | null; text: string; created_at: string;
   attempts: number; last_error: string | null; next_attempt_at: string | null; delivered_at: string | null; delivered_via: string | null;
+  session: string | null; answered_at: string | null; options_json?: string | null;
 }
 
 const toItem = (r: OutboxRow): OutboxItem => ({
   key: r.dedup_key, kind: r.kind as NotificationKind, taskId: r.task_id, text: r.text, createdAt: r.created_at,
   attempts: r.attempts, lastError: r.last_error, nextAttemptAt: r.next_attempt_at, deliveredAt: r.delivered_at, deliveredVia: r.delivered_via,
+  session: r.session ?? null, answeredAt: r.answered_at ?? null,
+  ...(r.options_json ? { options: parseOptions(r.options_json) } : {}),
 });
+
+function parseOptions(json: string): string[] {
+  try { const v = JSON.parse(json) as unknown; return Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []; } catch { return []; }
+}
+
+export const MAX_POLL_OPTIONS = 10;
+export const MAX_POLL_OPTION_LENGTH = 100;
+export const MAX_POLL_QUESTION_LENGTH = 300;
 
 /** A channel that can deliver one notification; it throws when the send fails. */
 export interface NotificationTransport {
@@ -280,7 +297,18 @@ function requireItem(db: RuntimeDb, key: string): OutboxItem {
   return item;
 }
 
-export interface EnqueueInput { key: string; kind: string; taskId?: string | null; text: string }
+export interface EnqueueInput {
+  key: string; kind: string; taskId?: string | null; text: string;
+  /**
+   * Held for the digest (task-68.5, src/runtime/digest.ts): `next_attempt_at` is set to this instant, so
+   * pending() does not return the item before it. A held row is one with no attempt yet and a next_attempt_at.
+   */
+  holdUntil?: string | null;
+  /** The enqueuing coordinator session (task-57 phase 8): an answer to its question routes back to it. */
+  session?: string | null;
+  /** A question's choices: sent as a native poll (the text is the poll question, at most 300 characters). */
+  options?: string[] | null;
+}
 export interface EnqueueResult { created: boolean; item: OutboxItem }
 
 /** Records a notification; an existing key (pending or delivered) is a no-op that returns the stored row. */
@@ -295,12 +323,20 @@ export function enqueue(db: RuntimeDb, input: EnqueueInput, clock: Clock = syste
   const text = input.text.trim();
   if (!text) throw new MinionsError('PRECONDITION', 'The notification text is empty.', 'Pass the text on stdin.');
   if (text.length > MAX_TEXT_LENGTH) throw new MinionsError('PRECONDITION', `The notification text is ${text.length} characters (max ${MAX_TEXT_LENGTH}).`, 'Shorten it: report outcomes, not logs.');
+  const options = input.options?.length ? input.options.map((o) => o.trim()) : null;
+  if (options) {
+    if (input.kind !== 'question') throw new MinionsError('PRECONDITION', 'Only a question has options.', 'Use --kind question.');
+    if (options.length < 2 || options.length > MAX_POLL_OPTIONS) throw new MinionsError('PRECONDITION', `A poll has 2 to ${MAX_POLL_OPTIONS} options (got ${options.length}).`);
+    if (options.some((o) => !o || [...o].length > MAX_POLL_OPTION_LENGTH)) throw new MinionsError('PRECONDITION', `Every option must be 1 to ${MAX_POLL_OPTION_LENGTH} characters.`);
+    if (new Set(options).size !== options.length) throw new MinionsError('PRECONDITION', 'The options must be distinct.');
+    if ([...text].length > MAX_POLL_QUESTION_LENGTH) throw new MinionsError('PRECONDITION', `A poll question is at most ${MAX_POLL_QUESTION_LENGTH} characters (got ${[...text].length}).`, 'Shorten the question; put the context in a separate status message first.');
+  }
   return db.transaction(() => {
     const existing = get(db, key);
     if (existing) return { created: false, item: existing };
-    db.exec('INSERT INTO outbox (dedup_key, kind, task_id, text, created_at, attempts) VALUES (?, ?, ?, ?, ?, 0)',
-      key, input.kind, input.taskId ?? null, text, clock().toISOString());
-    db.addEvent('notify-enqueue', input.taskId ?? null, { key, kind: input.kind });
+    db.exec('INSERT INTO outbox (dedup_key, kind, task_id, text, created_at, attempts, next_attempt_at, session, options_json) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)',
+      key, input.kind, input.taskId ?? null, text, clock().toISOString(), input.holdUntil ?? null, input.session ?? null, options ? JSON.stringify(options) : null);
+    db.addEvent('notify-enqueue', input.taskId ?? null, { key, kind: input.kind, ...(input.holdUntil ? { holdUntil: input.holdUntil } : {}), ...(input.session ? { session: input.session } : {}) });
     return { created: true, item: get(db, key)! };
   });
 }
@@ -317,6 +353,9 @@ export function pending(db: RuntimeDb, opts: { includeWaiting?: boolean; limit?:
   const items = rows.map(toItem);
   return opts.limit !== undefined ? items.slice(0, opts.limit) : items;
 }
+
+/** Held for the digest: undelivered, never attempted, with a next attempt time (a failed send has attempts > 0). */
+export const isHeld = (i: Pick<OutboxItem, 'attempts' | 'nextAttemptAt' | 'deliveredAt'>): boolean => !i.deliveredAt && i.attempts === 0 && i.nextAttemptAt !== null;
 
 /** Marks a notification delivered. Acknowledging an already delivered key is a no-op (it keeps the first delivery). */
 export function ack(db: RuntimeDb, key: string, via = 'unknown', clock: Clock = systemClock): { item: OutboxItem; alreadyDelivered: boolean } {
@@ -341,18 +380,23 @@ export function fail(db: RuntimeDb, key: string, error: string, clock: Clock = s
   });
 }
 
-export interface OutboxCounts { pending: number; due: number; waiting: number; delivered: number; oldestPendingAt: string | null }
+/**
+ * waiting: pending but not due yet (held + retrying, kept for older readers). held: held for the digest (no attempt
+ * yet, isHeld); retrying: failed sends waiting for their backoff (attempts > 0). Only `retrying` are failures.
+ */
+export interface OutboxCounts { pending: number; due: number; waiting: number; held: number; retrying: number; delivered: number; oldestPendingAt: string | null }
 
 export function counts(db: RuntimeDb, clock: Clock = systemClock): OutboxCounts {
   const now = clock().toISOString();
-  const r = db.get<{ pending: number; due: number; delivered: number; oldest: string | null }>(
+  const r = db.get<{ pending: number; due: number; held: number; delivered: number; oldest: string | null }>(
     `SELECT SUM(delivered_at IS NULL) AS pending,
             SUM(delivered_at IS NULL AND (next_attempt_at IS NULL OR next_attempt_at <= ?)) AS due,
+            SUM(delivered_at IS NULL AND attempts = 0 AND next_attempt_at > ?) AS held,
             SUM(delivered_at IS NOT NULL) AS delivered,
             MIN(CASE WHEN delivered_at IS NULL THEN created_at END) AS oldest
-     FROM outbox`, now);
-  const p = Number(r?.pending ?? 0), d = Number(r?.due ?? 0);
-  return { pending: p, due: d, waiting: p - d, delivered: Number(r?.delivered ?? 0), oldestPendingAt: r?.oldest ?? null };
+     FROM outbox`, now, now);
+  const p = Number(r?.pending ?? 0), d = Number(r?.due ?? 0), h = Number(r?.held ?? 0);
+  return { pending: p, due: d, waiting: p - d, held: h, retrying: p - d - h, delivered: Number(r?.delivered ?? 0), oldestPendingAt: r?.oldest ?? null };
 }
 
 export interface FlushReport { sent: string[]; failed: { key: string; error: string }[]; remaining: number }
@@ -388,5 +432,10 @@ export function formatItems(items: OutboxItem[]): string {
   return items.map((i) => `${i.key}  [${i.kind}${i.taskId ? ` ${i.taskId}` : ''}] attempts=${i.attempts}${i.lastError ? ` last error: ${i.lastError}` : ''}\n  ${i.text.split('\n').join('\n  ')}`).join('\n');
 }
 
-export const formatCounts = (c: OutboxCounts): string =>
-  `notifications: ${c.pending} pending${c.waiting ? ` (${c.waiting} waiting to retry)` : ''}${c.oldestPendingAt ? `, oldest ${c.oldestPendingAt}` : ''}`;
+export const formatCounts = (c: OutboxCounts): string => {
+  // An older status JSON (relayed from a container) has only `waiting`: show it as before.
+  const held = c.held ?? 0;
+  const retrying = c.retrying ?? (c.held === undefined ? c.waiting : 0);
+  const parts = [...(held ? [`${held} held for digest`] : []), ...(retrying ? [`${retrying} waiting to retry`] : [])];
+  return `notifications: ${c.pending} pending${parts.length ? ` (${parts.join(', ')})` : ''}${c.oldestPendingAt ? `, oldest ${c.oldestPendingAt}` : ''}`;
+};

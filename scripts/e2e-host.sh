@@ -93,7 +93,7 @@ before="$(git status --porcelain)"
 
 step "init --runtime host (no Docker)"
 init_err="$WORK/init.err"
-out="$("$M" init "$A" --yes --private --runtime host --json 2>"$init_err")"
+out="$("$M" init "$A" --mode independent --yes --private --runtime host --json 2>"$init_err")"
 ID="$(json 'd.data.plan.projectId' <<<"$out")"
 expect_eq "$(json 'd.data.plan.runtime' <<<"$out")" host "plan records the host runtime"
 json 'd.data.plan.warnings.join(" ")' <<<"$out" | grep -q 'agents run as your macOS user' || fail "init warning missing"
@@ -107,26 +107,7 @@ doc="$("$M" doctor --json || true)"  # doctor exits 1 on blocking FAIL; the chec
 expect_eq "$(json 'd.data.checks.find(c=>c.name==="runtime").status' <<<"$doc")" warn "doctor: runtime is a warn-level check"
 for t in tmux claude backlog git; do expect_eq "$(json "d.data.checks.find(c=>c.name===\"host.$t\").status" <<<"$doc")" ok "doctor: host.$t"; done
 expect_eq "$(json 'd.data.checks.some(c=>c.name.startsWith("docker."))' <<<"$doc")" false "doctor does not check Docker"
-
-step "GitHub setup hints (--yes: no prompt, push or browser)"
-gs="$("$M" setup github --yes --json)"
-expect_eq "$(json 'd.data.remote.status' <<<"$gs")" missing "setup github sees no remote"
-json 'd.data.nextSteps.join(" ")' <<<"$gs" | grep -q 'minions setup github' || fail "setup github hints"
-expect_eq "$(json 'd.data.checks.find(c=>c.name==="github.setup").status' <<<"$doc")" ok "doctor has a github.setup check"
-expect_eq "$(git remote)" "" "no remote added"
-
-step "Setup assistant (never launched by init --yes; dry-run plan; needs a terminal)"
-[ ! -e "$WORK/fake/claude.json" ] && ok "init --yes did not launch claude" || fail "init --yes launched claude"
 expect_eq "$(json 'd.data.checks.find(c=>c.name==="setup").status' <<<"$doc")" ok "doctor: setup check (verification commands inferred)"
-sa="$("$M" setup assist --dry-run --json)"
-expect_eq "$(json 'd.data.args[d.data.args.indexOf("--permission-mode")+1]' <<<"$sa")" default "assistant permission mode default"
-expect_eq "$(json 'd.data.args.some(a=>/^(bypassPermissions|acceptEdits|auto|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)$/.test(a))' <<<"$sa")" false "assistant never bypasses permissions"
-expect_eq "$(json 'd.data.args.includes("Bash(git push*)") && d.data.args.includes("Bash(minions runtime set*)")' <<<"$sa")" true "assistant denies push and runtime set"
-expect_eq "$(json 'd.data.cwd' <<<"$sa")" "$A" "assistant runs in the repository root"
-[ ! -e "$P/assistant-plugin" ] && ok "dry-run wrote nothing" || fail "dry-run wrote the assistant plugin"
-set +e; "$M" setup assist --json </dev/null >/dev/null 2>&1; rc=$?; set -e
-expect_eq "$rc" 11 "setup assist without a terminal fails (PRECONDITION)"
-[ ! -e "$WORK/fake/claude.json" ] && ok "claude not launched without a terminal" || fail "claude launched without a terminal"
 
 step "start --no-attach: warning, separate workspace clone, state"
 start_err="$WORK/start.err"
@@ -167,9 +148,8 @@ deny="$(printf '{"tool_name":"Agent","tool_input":{"subagent_type":"minions:engi
 expect_eq "$(json 'd.hookSpecificOutput.permissionDecision' <<<"$deny")" deny "pre-agent hook denies an unclaimed worker"
 H="$(cd "$WT" && echo 'console.log("hello")' > hello.js && git add hello.js && git -c commit.gpgsign=false commit -qm 'Add greeting' && git rev-parse HEAD)"
 result() { printf '{"status":"complete","summary":"done","branch":"%s","headSha":"%s","modifiedPaths":["hello.js"],"checks":[{"command":"npm test","outcome":"pass"}],"acceptanceEvidence":[{"criterion":"prints hello","evidence":"hello.js"}],"findings":[],"nextAction":"next"%s}' "$BRANCH" "$H" "${1:-}"; }
-expect_eq "$(result | "$SHIM" work record "$LEASE" --json | json 'd.data.to')" testing "engineer -> testing"
-L2="$("$SHIM" work claim "$T" --role tester --json | json 'd.data.leaseId')"
-expect_eq "$(result | "$SHIM" work record "$L2" --json | json 'd.data.to')" reviewing "tester -> reviewing"
+# No QA label: the default workflow skips the tester stage.
+expect_eq "$(result | "$SHIM" work record "$LEASE" --json | json 'd.data.to')" reviewing "engineer -> reviewing"
 L3="$("$SHIM" work claim "$T" --role reviewer --json | json 'd.data.leaseId')"
 expect_eq "$(result ',"verdict":"approve"' | "$SHIM" work record "$L3" --json | json 'd.data.to')" delivered "reviewer approve -> delivered"
 
@@ -179,14 +159,6 @@ expect_eq "$("$M" status --json | json 'd.data.paused.starts')" true "status"
 expect_eq "$("$M" status --json | json 'd.data.channel.configured+" "+d.data.channel.effective')" "auto terminal" "status: channel auto is terminal in the host runtime"
 expect_eq "$("$M" channel show --json | json 'd.data.cause')" "no-token" "channel show in the host runtime"
 expect_eq "$("$M" resume --json | json 'd.data.paused.starts')" false "resume"
-
-step "git credential helper through the shim (quoted path with a space; fake token file)"
-FAKE_TOKEN="ghp_fakeE2eHostToken00000000000000000000"
-printf '%s\n' "$FAKE_TOKEN" > "$P/secrets/github-token"; chmod 600 "$P/secrets/github-token"
-helper="!'$SHIM' git-credential"
-cred="$(printf 'protocol=https\nhost=github.com\n\n' | git -C "$W" -c credential.helper= -c credential.helper="$helper" credential fill)"
-expect_eq "$(grep '^password=' <<<"$cred")" "password=$FAKE_TOKEN" "helper answers with the project token (not the user's GH_TOKEN)"
-rm -f "$P/secrets/github-token"
 
 step "coordinator launch (fake tmux + fake claude) and down"
 "$SHIM" coordinator sync --start-detached --json >/dev/null
@@ -199,6 +171,53 @@ expect_eq "$("$M" down --json | json 'd.data.wasRunning')" true "down stops the 
 grep -q "tmux -L minions-${ID:0:8} kill-server" "$WORK/fake/tmux.log" || fail "down did not kill the dedicated server"
 grep -v -- ' -L ' "$WORK/fake/tmux.log" | grep -Eq 'session|server' && fail "a tmux call used the default server"
 ok "only the dedicated tmux server was used"
+
+step "upgrade on the host runtime (task-7): dry run, drain, shim regeneration, coordinator restart, refusals"
+ntmux() { grep -c "new-session" "$WORK/fake/tmux.log" || true; }
+"$SHIM" coordinator sync --start-detached --json >/dev/null
+shim_before="$(cat "$SHIM")"
+dry="$("$M" upgrade --dry-run --json)"
+expect_eq "$(json 'd.data.steps.some(s=>["image","recreate","origin"].includes(s.id))' <<<"$dry")" false "upgrade dry run: no image, recreate or origin step"
+expect_eq "$(json '["preflight","pause","drain","files","secrets","shim","workspace","resume","coordinator"].every(id=>d.data.steps.some(s=>s.id===id&&s.detail))' <<<"$dry")" true "upgrade dry run explains every host step"
+expect_eq "$(cat "$SHIM")" "$shim_before" "upgrade dry run leaves the shim"
+T2="$("$SHIM" backlog create --title "Upgrade drain" --ac "x" --key k-upgrade --status ready --json | json 'd.data.task.id')"
+UL="$("$SHIM" work claim "$T2" --role engineer --json | json 'd.data.leaseId')"
+nl="$("$M" status --json | json 'd.data.activeLeases.length')"
+n0="$(ntmux)"
+set +e; "$M" upgrade --timeout 1 --json >/dev/null 2>&1; rc=$?; set -e
+expect_eq "$rc" 11 "upgrade with an active lease aborts at the drain timeout"
+expect_eq "$(ntmux)" "$n0" "aborted upgrade did not restart the coordinator"
+expect_eq "$("$M" status --json | json 'd.data.paused.starts+" "+d.data.activeLeases.length')" "false $nl" "aborted upgrade resumed starts and kept the lease"
+expect_eq "$(cat "$SHIM")" "$shim_before" "aborted upgrade left the shim"
+# A new CLI install (a copy of the prefix): the upgrade run by it points the shim at it.
+cp -R "$PREFIX" "$WORK/prefix2"
+M2="$WORK/prefix2/node_modules/minions/dist/cli.js"
+up="$(node "$M2" upgrade --now --json 2>/dev/null)"
+expect_eq "$(json "d.data.ok && d.data.interrupted.some(l=>l.id==='$UL')" <<<"$up")" true "upgrade --now released the lease, then finished"
+expect_eq "$(json 'd.data.steps.find(s=>s.id==="coordinator").status' <<<"$up")" done "coordinator restarted after the release"
+[ "$(ntmux)" -gt "$n0" ] && ok "coordinator relaunched" || fail "coordinator not relaunched"
+grep -qF "$M2" "$SHIM" && ok "shim points at the CLI that ran the upgrade" || fail "shim not regenerated"
+# (host commands such as status rewrite the shim for the CLI that runs them, so this check comes first)
+expect_eq "$("$M" status --json | json 'd.data.activeLeases.length')" 0 "no worker lease left after the upgrade"
+# A CLI inside (or linked into) the agent-writable workspace is refused before anything changes.
+EVIL="$P/host/workspace/evil"
+cp -R "$PREFIX" "$EVIL" && ln -s "$EVIL" "$WORK/linked-cli"
+shim_now="$(cat "$SHIM")"
+set +e; e1="$(node "$EVIL/node_modules/minions/dist/cli.js" upgrade --dry-run --json 2>/dev/null)"; set -e
+expect_eq "$(json 'd.data.steps.find(s=>s.id==="preflight").status' <<<"$e1")" failed "dry run from a workspace CLI fails the preflight"
+set +e; node "$WORK/linked-cli/node_modules/minions/dist/cli.js" upgrade --now --json >/dev/null 2>&1; rc=$?; set -e
+expect_eq "$rc" 11 "upgrade through a link into the workspace is refused"
+expect_eq "$(cat "$SHIM")" "$shim_now" "refused upgrade left the shim"
+rm -rf "$EVIL" "$WORK/linked-cli"
+# The runtime records an upgrade request; the owner applies it: export, fast-forward, upgrade, marked applied.
+WH="$(cd "$W" && git -c user.name=a -c user.email=a@b -c commit.gpgsign=false commit -q --allow-empty -m "merged in the runtime" && git rev-parse HEAD)"
+RID="$("$SHIM" upgrade --from-container --reason "self-update" --json | json 'd.data.request.id')"
+"$M" export --json >/dev/null
+"$M" upgrade --from-container --json >/dev/null 2>&1
+expect_eq "$(git -C "$A" rev-parse main)" "$WH" "upgrade --from-container fast-forwarded main from the host workspace"
+"$SHIM" settings requests mark "$RID" --status applied --json >/dev/null
+expect_eq "$("$SHIM" settings requests --all --json | json "d.data.requests.find(r=>r.id==='$RID').status")" applied "upgrade request marked applied"
+"$M" down --json >/dev/null
 
 step "export into refs/remotes/minions/*"
 heads_before="$(git for-each-ref refs/heads)"

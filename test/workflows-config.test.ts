@@ -2,8 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { validateConfig } from '../src/config/resolve.js';
 import type { MinionsConfig } from '../src/config/schema.js';
 import {
-  claimableStatuses, derivePosition, derivedDefaultWorkflow, nextRunnable, repairTarget, resolveWorkflow, verifierBefore, withQaTester,
-  workflowConfigIssues, workflowNames, type Stage,
+  claimableStatuses, derivePosition, derivedDefaultWorkflow, repairTarget, resolveWorkflow, workflowConfigIssues, workflowNames, type Stage,
 } from '../src/config/workflows.js';
 import type { MinionsError } from '../src/core/errors.js';
 import { checkWorkflowName } from '../src/backlog/commands.js';
@@ -19,15 +18,22 @@ const writer = { description: 'Writes.', promptText: 'Write it.', contract: 'pro
 const checker = { description: 'Checks.', promptText: 'Check it.', contract: 'verifier' as const };
 
 describe('workflow config', () => {
-  it('derives the default workflow from the verification settings (today\'s pipeline)', () => {
+  it('derives the default workflow from the verification settings: engineer, then the reviewer (no tester)', () => {
     const cfg = defaults();
     expect(cfg.workflows).toBeUndefined();
-    expect(derivedDefaultWorkflow(cfg)).toEqual([{ role: 'engineer' }, { role: 'tester', when: 'qa' }, { role: 'reviewer' }]);
+    expect(derivedDefaultWorkflow(cfg)).toEqual([{ role: 'engineer' }, { role: 'reviewer' }]);
     expect(resolveWorkflow(cfg, null)).toEqual({ name: 'default', stages: derivedDefaultWorkflow(cfg) });
-    const strict = { ...cfg, verification: { ...cfg.verification, testerRequired: true } };
-    expect(derivedDefaultWorkflow(strict)).toEqual([{ role: 'engineer' }, { role: 'tester' }, { role: 'reviewer' }]);
     const noReview = { ...cfg, verification: { ...cfg.verification, reviewerRequired: false } };
-    expect(derivedDefaultWorkflow(noReview)).toEqual([{ role: 'engineer' }, { role: 'tester', when: 'qa' }]);
+    expect(derivedDefaultWorkflow(noReview)).toEqual([{ role: 'engineer' }]);
+  });
+
+  it('old configs load: testerRequired and qaLabels are dropped, and so are `when: "qa"` stages', () => {
+    const d = defaults();
+    const cfg = validateConfig({ ...d, verification: { ...d.verification, testerRequired: true, qaLabels: ['qa'] },
+      workflows: { docs: ['engineer', { role: 'tester', when: 'qa' }, { role: 'reviewer', model: 'haiku' }] } });
+    expect(cfg.verification).not.toHaveProperty('testerRequired');
+    expect(cfg.verification).not.toHaveProperty('qaLabels');
+    expect(resolveWorkflow(cfg, 'docs')!.stages).toEqual([{ role: 'engineer' }, { role: 'reviewer', model: 'haiku' }]);
   });
 
   it('accepts the documented workflows and a workflows.default override', () => {
@@ -80,22 +86,7 @@ describe('workflow config', () => {
 describe('stage machine helpers', () => {
   const cfg = validateConfig({ ...defaults(), roles: { researcher, writer, checker: { ...checker, repairTo: 'researcher' } } });
   const docs: Stage[] = [{ role: 'engineer' }, { role: 'reviewer', model: 'haiku' }];
-  const dflt = derivedDefaultWorkflow(cfg);
-
-  it('QA insertion (invariant 3): the tester goes before the final gate unless a verifier already runs there', () => {
-    expect(withQaTester(cfg, docs, 0)).toEqual([{ role: 'engineer' }, { role: 'tester', inserted: 'qa' }, { role: 'reviewer', model: 'haiku' }]);
-    expect(withQaTester(cfg, dflt, 0)).toBe(dflt); // the conditional tester is a runnable verifier when QA is required
-    expect(withQaTester(cfg, [{ role: 'engineer' }], 0)).toEqual([{ role: 'engineer' }, { role: 'tester', inserted: 'qa' }]);
-    expect(withQaTester(cfg, [{ role: 'researcher' }, { role: 'checker' }, { role: 'reviewer' }], 0).map((s) => s.role)).toEqual(['researcher', 'checker', 'reviewer']);
-    expect(verifierBefore(cfg, docs, 1)).toEqual({ stages: [{ role: 'engineer' }, { role: 'tester', inserted: 'qa' }, { role: 'reviewer', model: 'haiku' }], position: 1 });
-    expect(verifierBefore(cfg, dflt, 2)).toEqual({ stages: dflt, position: 1 });
-  });
-
-  it('skips when:qa stages without QA reasons', () => {
-    expect(nextRunnable(dflt, 0, false)).toBe(2);
-    expect(nextRunnable(dflt, 0, true)).toBe(1);
-    expect(nextRunnable(dflt, 2, true)).toBeNull();
-  });
+  const dflt: Stage[] = [{ role: 'engineer' }, { role: 'tester' }, { role: 'reviewer' }];
 
   it('repair targets: repairTo, else the nearest earlier committing producer (never a verifier by default)', () => {
     expect(repairTarget(cfg, dflt, 2)).toBe(0);
@@ -112,8 +103,24 @@ describe('stage machine helpers', () => {
     for (const s of ['ready', 'changes-requested', 'implementing'] as const) expect(derivePosition(cfg, dflt, s)).toEqual({ stages: dflt, position: 0 });
     expect(derivePosition(cfg, dflt, 'testing')).toEqual({ stages: dflt, position: 1 });
     expect(derivePosition(cfg, dflt, 'reviewing')).toEqual({ stages: dflt, position: 2 });
-    expect(derivePosition(cfg, docs, 'testing')).toEqual({ stages: withQaTester(cfg, docs, 0), position: 1 });
+    // A `testing` task from before the verify step (no testing stage): the built-in tester is inserted before the gate.
+    expect(derivePosition(cfg, docs, 'testing')).toEqual({ stages: [{ role: 'engineer' }, { role: 'tester', inserted: 'legacy' }, { role: 'reviewer', model: 'haiku' }], position: 1 });
     expect(derivePosition(cfg, dflt, 'blocked')).toBeNull();
     expect(derivePosition(cfg, dflt, 'delivered')).toBeNull();
+  });
+});
+
+describe('flow end markers (docs/design/autonomy.md Decision 2)', () => {
+  it('splits "ci" and "merge" off the worker stages', () => {
+    const cfg = validateConfig({ ...defaults(), workflows: { full: ['engineer', 'tester', 'reviewer', 'ci', 'merge'], review: ['engineer', 'reviewer'], nomerge: ['engineer', 'reviewer', 'ci'] } });
+    expect(resolveWorkflow(cfg, 'full')).toEqual({ name: 'full', stages: [{ role: 'engineer' }, { role: 'tester' }, { role: 'reviewer' }], end: { ci: true, merge: true } });
+    expect(resolveWorkflow(cfg, 'review')!.end).toBeUndefined();
+    expect(resolveWorkflow(cfg, 'nomerge')!.end).toEqual({ ci: true, merge: false });
+  });
+  it('refuses markers before a worker stage, twice, or alone; and as role names', () => {
+    expect(issuesOf({ workflows: { bad: ['engineer', 'merge', 'reviewer'] } } as never).map((i) => i.message)).toContain('"ci" and "merge" end the flow: put them after every worker stage');
+    expect(issuesOf({ workflows: { bad: ['engineer', 'reviewer', 'merge', 'merge'] } } as never).map((i) => i.message)).toContain('each end marker ("ci", "merge") at most once');
+    expect(issuesOf({ workflows: { bad: ['merge'] } } as never).map((i) => i.message)).toContain('a flow needs at least one worker stage');
+    expect(issuesOf({ roles: { merge: { description: 'x', promptText: 'x', contract: 'producer' } } } as never).length).toBeGreaterThan(0);
   });
 });

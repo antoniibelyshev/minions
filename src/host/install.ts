@@ -4,27 +4,28 @@ import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { z } from 'zod';
 import { can } from '../config/capabilities.js';
+import { toMode } from '../config/modes.js';
 import { DEFERRED_FEATURES, listUnavailable, validateConfig, type Unavailable } from '../config/resolve.js';
-import { CAPABILITIES, type Effect, type MinionsConfig, type Profile } from '../config/schema.js';
+import { CAPABILITIES, type Effect, type MinionsConfig, type Mode } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, ensureDir, exists, readJsonIfExists, sha256, writeJson } from '../core/fsutil.js';
-import { GITHUB_TOKEN_CONTAINER_PATH, TELEGRAM_TOKEN_CONTAINER_PATH, imageTag, projectPaths, registryPath, repoPaths, volumeNames } from '../core/paths.js';
+import { TELEGRAM_TOKEN_CONTAINER_PATH, imageTag, projectPaths, registryPath, repoPaths, volumeNames } from '../core/paths.js';
 import { VERSION } from '../core/version.js';
 import { generatePlugin } from '../plugin/generate.js';
-import { ciSetupPlan } from '../runtime/ci.js';
+import { GOALS_FILE, GOALS_MAX_BYTES } from '../runtime/goals.js';
 import { discover, dockerProbe, type Discovery, type DockerProbe, type DockerStatus } from './discovery.js';
 import { authOf, ensureSecretsDir, isKeyAuth, loadDefaults, resolveOnPath, summarize, type AuthSummary, type ClaudeAuth } from './auth.js';
 import {
-  backendLabel, githubRepoFromRemote, githubTokenGuidance, loadCredentialRefs, provisionTelegramToken,
-  type CredentialsJson, type Fetch, type ProvisionResult, type TelegramProvisionResult,
+  backendLabel, loadCredentialRefs, provisionTelegramToken,
+  type CredentialsJson, type Fetch, type TelegramProvisionResult,
 } from './credentials.js';
-import { composeYaml, type Runner } from './docker.js';
+import { composeYaml, resolveGpus, type Runner } from './docker.js';
 import { composeHint, daemonHint } from './linux-host.js';
-import { ProjectJsonSchema, loadEffectiveConfig, projectConfigPath, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
+import { ProjectJsonSchema, loadEffectiveConfig, loadProjectJson, projectConfigPath, resolveEffective, runtimeProjectInfo, sharedConfigView, type ProjectJson } from './project.js';
 import { bindProject, gitCommonDir, loadRegistry, repoRoot, resolveIdentity, saveRegistry, sharedProjectId, type Identity, type Registry } from './registry.js';
-import { runWizard, type WizardIO } from './wizard.js';
-import { runGithubSetup, type GithubSetupResult } from './github-setup.js';
-import { HOST_CONFIRM_WORD, HOST_RUNTIME_SHORT, HOST_RUNTIME_WARNING, RUNTIMES, type RuntimeKind } from './runtime.js';
+import { bootstrapRepo } from './repo-bootstrap.js';
+import { askMode, modeRequired, runWizard, type WizardIO } from './wizard.js';
+import { HOST_RUNTIME_SHORT, HOST_RUNTIME_WARNING, runtimeOf, type RuntimeKind } from './runtime.js';
 import { hostRuntimePaths } from '../core/paths.js';
 
 // ---------------------------------------------------------------- manifest + journal
@@ -104,7 +105,7 @@ export interface InstallPlan {
   repoPath: string;
   gitCommonDir: string;
   visibility: 'shared' | 'private';
-  profile: Profile;
+  mode: Mode;
   writes: PlannedWrite[];
   permissions: Record<Effect, string[]>;
   verificationCommands: string[];
@@ -125,7 +126,8 @@ interface Desired { path: string; content: Buffer; inRepo: boolean; note?: strin
 
 export interface InitOptions {
   path: string;
-  profile?: Profile;
+  /** Required for a new project unless interactive (asked first) or --config. */
+  mode?: Mode;
   visibility?: 'shared' | 'private';
   yes?: boolean;
   configFile?: string;
@@ -133,56 +135,24 @@ export interface InitOptions {
   attach?: boolean;
   newIdentity?: boolean;
   io?: WizardIO;
-  /**
-   * `minions setup`: the wizard skips the delivery/channel questions and init does not offer the
-   * GitHub/Telegram token prompts; setup asks for them itself after the plan is applied.
-   */
+  /** `minions setup`: init does not offer the Telegram token prompt; setup asks for it after the plan is applied. */
   skipIntegrations?: boolean;
   /**
-   * Rerun with an existing configuration: run the wizard again with the existing values as defaults
-   * (visibility stays as installed) instead of reusing the configuration unchanged.
+   * Rerun with an existing configuration: ask the mode again (the current one is the default) and rebuild the
+   * configuration (visibility stays as installed) instead of reusing it unchanged.
    */
   reconfigure?: boolean;
   dockerProbe?: DockerProbe;
   runner?: Runner;
   /** Wizard: whether `central` is on PATH (default: PATH lookup, never executed). */
   centralOnPath?: boolean;
-  /** GitHub API client for token verification (tests). */
+  /** Telegram Bot API client for token verification (tests). */
   fetch?: Fetch;
-  /** --runtime docker|host (host-only setting; repository config can never select it). */
+  /** --runtime docker|host (host-only setting; repository config can never select it). Default: the mode's. */
   runtime?: RuntimeKind;
-  /** Opens the token page after an explicit yes (tests; default `open` on macOS). */
-  openUrl?: (url: string) => Promise<void>;
 }
 
 interface Prepared { plan: InstallPlan; desired: Desired[]; manifest: Manifest | undefined; registry: Registry; cleanup: () => Promise<void> }
-
-/**
- * Wizard step 0: agent runtime. Docker is the default; choosing host shows the warning and needs the
- * typed confirmation word, otherwise Docker is kept.
- */
-async function askRuntime(io: WizardIO, def: RuntimeKind, docker: DockerStatus | undefined, notes: string[]): Promise<RuntimeKind> {
-  const dockerOk = !docker || (docker.daemon && docker.compose);
-  io.info(`Agent runtime: docker (hardened container, recommended${dockerOk ? '' : '; Docker is not reachable right now'}) or host (no Docker; less safe).`);
-  let pick: RuntimeKind = def;
-  for (let i = 0; ; i++) {
-    const a = (await io.ask('Agent runtime (docker/host)', def)).trim();
-    if ((RUNTIMES as readonly string[]).includes(a)) { pick = a as RuntimeKind; break; }
-    if (i >= 2) throw new MinionsError('INVALID_CONFIG', 'Agent runtime: choose docker or host.');
-    io.info('  choose one of: docker, host');
-  }
-  if (pick !== 'host') return pick;
-  return confirmHostRuntime(io, notes);
-}
-
-/** Shows the warning and asks for the typed confirmation word; anything else keeps Docker. */
-async function confirmHostRuntime(io: WizardIO, notes: string[]): Promise<RuntimeKind> {
-  for (const l of HOST_RUNTIME_WARNING) io.info(l);
-  const typed = (await io.ask(`Type "${HOST_CONFIRM_WORD}" to run agents without Docker (anything else keeps Docker)`, '')).trim();
-  if (typed === HOST_CONFIRM_WORD) return 'host';
-  notes.push('Host runtime not confirmed; using the Docker runtime.');
-  return 'docker';
-}
 
 const json = (v: unknown) => Buffer.from(JSON.stringify(v, null, 2) + '\n');
 
@@ -191,7 +161,7 @@ function sharedReadme(): string {
 
 This directory holds the shared [minions](https://github.com/) configuration for this repository.
 
-- \`config.json\` — project configuration (profile, policy, limits). Commit it to share the setup.
+- \`config.json\` — project configuration (mode, policy, limits). Commit it to share the setup.
 - Runtime state, backlog, credentials, and Claude login live in per-project Docker volumes on
   each developer's machine, never in this directory.
 
@@ -229,11 +199,12 @@ const isInside = (child: string, parent: string) => {
 
 async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepared> {
   if (!(await exists(opts.path))) throw new MinionsError('NOT_FOUND', `Path not found: ${opts.path}`);
+  const bootstrapped = await bootstrapRepo(opts.path, { dryRun: opts.dryRun, ...(opts.runner ? { runner: opts.runner } : {}) });
   const repoPath = await repoRoot(opts.path);
   const commonDir = await gitCommonDir(repoPath);
   const discovery = await discover(repoPath, opts.runner);
   const registry = await loadRegistry();
-  const notes: string[] = [];
+  const notes: string[] = [...bootstrapped];
   const warnings: string[] = [];
 
   const registered = Object.entries(registry.projects).find(([, e]) => e.gitCommonDir === commonDir);
@@ -265,53 +236,52 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
   if (visibility === 'shared' && sharedExists) { existingRaw = await readJsonIfExists(sharedPath); existingFile = sharedPath; }
   else if (visibility !== 'shared' && await exists(paths.configJson)) { existingRaw = await readJsonIfExists(paths.configJson); existingFile = paths.configJson; }
 
-  // Claude authorization and the runtime are host-only: previous project.json, else
-  // <MINIONS_HOME>/defaults.json, else login / docker.
+  // Claude authorization, the git identity and the runtime are host-only: previous project.json, else
+  // <MINIONS_HOME>/defaults.json, else login / git config / the mode's runtime.
   const defaults = await loadDefaults();
   const interactive = !!opts.io && !opts.yes && !opts.configFile;
-  // The host runtime is never inherited silently: a non-interactive init uses it only for an existing
-  // host project or an explicit `--runtime host --yes`; a host-wide default of host applies interactively
-  // (the wizard asks, with the typed confirmation).
-  const inheritedHost = !opts.runtime && !prevProject?.runtime && defaults.runtime === 'host';
-  let runtime: RuntimeKind = opts.runtime ?? prevProject?.runtime ?? (inheritedHost && !interactive ? 'docker' : defaults.runtime) ?? 'docker';
-  if (inheritedHost && !interactive) notes.push('defaults.json selects the host runtime, but a non-interactive init never inherits it; using Docker. Pass `--runtime host --yes` to choose it explicitly.');
-  if (!opts.runtime && interactive) runtime = await askRuntime(opts.io!, runtime, docker, notes);
-  else if (opts.runtime === 'host' && prevProject?.runtime !== 'host') {
-    if (interactive) runtime = await confirmHostRuntime(opts.io!, notes);
-    else if (!opts.yes && !opts.dryRun) {
-      throw new MinionsError('PRECONDITION', '--runtime host needs confirmation: agents would run as your macOS user without Docker.',
-        'Rerun interactively and type the confirmation word, or pass `--runtime host --yes`.');
-    }
+  const reconfigure = !!opts.reconfigure && !!existingRaw && !opts.configFile && !opts.yes;
+  const existingMode = existingRaw ? toMode(existingRaw.mode) ?? toMode(existingRaw.profile) : undefined;
+  // The mode: the existing configuration's (a rerun), else --mode, else asked first; never a default.
+  let mode: Mode | undefined = existingRaw && !opts.configFile && !reconfigure ? existingMode : opts.mode;
+  if (existingRaw && !opts.configFile && !reconfigure && opts.mode && opts.mode !== existingMode) {
+    warnings.push(`--mode ${opts.mode} ignored: the existing configuration uses ${existingMode}; change it with \`minions mode set ${opts.mode}\`.`);
   }
+  if (!mode && interactive) mode = await askMode(opts.io!, reconfigure ? existingMode : undefined);
+  if (!mode && opts.configFile) {
+    const raw = await readJsonIfExists<Record<string, unknown>>(opts.configFile);
+    mode = toMode(raw?.mode) ?? toMode(raw?.profile);
+  }
+  if (!mode) {
+    if (existingRaw && !opts.configFile) throw new MinionsError('INVALID_CONFIG', `${existingFile} has no valid mode.`, 'Set "mode" to independent or supervised, then rerun init.');
+    throw modeRequired();
+  }
+  // A new project: independent runs in Docker unless --runtime says otherwise, supervised on the host unless
+  // defaults.json says otherwise. An installed project keeps its runtime (`minions runtime set` changes it).
+  const runtime: RuntimeKind = opts.runtime ?? (prevProject ? runtimeOf(prevProject)
+    : mode === 'independent' ? 'docker' : defaults.runtime ?? 'host');
   if (runtime === 'docker' && docker && !opts.dryRun && (!docker.daemon || !docker.compose)) throw dockerUnavailable(docker);
   if (runtime === 'host') warnings.push(`${HOST_RUNTIME_SHORT}`);
   let claudeAuth: ClaudeAuth | undefined = prevProject?.claudeAuth ?? defaults.claudeAuth;
+  const gitIdentity = { name: defaults.git?.name ?? discovery.git.userName ?? '', email: defaults.git?.email ?? discovery.git.userEmail ?? '' };
   let config!: MinionsConfig;
-  const reconfigure = !!opts.reconfigure && !!existingRaw && !opts.configFile && !opts.yes;
   if (existingRaw && !opts.configFile) {
-    const profile = (existingRaw.profile as Profile | undefined) ?? 'project-owner';
     const ctx = {
-      projectId, profile,
+      projectId, mode: existingMode ?? mode,
       baseBranch: prevProject?.baseBranch ?? discovery.git.baseBranch,
-      gitIdentity: prevProject?.gitIdentity ?? { name: discovery.git.userName ?? '', email: discovery.git.userEmail ?? '' },
+      gitIdentity: prevProject?.gitIdentity ?? gitIdentity,
     };
     if (!ctx.gitIdentity.name || !ctx.gitIdentity.email) {
-      throw new MinionsError('PRECONDITION', 'Git identity (user.name / user.email) is not configured for this repository.',
-        'Run `git config user.name "…"` and `git config user.email "…"`, then rerun init.');
+      throw new MinionsError('PRECONDITION', 'Git identity for agent commits is not configured.',
+        'Run `minions defaults set git.name <name>` and `minions defaults set git.email <email>` (or set git user.name/user.email), then rerun init.');
     }
     config = resolveEffective(ctx, { ...existingRaw, projectId }, undefined, { project: existingFile! }).config;
-    if (opts.profile && opts.profile !== config.profile && !reconfigure) {
-      warnings.push(`--profile ${opts.profile} ignored: existing configuration uses ${config.profile}; edit ${existingFile} to change it.`);
-    }
     notes.push(`Reusing existing configuration ${existingFile}.`);
   }
   if (!existingRaw || opts.configFile || reconfigure) {
-    // Branch/PR delivery is selectable only when a GitHub token is already stored for this project.
-    const githubCredential = discovery.git.hasGitHub &&
-      !!(await loadCredentialRefs(projectId).catch((): CredentialsJson => ({ version: 1 }))).github;
     const r = await runWizard({
-      discovery, projectId, profile: opts.profile, visibility: reconfigure ? visibility ?? config.visibility : visibility, configFile: opts.configFile,
-      yes: !!opts.yes, io: opts.io, githubCredential, runtime, skipIntegrations: opts.skipIntegrations,
+      discovery, projectId, mode, visibility: reconfigure ? visibility ?? config.visibility : visibility, configFile: opts.configFile,
+      yes: !interactive, io: opts.io, runtime, gitIdentity: defaults.git,
       auth: { default: claudeAuth, centralOnPath: opts.centralOnPath ?? !!(await resolveOnPath('central')) },
       ...(reconfigure ? { existing: config } : {}),
     });
@@ -326,15 +296,17 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
   const project: ProjectJson = {
     version: 1, projectId,
     repoPath: prevProject && await exists(prevProject.repoPath) && identity.source !== 'attached' ? prevProject.repoPath : repoPath,
-    gitCommonDir: commonDir, visibility: vis, profile: config.profile, imageTag: imageTag(VERSION),
+    gitCommonDir: commonDir, visibility: vis, mode: config.mode, imageTag: imageTag(VERSION),
     baseBranch: config.git.baseBranch, remoteUrl: discovery.git.remoteUrl, gitIdentity: config.git.identity,
     container: {
       cpus: config.container.cpus, memoryMiB: config.container.memoryMiB, pidsLimit: config.container.pidsLimit,
       ...(config.container.tmpSizeMiB !== undefined ? { tmpSizeMiB: config.container.tmpSizeMiB } : {}),
       publishPorts: config.container.publishPorts, network: config.container.network,
+      ...(resolveGpus(config.container.gpus) ? { gpus: 'nvidia' as const } : {}),
     },
     ...(claudeAuth ? { claudeAuth } : {}),
     ...(runtime === 'host' || prevProject?.runtime || opts.runtime ? { runtime } : {}),
+    ...(prevProject?.telegramOwner ?? defaults.telegram?.owner ? { telegramOwner: prevProject?.telegramOwner ?? defaults.telegram?.owner } : {}),
   };
 
   // Project config layer as written to disk, and the effective config for the runtime.
@@ -350,11 +322,13 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
   add(paths.composeYaml, composeYaml(project));
   add(join(paths.runtimeDir, 'config.json'), json(effective));
   add(join(paths.runtimeDir, 'project.json'), json(runtimeProjectInfo(project)));
+  const goals = await readGoalsSource(project);
+  if (goals) add(join(paths.runtimeDir, GOALS_FILE), goals);
 
   const staging = await mkdtemp(join(tmpdir(), 'minions-plugin-'));
   const cleanup = () => rm(staging, { recursive: true, force: true });
   try {
-    await generatePlugin(effective, staging, { configDir: roleConfigDir(project) });
+    await generatePlugin(effective, staging, { configDir: roleConfigDir(project), runtime: runtimeOf(project) });
     for (const f of await walkFiles(staging)) add(join(paths.pluginDir, relative(staging, f)), await readFile(f));
   } catch (e) { await cleanup(); throw e; }
 
@@ -412,9 +386,8 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
   if (vis === 'shared') notes.push('Shared install never modifies CLAUDE.md, AGENTS.md, or .claude/.');
 
   const unavailable = { settings: listUnavailable(config), features: [...DEFERRED_FEATURES] };
-  const ghRepo = githubRepoFromRemote(discovery.git.remoteUrl);
   const plan: InstallPlan = {
-    projectId, identitySource: identity.source, repoPath, gitCommonDir: commonDir, visibility: vis, profile: config.profile,
+    projectId, identitySource: identity.source, repoPath, gitCommonDir: commonDir, visibility: vis, mode: config.mode,
     writes, permissions: permissionSummary(effective), verificationCommands: effective.verification.commands,
     communication: effective.communication,
     unavailable,
@@ -425,7 +398,7 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
         isKeyAuth(authOf(project))
           ? `Claude key from ${summarize(authOf(project)).source} is provisioned by the host on every \`minions start\` (0600 file read by apiKeyHelper).`
           : 'Claude Code uses your existing host login (run `claude` once and /login if you are not logged in).',
-        'The coordinator gets the Claude Code sandbox (Bash writes limited to the workspace/state, credential directories unreadable) and never bypassPermissions.',
+        'The coordinator gets the Claude Code sandbox (Bash writes limited to the workspace/state, credential directories unreadable); sandboxed commands run without prompts. For fully unattended work set `coordinator.permissionMode bypassPermissions` (and optionally `coordinator.sandbox false`) in your local config.',
       ] : [
         process.platform === 'linux' ? 'Docker Engine running and reachable by your user (compose v2+ plugin).' : 'Docker Desktop running (compose v2+).',
         `Runtime image ${project.imageTag} is built from the installed package on first \`minions start\`.`,
@@ -434,25 +407,10 @@ async function prepare(opts: InitOptions, docker?: DockerStatus): Promise<Prepar
           : 'Claude login inside the container on first start: run /login in the coordinator session (host login is not reused).',
         'Repository is imported into the container from a Git bundle of committed history on first start.',
       ]),
-      ...(discovery.git.hasGitHub ? [
-        `Optional GitHub token (mounted read-only at ${GITHUB_TOKEN_CONTAINER_PATH}; needed for branch/pull-request delivery):`,
-        ...githubTokenGuidance(discovery.git.remoteUrl).map((l) => `  ${l}`),
-      ] : []),
-      // Printed only: the installer never writes workflow files or changes branch protection.
-      ...(discovery.git.hasGitHub ? ciSetupPlan({
-        hasWorkflows: discovery.ciWorkflows.some((f) => f.startsWith('.github/workflows/')),
-        requiredChecks: effective.delivery.requiredChecksConfigured ? 'configured' : 'unknown',
-        verificationCommands: effective.verification.commands, baseBranch: effective.git.baseBranch,
-        repository: ghRepo ? `${ghRepo.owner}/${ghRepo.repo}` : null,
-      }) : []),
-      ...(effective.communication.channel === 'telegram' ? [
+      ...(effective.communication.channel !== 'terminal' ? [
         `Telegram bot token from BotFather, stored on the host (Keychain or 0600 file) and mounted read-only at ${TELEGRAM_TOKEN_CONTAINER_PATH}; only the coordinator process receives it.`,
-        'The runtime image includes a pinned Bun (the Telegram plugin runs on it); an existing image is rebuilt on the next `minions start`.',
-        'On `minions start` the container installs telegram@claude-plugins-official at user scope (needs network; no login).',
-        'Pairing happens in the coordinator terminal (/telegram:access pair <code>, then /telegram:access policy allowlist); pair only yourself.',
+        'Pairing happens on the host (`minions telegram access pair <code>`, then `minions telegram access policy allowlist`); pair only yourself.',
         'Telegram changes are restart-required: `minions start` restarts the coordinator in a controlled way.',
-      ] : effective.communication.channel === 'auto' && runtime !== 'host' && effective.container.network !== 'none' ? [
-        'Optional Telegram (communication.channel auto): create a bot with BotFather, store its token with `minions auth telegram`, then `minions down && minions start`; pair in the coordinator terminal (/telegram:access pair <code>, then /telegram:access policy allowlist). Without a token the coordinator uses the terminal.',
       ] : []),
     ],
     notes, warnings,
@@ -541,11 +499,20 @@ async function apply(prep: Prepared): Promise<ApplyResult> {
 /** Directory role prompt files (`roles.<r>.prompt`) are relative to: next to the project config, read on the host (D1). */
 const roleConfigDir = (project: Pick<ProjectJson, 'visibility' | 'repoPath' | 'projectId'>) => dirname(projectConfigPath(project));
 
+/**
+ * The owner's goals file (docs/design/autonomy.md Decision 16): `goals.md` next to the project config, read on the
+ * host like the role prompt files, so the runtime only ever sees the owner's copy. Null when there is none.
+ */
+export const goalsSourcePath = (project: Pick<ProjectJson, 'visibility' | 'repoPath' | 'projectId'>) => join(roleConfigDir(project), GOALS_FILE);
+async function readGoalsSource(project: Pick<ProjectJson, 'visibility' | 'repoPath' | 'projectId'>): Promise<Buffer | null> {
+  try { return (await readFile(goalsSourcePath(project))).subarray(0, GOALS_MAX_BYTES); } catch { return null; }
+}
+
 /** Renders the plugin from the installed package's templates: [absolute path under pluginDir, content]. */
 async function renderPlugin(pluginDir: string, effective: MinionsConfig, project: ProjectJson): Promise<[string, Buffer][]> {
   const staging = await mkdtemp(join(tmpdir(), 'minions-plugin-'));
   try {
-    await generatePlugin(effective, staging, { configDir: roleConfigDir(project) });
+    await generatePlugin(effective, staging, { configDir: roleConfigDir(project), runtime: runtimeOf(project) });
     const out: [string, Buffer][] = [];
     for (const f of await walkFiles(staging)) out.push([join(pluginDir, relative(staging, f)), await readFile(f)]);
     return out;
@@ -567,13 +534,23 @@ export async function refreshDerived(project: ProjectJson, effective: MinionsCon
   const manifest = (await loadManifest(project.projectId)) ?? { version: 1 as const, packageVersion: VERSION, files: [] };
   const warnings: string[] = [];
   const plugin = await renderPlugin(paths.pluginDir, effective, project);
+  const goals = await readGoalsSource(project);
+  const goalsCopy = join(paths.runtimeDir, GOALS_FILE);
   const files: [string, Buffer][] = [
     [paths.composeYaml, Buffer.from(composeYaml(project))],
     [join(paths.runtimeDir, 'config.json'), json(effective)],
     [join(paths.runtimeDir, 'project.json'), json(runtimeProjectInfo(project))],
+    ...(goals ? [[goalsCopy, goals] as [string, Buffer]] : []),
     ...plugin,
   ];
   let changed = false;
+  // The owner removed the goals file: so does the runtime's copy.
+  if (!goals && await fileHash(goalsCopy) !== undefined) {
+    await rm(goalsCopy, { force: true });
+    const i = manifest.files.findIndex((f) => f.path === goalsCopy);
+    if (i >= 0) manifest.files.splice(i, 1);
+    changed = true;
+  }
   for (const [path, data] of files) {
     const want = sha256(data);
     const cur = await fileHash(path);
@@ -598,7 +575,7 @@ export async function refreshDerived(project: ProjectJson, effective: MinionsCon
   return warnings;
 }
 
-/** The container resource limits (recreate class) that `minions upgrade` copies from the config into project.json. */
+/** The container resource limits (recreate class) that `minions upgrade` copies from the config into project.json (container.gpus too, resolved). */
 export const CONTAINER_LIMIT_KEYS = ['cpus', 'memoryMiB', 'pidsLimit', 'tmpSizeMiB'] as const;
 
 /**
@@ -608,13 +585,15 @@ export const CONTAINER_LIMIT_KEYS = ['cpus', 'memoryMiB', 'pidsLimit', 'tmpSizeM
  * publishPorts are isolation settings and stay as setup wrote them. An unset tmpSizeMiB drops the override
  * (the default cap applies). Writes project.json only when a value changed; returns the (possibly new) record.
  */
-export async function syncContainerLimits(project: ProjectJson, effective: MinionsConfig): Promise<ProjectJson> {
+export async function syncContainerLimits(project: ProjectJson, effective: MinionsConfig, nvidia?: () => boolean): Promise<ProjectJson> {
   const container = { ...project.container };
   for (const k of CONTAINER_LIMIT_KEYS) {
     const v = effective.container[k];
     if (v === undefined) delete container[k]; else container[k] = v;
   }
-  if (CONTAINER_LIMIT_KEYS.every((k) => container[k] === project.container[k])) return project;
+  const gpus = resolveGpus(effective.container.gpus, nvidia);
+  if (gpus) container.gpus = gpus; else delete container.gpus;
+  if ([...CONTAINER_LIMIT_KEYS, 'gpus' as const].every((k) => container[k] === project.container[k])) return project;
   const next = ProjectJsonSchema.parse({ ...project, container });
   await writeGenerated(project.projectId, projectPaths(project.projectId).projectJson, projectJsonBytes(next));
   return next;
@@ -687,14 +666,10 @@ export const projectJsonBytes = (p: ProjectJson) => json(p);
 
 export interface InitResult {
   dryRun: boolean;
-  plan: Omit<InstallPlan, 'discovery'> & { discovery: Pick<Discovery, 'git' | 'instructions' | 'ciWorkflows' | 'dockerfile' | 'host'> };
+  plan: Omit<InstallPlan, 'discovery'> & { discovery: Pick<Discovery, 'git' | 'instructions' | 'dockerfile' | 'host'> };
   applied?: ApplyResult;
   docker: DockerStatus;
   nextSteps: string[];
-  /** GitHub token step of an interactive init (repo has a GitHub remote). Never contains the token. */
-  github?: { status: 'present' | 'stored' | 'skipped' | 'failed'; detail: string; provisioned?: Omit<ProvisionResult, 'projectId'> };
-  /** Guided GitHub setup (interactive) or its next-step hints (--yes). Never contains the token. */
-  githubSetup?: GithubSetupResult;
   /** Telegram bot token step (communication.channel is telegram). Never contains the token. */
   telegram?: { status: 'present' | 'stored' | 'skipped' | 'failed'; detail: string; provisioned?: Omit<TelegramProvisionResult, 'projectId'> };
 }
@@ -702,12 +677,12 @@ export interface InitResult {
 const TERMINAL_UNTIL_TOKEN = 'the coordinator runs terminal-only until a bot token is stored with `minions auth telegram`';
 
 /**
- * communication.channel telegram only: offers to store the bot token through the host terminal's
+ * communication.channel telegram or auto: offers to store the bot token through the host terminal's
  * non-echoing prompt, with an optional, consented getMe check. Failures never fail init; Telegram
  * then stays off at launch with the stated reason (terminal fallback).
  */
 async function offerTelegramToken(opts: InitOptions, plan: InitResult['plan']): Promise<InitResult['telegram']> {
-  if (plan.communication.channel !== 'telegram') return undefined;
+  if (plan.communication.channel === 'terminal') return undefined;
   const existing = (await loadCredentialRefs(plan.projectId).catch((): CredentialsJson => ({ version: 1 }))).telegram;
   if (existing) return { status: 'present', detail: `Telegram bot token already provisioned (bot ${existing.botId}, ${existing.backend}); replace it with \`minions auth telegram\`.` };
   const io = opts.io;
@@ -727,26 +702,13 @@ async function offerTelegramToken(opts: InitOptions, plan: InitResult['plan']): 
   }
 }
 
-/**
- * GitHub step of init (after the plan is applied, so failures never fail init). Interactive: the
- * guided flow (remote, base branch on the remote, token, delivery mode; src/host/github-setup.ts).
- * --yes / --config / no terminal: next-step hints only (no prompt, push, browser or network).
- */
-async function githubStep(opts: InitOptions, plan: InitResult['plan']): Promise<GithubSetupResult> {
-  const interactive = !!opts.io && !opts.yes && !opts.configFile;
-  return runGithubSetup({
-    projectId: plan.projectId, repoPath: plan.repoPath, io: interactive ? opts.io : undefined, yes: !interactive,
-    runner: opts.runner, fetch: opts.fetch, openUrl: opts.openUrl,
-  });
-}
-
 export function dockerUnavailable(s: DockerStatus, platform: NodeJS.Platform = process.platform): MinionsError {
   const what = !s.daemon ? `Docker daemon is not reachable${s.error ? ` (${s.error})` : ''}` : `Docker Compose v2+ is required (found: ${s.composeVersion ?? 'none'})`;
   const fix = platform === 'linux'
     ? `${!s.daemon ? daemonHint(platform, s) : composeHint(platform, s)} Then rerun; \`minions doctor\` names the exact fix.`
     : 'Start Docker Desktop (or install Compose v2), then rerun.';
   return new MinionsError('DOCKER_UNAVAILABLE', `${what}. The docker runtime needs Docker; minions never falls back to the host on its own.`,
-    `${fix} Running without Docker is an explicit, less safe choice: \`minions runtime set host\` (see README "Running without Docker").`, s);
+    `${fix} Running without Docker is an explicit, less safe choice: \`minions runtime set host\` (see docs/guide.md "Running without Docker").`, s);
 }
 
 export async function runInit(opts: InitOptions): Promise<InitResult> {
@@ -758,7 +720,7 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
   const hostRuntime = prep.plan.runtime === 'host';
   try {
     const { discovery, ...rest } = prep.plan;
-    const plan = { ...rest, discovery: { git: discovery.git, instructions: discovery.instructions, ciWorkflows: discovery.ciWorkflows, dockerfile: discovery.dockerfile, host: discovery.host } };
+    const plan = { ...rest, discovery: { git: discovery.git, instructions: discovery.instructions, dockerfile: discovery.dockerfile, host: discovery.host } };
     if (opts.dryRun) {
       if (!hostRuntime && (!docker.daemon || !docker.compose)) plan.warnings.push(dockerUnavailable(docker).message);
       return { dryRun: true, plan, docker, nextSteps: ['Rerun without --dry-run to apply this plan.'] };
@@ -774,13 +736,11 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
     if (!hostRuntime && (!after.daemon || !after.compose)) throw dockerUnavailable(after);
     // The secrets directory must exist: compose bind-mounts it with create_host_path: false.
     await ensureSecretsDir(plan.projectId);
-    // `minions setup` runs the GitHub and Telegram steps itself after the plan is applied.
-    const setup = opts.skipIntegrations ? undefined : await githubStep(opts, plan);
-    const github = setup?.interactive && setup.state.repository ? setup.token : undefined;
+    // `minions setup` runs the Telegram step itself after the plan is applied.
     const telegram = opts.skipIntegrations ? undefined : await offerTelegramToken(opts, plan);
     const tgReady = telegram?.status === 'stored' || telegram?.status === 'present';
     return {
-      dryRun: false, plan, applied, docker: after, ...(github ? { github } : {}), ...(setup ? { githubSetup: setup } : {}), ...(telegram ? { telegram } : {}),
+      dryRun: false, plan, applied, docker: after, ...(telegram ? { telegram } : {}),
       nextSteps: [
         'Run `minions start` in this repository.',
         ...(hostRuntime ? [
@@ -791,13 +751,10 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
         ] : [prep.plan.claudeAuth.method === 'login'
           ? 'The first start builds the runtime image, imports committed history, and opens the coordinator; log in to Claude inside the container with /login.'
           : 'The first start builds the runtime image, provisions the Claude key, imports committed history, and opens the coordinator.']),
-        ...(setup?.nextSteps ?? []),
-        ...(plan.communication.channel === 'telegram' ? [
+        ...(plan.communication.channel === 'terminal' ? [] : [
           ...(tgReady ? [] : ['Run `minions auth telegram` to store the Telegram bot token (entered without echo); until then the coordinator is terminal-only.']),
-          'After the first start, pair in the coordinator terminal: DM your bot, type /telegram:access pair <code>, then /telegram:access policy allowlist.',
-        ] : plan.communication.channel === 'auto' && !hostRuntime ? [
-          'Optional Telegram (channel auto): `minions auth telegram` stores a bot token; the coordinator then uses Telegram after `minions down && minions start`.',
-        ] : []),
+          'After the first start, DM your bot, then pair on the host: `minions telegram access pair <code>`, then `minions telegram access policy allowlist` (not needed when `minions defaults set telegram.owner <id>` is set: that user is allowlisted).',
+        ]),
         'Run `minions doctor` to check readiness at any time.',
       ],
     };
@@ -808,7 +765,7 @@ export async function runInit(opts: InitOptions): Promise<InitResult> {
 
 export function formatPlan(plan: InitResult['plan']): string {
   const L: string[] = [];
-  L.push(`Project ${plan.projectId} (${plan.visibility}, profile ${plan.profile}) — ${plan.repoPath}`);
+  L.push(`Project ${plan.projectId} (${plan.visibility}, ${plan.mode}) — ${plan.repoPath}`);
   L.push('', 'Planned writes:');
   for (const w of plan.writes) L.push(`  ${w.action.padEnd(9)} ${w.path}${w.note ? `  — ${w.note}` : ''}`);
   L.push('', 'Effective permissions:');
@@ -837,12 +794,6 @@ export function formatInit(r: InitResult): string {
     L.push('', `Applied: ${r.applied.written.length} written, ${r.applied.removed.length} removed, ${r.applied.unchanged} unchanged.`);
     for (const s of r.applied.skipped) L.push(`  ! drift: ${s.path} — ${s.note}`);
   }
-  if (r.github) {
-    L.push(`GitHub token: ${r.github.status} — ${r.github.detail}`);
-    for (const w of r.github.provisioned?.warnings ?? []) L.push(`  ! ${w}`);
-  }
-  if (r.githubSetup?.interactive && r.githubSetup.remote.status === 'added') L.push(`GitHub remote added: ${r.githubSetup.remote.url}`);
-  if (r.githubSetup?.delivery.changed) L.push(`Delivery: ${r.githubSetup.delivery.note}`);
   if (r.telegram) {
     L.push(`Telegram bot token: ${r.telegram.status} — ${r.telegram.detail}`);
     for (const w of r.telegram.provisioned?.warnings ?? []) L.push(`  ! ${w}`);

@@ -34,7 +34,7 @@ beforeAll(async () => {
   env = withHome();
   repo = makeRepo(env.root);
   writeFileSync(join(repo, '.env'), `ANTHROPIC_API_KEY=${SECRET}\n`); // ignored by .gitignore
-  const r = await runInit({ path: repo, yes: true, visibility: 'private' });
+  const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private' });
   projectId = r.plan.projectId;
   const paths = projectPaths(projectId);
   // Retarget image + resource names to test-prefixed ones.
@@ -86,7 +86,7 @@ describe('runtime container (docker)', () => {
     expect(binds.map((m) => [m.Destination, m.RW]).sort()).toEqual([['/opt/minions/config', false], ['/opt/minions/plugin', false], ['/opt/minions/secrets', false]]);
     const vols = mounts.filter((m) => m.Type === 'volume').map((m) => m.Name).sort();
     expect(vols.every((n) => n!.startsWith('minions-test-'))).toBe(true);
-    expect(vols).toHaveLength(4);
+    expect(vols).toHaveLength(5);
   });
 
   it('publishes requested ports on loopback only', () => {
@@ -96,7 +96,7 @@ describe('runtime container (docker)', () => {
 
   it('root filesystem is read-only; tmp, home, and volumes are writable', async () => {
     expect((await sh(['touch', '/usr/local/x'])).code).not.toBe(0);
-    for (const p of ['/tmp/x', '/home/node/x', '/workspace/x', '/state/x', '/home/node/.claude/x', '/home/node/.cache/x']) {
+    for (const p of ['/tmp/x', '/home/node/x', '/workspace/x', '/state/x', '/home/node/.claude/x', '/home/node/.cache/x', '/opt/tools/bin/x', '/opt/tools/cargo/x']) {
       expect((await sh(['touch', p])).code, p).toBe(0);
     }
     expect((await sh(['touch', '/opt/minions/config/x'])).code).not.toBe(0);

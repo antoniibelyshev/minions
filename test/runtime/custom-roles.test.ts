@@ -3,13 +3,15 @@
 // `requires` checked at claim, and end-to-end scheduler runs of project-role workflows.
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { validateConfig } from '../../src/config/resolve.js';
 import { roleNameProblem } from '../../src/config/roles.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import type { MinionsError } from '../../src/core/errors.js';
 import { resultContractText, validateResult } from '../../src/runtime/results.js';
 import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const err = async (p: Promise<unknown>) => {
   try { await p; } catch (e) { return e as MinionsError; }
@@ -67,7 +69,7 @@ async function stageIn(e: Env, id: string, role: string, files: string[] = [], o
 describe('config: the test roles and workflows are valid, reserved names', () => {
   it('validates ROLES and WORKFLOWS under the project-owner defaults', async () => {
     const { defaults } = await import('../helpers.js');
-    expect(() => validateConfig({ ...defaults('project-owner'), roles: ROLES, workflows: WORKFLOWS })).not.toThrow();
+    expect(() => validateConfig({ ...defaults('independent'), roles: ROLES, workflows: WORKFLOWS })).not.toThrow();
   });
 
   it('reserves the runtime evidence kinds "check" and "ci-gate" as role names (33.3 review nit)', () => {
@@ -78,17 +80,18 @@ describe('config: the test roles and workflows are valid, reserved names', () =>
 });
 
 describe('validateResult by contract variant (D4)', () => {
-  it('producer: no verdict, no needsQa, no CI evidence; failing checks allowed on complete', () => {
+  it('producer: no verdict, no CI evidence; failing checks allowed on complete', () => {
     expect(validateResult(base(), 'producer').ok).toBe(true);
     expect(validateResult(base({ checks: [{ command: 'npm test', outcome: 'fail' }] }), 'producer').ok).toBe(true);
     for (const over of [{ verdict: 'approve' }, { needsQa: true }, { checks: [{ command: 'test', outcome: 'pass', source: 'ci' }] }]) {
-      const v = validateResult(base(over), 'producer', { ciAuthority: 'github' });
+      const v = validateResult(base(over), 'producer');
       expect(v.ok, JSON.stringify(over)).toBe(false);
     }
   });
 
-  it('verifier: no verdict or needsQa; complete cannot fail checks; may cite CI with ciAuthority github', () => {
-    expect(validateResult(base({ checks: [{ command: 'test', outcome: 'pass', source: 'ci' }] }), 'verifier', { ciAuthority: 'github' }).ok).toBe(true);
+  it('verifier: no verdict; complete cannot fail checks; never cites CI', () => {
+    expect(validateResult(base({ checks: [{ command: 'test', outcome: 'pass', source: 'ci' }] }), 'verifier').ok).toBe(false);
+    expect(validateResult(base({ checks: [{ command: 'test', outcome: 'pass', source: 'local' }] }), 'verifier').ok).toBe(true);
     expect(validateResult(base({ verdict: 'approve' }), 'verifier').ok).toBe(false);
     expect(validateResult(base({ needsQa: true }), 'verifier').ok).toBe(false);
     const failed = validateResult(base({ checks: [{ command: 'npm test', outcome: 'fail' }] }), 'verifier');
@@ -96,8 +99,9 @@ describe('validateResult by contract variant (D4)', () => {
     expect(validateResult(base({ status: 'needs_changes', checks: [{ command: 'npm test', outcome: 'fail' }] }), 'verifier').ok).toBe(true);
   });
 
-  it('gate: complete requires approve; needs_changes cannot approve; may set needsQa', () => {
-    expect(validateResult(base({ verdict: 'approve', needsQa: true }), 'gate').ok).toBe(true);
+  it('gate: complete requires approve; needs_changes cannot approve; needsQa is gone', () => {
+    expect(validateResult(base({ verdict: 'approve' }), 'gate').ok).toBe(true);
+    expect(validateResult(base({ verdict: 'approve', needsQa: true }), 'gate').ok).toBe(false);
     expect(validateResult(base(), 'gate').ok).toBe(false);
     expect(validateResult(base({ status: 'needs_changes', verdict: 'approve' }), 'gate').ok).toBe(false);
     expect(validateResult(base({ status: 'needs_changes', verdict: 'request-changes' }), 'gate').ok).toBe(true);
@@ -119,14 +123,14 @@ describe('validateResult by contract variant (D4)', () => {
 });
 
 describe('result contract text per variant (D4)', () => {
-  it('a producer is never told about verdict, needsQa or CI evidence; verifier and gate are', () => {
+  it('a producer is never told about verdict; a gate is; nobody is told about CI evidence', () => {
     const p = resultContractText('producer');
     expect(p).not.toMatch(/verdict\?|verdict:|needsQa\?|source\?/);
-    expect(resultContractText('verifier')).toMatch(/source\?: local\|ci/);
+    expect(resultContractText('verifier')).not.toMatch(/source\?/);
     expect(resultContractText('verifier')).not.toMatch(/verdict:/);
     const g = resultContractText('gate');
     expect(g).toMatch(/verdict: approve\|request-changes/);
-    expect(g).toMatch(/needsQa\?/);
+    expect(g).not.toMatch(/needsQa/);
     expect(g).toMatch(/head must not move/);
   });
 

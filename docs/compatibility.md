@@ -13,7 +13,6 @@
 | Claude Code flags/fields used optionally | `--model`, `--effort <low\|medium\|high\|xhigh\|max>`, agent frontmatter `effort` | Verified in 2.1.292 (`claude --help`, agent definition schema). Sent only when `models.coordinator` / `models.effort` / `models.effortByRole` are set (`minions:engineer-deep` always carries an `effort`). The Agent tool's `model` accepts only the aliases `sonnet`, `opus`, `haiku`, `fable`; full IDs go in frontmatter. |
 | Backlog.md (in image) | `backlog.md@1.54.0` | Pinned in `docker/Dockerfile`. |
 | OpenAI Codex CLI (in image) | `@openai/codex@0.164.0` | Pinned in `docker/Dockerfile` (`ARG CODEX_VERSION`); `ENV MINIONS_CODEX_VERSION` carries the pin, which `minions work probe` and doctor `harness.codex` check against `codex --version`. Runs only as a process harness under `minions-sandbox`. Image with codex not yet built/tested. |
-| GitHub CLI (in image) | `gh` 2.102.0 (official release tarball `gh_2.102.0_linux_{amd64,arm64}.tar.gz`) | Pinned in `docker/Dockerfile` with SHA-256 per architecture (`ADD --checksum`, BuildKit). Real binary at `/opt/gh/bin/gh`; `/usr/local/bin/gh` is the token wrapper (`docker/gh-wrapper.sh`). Image with gh not yet built/tested. |
 | Telegram channel plugin | `telegram@claude-plugins-official` 0.0.7 (marketplace commit `1e96c6b`) | Interface read and install verified on Claude Code 2.1.292 without credentials. Not bundled: `minions start` runs `minions telegram install` (user scope, claude volume) when `communication.channel` is `telegram`; other versions get a warning. `minions telegram probe` and doctor checks `telegram.*` report readiness. No live bot/pairing run recorded yet. See [design/telegram.md](design/telegram.md). |
 | Bun (in image) | `1.4.3` (`bun-linux-aarch64`, `bun-linux-x64-baseline`) | Pinned with SHA-256 checksums from the release `SHASUMS256.txt` in `docker/Dockerfile`, fetched in a throwaway build stage; runs the Telegram plugin's MCP server. The aarch64 checksum was re-verified against the downloaded archive on 2026-10-19. The updated image has not been built in the development sandbox (no Docker there). |
 | System packages (in image) | git, tmux, ca-certificates, ripgrep, less, procps (Debian bookworm) | Installed at build time only. |
@@ -33,13 +32,9 @@ It uses a temp `MINIONS_HOME` and disposable repos and removes its containers an
 `npm run e2e:host` (scripts/e2e-host.sh) drives the host runtime with no Docker on `PATH`: init
 `--runtime host`, doctor host checks, `start --no-attach` (warning, separate clone, 0700 dirs), the lease
 flow through the shim, host-delegated status/pause/resume, a coordinator launch through a fake tmux and
-fake claude (dedicated `-L` server, sandbox settings, user `GH_TOKEN` dropped), the git credential helper
-through a shim path with a space, `export`, helper-mode Claude key (`apiKeyHelper` quoting), `runtime
+fake claude (dedicated `-L` server, sandbox settings, user `GH_TOKEN` dropped), a shim path with a space,
+`export`, helper-mode Claude key (`apiKeyHelper` quoting), `runtime
 set`, and `uninstall --delete-data`. It installs the real `backlog.md@1.54.0` into its temp dir.
-
-The guided GitHub setup (`minions setup github`, init) is covered by unit tests with temp repos and a
-fake GitHub API; the pre-filled token URL follows GitHub's documented template URL parameters
-(verified against docs.github.com on 2026-10-19), but opening it in a real browser is not automated.
 
 ### Host runtime (no Docker)
 
@@ -48,7 +43,6 @@ fake GitHub API; the pre-filled token URL follows GitHub's documented template U
 | Claude Code (host) | 2.1.292 | Sandbox keys checked against this version's settings schema; doctor warns on other versions. No real session in automated tests. |
 | Backlog.md (host) | 1.54.0 | Installed by you (`npm install -g backlog.md@1.54.0`). |
 | tmux (host) | fake only in e2e | `brew install tmux`; any 3.x expected to work (`-L`, `new-session -A/-d`, `has-session`, `kill-server`). |
-| gh (host) | not exercised | Optional, for pull-request delivery; wrapped by `host/bin/gh`. |
 
 ### Linux hosts (preview)
 
@@ -81,7 +75,6 @@ Linux gap list (audit of the macOS-specific host paths, 2026-10-23):
   (rootful, private group) is implemented in `src/host/secrets-access.ts`.
 - `src/host/setup.ts`, `wizard.ts`, `commands.ts`: credential messages name the actual backend. The
   wizard's Claude key source `keychain` (macOS `security`) has no Linux counterpart yet (`file` and `env` work).
-  The GitHub token page is opened with `open` on macOS only; Linux prints the URL (no `xdg-open` yet).
 - `src/core/paths.ts`: XDG handled (above). `tmuxSocket` comment cites the 104-byte macOS limit; Linux's
   limit is 108, so nothing changes.
 - Host runtime (`runtime: host`) on Linux: not reviewed. Its sandbox settings target Seatbelt (macOS);
@@ -125,7 +118,7 @@ Design for the open ownership cases (not implemented; needs live validation):
 - **Claude authorization** defaults to an interactive `/login` inside the container (stored in the
   project's `claude` volume). Host-provisioned keys (`minions auth set api-key|helper|jbcentral`) are
   supported: the key file (`anthropic-api-key`) lives in the secrets directory mounted read-only at
-  `/opt/minions/secrets` (shared with the GitHub/Telegram tokens) and Claude
+  `/opt/minions/secrets` (shared with the Telegram token) and Claude
   Code 2.1.292 reads it through `apiKeyHelper` (re-read every `CLAUDE_CODE_API_KEY_HELPER_TTL_MS` =
   5 min). `npm run e2e` verifies this with a fake helper and a fake local endpoint: the key is
   readable and read-only in the container, a refreshed key becomes visible without a restart, the
@@ -134,8 +127,8 @@ Design for the open ownership cases (not implemented; needs live validation):
   `127.0.0.1:19516`) is not exercised by the automated tests; reaching the host proxy at
   `host.docker.internal` was verified manually on Docker Desktop. Other engines get an
   `extra_hosts: host.docker.internal:host-gateway` entry (untested). Host login reuse is not supported.
-- **Secret file ownership**: the materialized files in `/opt/minions/secrets` (GitHub token, Telegram
-  bot token, Claude key) are 0600 files owned by the host user. Docker Desktop on macOS maps bind-mount ownership so the
+- **Secret file ownership**: the materialized files in `/opt/minions/secrets` (Telegram bot token,
+  Claude key) are 0600 files owned by the host user. Docker Desktop on macOS maps bind-mount ownership so the
   container user (uid 1000) can read it. On a Linux Docker Engine whose host user is not uid 1000,
   or with rootless Docker, the container cannot read it; `minions doctor` warns (`docker.uid`, `docker.rootless`).
 - **Outbound network is unrestricted** in the container (`network: outbound-internet`). There is no
@@ -149,16 +142,9 @@ Design for the open ownership cases (not implemented; needs live validation):
   requires the top-level `permissionMode` and rejects the `coordinator` key. Before reinstalling an
   older build, remove `coordinator` from the project config and set `permissionMode` (for example
   `"acceptEdits"`), otherwise config validation fails.
-- **CI-gated auto-merge** (opt-in, `delivery.merge: "auto-when-eligible"`, default `disabled`) needs
-  pull-request delivery, required status checks on the base branch, `delivery.requiredChecksConfigured: true`,
-  `verification.ciAuthority: "github"`, and "Allow auto-merge" enabled in the GitHub repository settings.
-  It is evaluated on `minions sync` (no polling loop), so a merge happens only after a sync pass; a
-  required check matched by name only (not pinned to an app) can be satisfied by anyone who can post a
-  commit status with that name (see "CI as verification authority").
-- **Deferred features** (reported as unavailable by `minions doctor`): GitHub Issues backend,
-  merge requests (`delivery.merge: "manual"`), review publication, the notification outbox, config plan/apply transactions,
-  backlog migration, upgrade plan and schema migration (drift checks, journal), budgets, companion containers, GitHub App short-lived tokens (a long-lived
-  fine-grained PAT is used instead), CODEOWNERS mapping of sensitive paths, shared backlog versioned in Git.
+- **Deferred features** (reported as unavailable by `minions doctor`): the notification outbox, config plan/apply
+  transactions, backlog migration, upgrade plan and schema migration (drift checks, journal), budgets, companion
+  containers, shared backlog versioned in Git.
 - **Telegram bot token exposure inside the container**: the token is mounted read-only and given only to
   the coordinator's `claude` process environment, but the coordinator's tools (and workers' Bash, which
   run in the same process tree) can read it. Revoke it in BotFather (`/revoke`) if the container is compromised.
@@ -181,7 +167,8 @@ Design for the open ownership cases (not implemented; needs live validation):
   `minions coordinator restart --recover` when no worker runs. Do not enable the plugin in a config dir that other sessions
   share with the coordinator. Start nested or ad-hoc `claude` runs with a separate
   `CLAUDE_CONFIG_DIR`. Workers never start `claude`; when a task needs a live run, the coordinator
-  runs it only while no worker lease is active, with a fresh `CLAUDE_CONFIG_DIR` (task-52). If
+  runs it only while no worker lease is active, with a fresh `CLAUDE_CONFIG_DIR` (task-52), through
+  `minions coordinator live-run` (task-96: credentials per auth method, see the README's Claude authorization). If
   Claude Code ever stops applying the flag `enabledPlugins`, the coordinator starts without the
   plugin: `minions doctor` then warns on `telegram.plugin` (off at user scope and no live poller).
   **Rollback**: a build from before task-51 does not enable the plugin in its coordinator launch, so
@@ -189,8 +176,7 @@ Design for the open ownership cases (not implemented; needs live validation):
   coordinator runs without Telegram. Fix it inside the runtime with
   `claude plugin enable telegram@claude-plugins-official` (user scope by default; a non-session
   subcommand, it starts no poller) and restart the coordinator,
-  or upgrade back to a task-51 or later build. The setup assistant (`minions setup assist`) passes no channel flags but
-  uses your host config, so it loads the plugin if you enabled it there. The test suite sets
+  or upgrade back to a task-51 or later build. The test suite sets
   `CLAUDE_CONFIG_DIR` to a temp dir (`test/setup/global.ts`), and `test/setup/claude-guard.ts`
   fails any test that would start `claude` with the real `~/.claude`.
 - Native macOS/iOS builds (Xcode) cannot run inside the Linux runtime.
@@ -200,8 +186,8 @@ Design for the open ownership cases (not implemented; needs live validation):
   outside the allowlist prompts rather than being blocked, and there are no CPU/memory/process limits.
   The sandbox configuration has not been exercised against a live Claude session in automated tests.
   Telegram is not set up automatically in host mode.
-- **Keychain access list**: the GitHub and Telegram Keychain items are created without a `-T` access list, so any
-  process running as your macOS user can read them (normal macOS behaviour). The plaintext copy mounted into the
+- **Keychain access list**: the Telegram Keychain item is created without a `-T` access list, so any
+  process running as your macOS user can read it (normal macOS behaviour). The plaintext copy mounted into the
   container is cleared when `minions start` fails to bring the container up and by `minions doctor` when the container is
   confirmed gone (exited, dead or absent; an uncertain state only produces a warning); the Keychain/file-store originals are never removed by that cleanup.
 
@@ -218,11 +204,10 @@ envelope: steps, interrupted leases, image, coordinator, `plugin`, and for the s
 
 Steps, in order (names as in `--json`):
 
-1. `sync`, `cli` (source phase, before anything touches the container). `--from-container` (local
-   delivery only, container must be running) exports the container branches and fast-forwards a host
+1. `sync`, `cli` (source phase, before anything touches the container). `--from-container` (the
+   container must be running) exports the container branches and fast-forwards a host
    branch (default: the base branch) to `minions/<base>`, only on a strict fast-forward with clean trees;
-   a dirty tree or divergence refuses and changes nothing. With GitHub delivery the host base is instead
-   fast-forwarded to `origin/<base>` and `--from-container` is refused. When the project repository is a
+   a dirty tree or divergence refuses and changes nothing. When the project repository is a
    minions checkout whose build differs from the installed CLI, the CLI is rebuilt or reinstalled, but
    only with `--rebuild-cli` (it runs the checkout's npm scripts on the host; review it first), and the
    rest of the upgrade is handed off to the newly installed CLI (`continued: true`). Without
@@ -239,8 +224,8 @@ Steps, in order (names as in `--json`):
    installed package, and reports whether the plugin matches it (`plugin` in `--json`; files you edited
    are kept with a warning). `minions doctor` has a `plugin` check for the same staleness.
 4. `image`: rebuilt only when the `minions.build` fingerprint changed, otherwise skipped.
-5. `secrets`, `recreate` (`docker compose up --force-recreate`), `workspace`, `origin` (the repository
-   import is refreshed and origin reconfigured; the existing clone is kept).
+5. `secrets`, `recreate` (`docker compose up --force-recreate`), `workspace`, `import` (the repository
+   import is refreshed; the existing clone is kept).
 6. `resume` (starts, before the coordinator restarts so recovery can dispatch), `coordinator`
    (`minions coordinator restart --recover`). The new coordinator session reads its handoff file if one
    exists, runs with the trimmed tool set (`coordinator.disallowedTools`, `toolSearch`, `bundledSkills`

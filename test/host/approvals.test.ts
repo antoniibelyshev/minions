@@ -19,7 +19,7 @@ describe('approval tokens (src/core/approval.ts)', () => {
 
   it('a valid signature for the exact task and head verifies', () => {
     const r = verifyApproval(sign('task-1', HEAD), pair.publicKeyPem, { taskId: 'task-1', head: HEAD });
-    expect(r).toMatchObject({ ok: true, payload: { taskId: 'task-1', head: HEAD, by: 'ada', scope: 'publish', v: 1 } });
+    expect(r).toMatchObject({ ok: true, payload: { taskId: 'task-1', head: HEAD, by: 'ada', scope: 'merge', v: 1 } });
   });
 
   it('fails closed: wrong head, wrong task, tampered, foreign key, unsigned, no key, expired, future', () => {
@@ -75,7 +75,7 @@ describe('host-held approval key', () => {
     await ensureApprovalKey(ID);
     const y = composeYaml({
       version: 1, projectId: ID, repoPath: '/Users/x/repo', gitCommonDir: '/Users/x/repo/.git', visibility: 'private',
-      profile: 'personal-work', imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null,
+      mode: 'supervised', imageTag: 'minions-runtime:0.1.0', baseBranch: 'main', remoteUrl: null,
       gitIdentity: { name: 'Ada', email: 'ada@example.com' },
       container: { cpus: 4, memoryMiB: 6144, pidsLimit: 512, publishPorts: [], network: 'outbound-internet' },
     });

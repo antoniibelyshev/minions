@@ -25,19 +25,6 @@ RUN set -eu; \
     install -m 0755 "/tmp/bun/${asset}/bun" /usr/local/bin/bun; \
     test "$(/usr/local/bin/bun --version)" = "${BUN_VERSION}"
 
-# GitHub CLI: official release tarball, pinned version, SHA-256 verified per architecture
-# (values from gh_<version>_checksums.txt of the release). Both are fetched; the target one is used.
-FROM node:22-bookworm-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS gh
-ARG GH_VERSION=2.102.0
-ADD --checksum=sha256:bb766f710eef8ede859c18578c72c327597cd4c8a85b06001b1f3843c6019386 \
-    https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz /gh/amd64.tar.gz
-ADD --checksum=sha256:7862c86c72f43df3a2d93ddde6f473285b4e2af61b494849846827e513ef6484 \
-    https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_arm64.tar.gz /gh/arm64.tar.gz
-ARG TARGETARCH
-RUN mkdir /gh/out \
- && tar -xzf "/gh/${TARGETARCH}.tar.gz" -C /gh/out --strip-components=1 "gh_${GH_VERSION}_linux_${TARGETARCH}/bin/gh" \
- && /gh/out/bin/gh --version | grep -q "^gh version ${GH_VERSION} "
-
 # minions-sandbox: the isolation wrapper for process-harness workers (Landlock, seccomp, process-lifetime
 # supervisor; docs/design/agent-runtimes.md D4), one small C file in docker/minions-sandbox/. Compiler image
 # pinned by multi-arch index digest (gcc:14.3.0-bookworm, resolved 2026-10-23). The binary is static, so
@@ -58,9 +45,9 @@ ARG BACKLOG_MD_VERSION=1.54.0
 # @openai/codex@0.164.0: sha512-TWj7UGyPRe3Pj/A3ddNAxs1te3a/W/xAd+J0LHrrFTmsSfahGMOLF/vn88D3QCIgAT3B1rm1y/Z3NYE0rx6cZQ==
 ARG CODEX_VERSION=0.164.0
 
-# Reviewed system packages only; nothing is installed as root at runtime.
+# Reviewed system packages only; nothing is installed as root at runtime. curl, xz and unzip fetch toolchains into /opt/tools.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends git tmux ca-certificates ripgrep less procps \
+ && apt-get install -y --no-install-recommends git tmux ca-certificates ripgrep less procps curl xz-utils unzip \
  && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
 
 RUN npm install -g --no-fund --no-audit \
@@ -70,11 +57,7 @@ RUN npm install -g --no-fund --no-audit \
 
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 COPY --from=sandbox /out/minions-sandbox /usr/local/bin/minions-sandbox
-
-# Real gh off PATH; /usr/local/bin/gh is the wrapper that reads the mounted token at exec time.
-COPY --from=gh /gh/out/bin/gh /opt/gh/bin/gh
-COPY docker/gh-wrapper.sh /usr/local/bin/gh
-RUN chmod 0755 /opt/gh/bin/gh /usr/local/bin/gh /usr/local/bin/minions-sandbox
+RUN chmod 0755 /usr/local/bin/minions-sandbox
 
 COPY package.json /opt/minions/pkg/package.json
 COPY dist/ /opt/minions/pkg/dist/
@@ -82,10 +65,15 @@ COPY templates/ /opt/minions/pkg/templates/
 RUN chmod 0755 /opt/minions/pkg/dist/cli.js \
  && ln -s /opt/minions/pkg/dist/cli.js /usr/local/bin/minions \
  # Mount points. Named volumes copy this ownership on first creation, so they are writable by node.
+ # /opt/tools is the tools volume (docs/design/autonomy.md Decision 14): toolchains the agents install without root.
  && mkdir -p /workspace /state /home/node/.claude /home/node/.cache /opt/minions/plugin /opt/minions/config \
- && chown -R node:node /workspace /state /home/node \
+      /opt/tools/bin /opt/tools/cargo /opt/tools/rustup /opt/tools/go /opt/tools/uv \
+ && chown -R node:node /workspace /state /home/node /opt/tools \
+ # Login shells reset PATH from /etc/profile: keep the tools on it there too.
+ && printf 'case ":$PATH:" in *:/opt/tools/bin:*) ;; *) PATH="$PATH:/opt/tools/bin:/opt/tools/cargo/bin:/opt/tools/go/bin:/opt/tools/goroot/bin" ;; esac\n' > /etc/profile.d/minions-tools.sh \
  && test "$(id -u node)" = 1000
 
+# The tools locations and PATH: the same values as TOOLS_ENV and CONTAINER_PATH in src/core/paths.ts.
 ENV MINIONS_RUNTIME=container \
     MINIONS_CODEX_VERSION=${CODEX_VERSION} \
     CLAUDE_CONFIG_DIR=/home/node/.claude \
@@ -93,7 +81,15 @@ ENV MINIONS_RUNTIME=container \
     DISABLE_AUTOUPDATER=1 \
     BUN_INSTALL_CACHE_DIR=/home/node/.cache/bun \
     LANG=C.UTF-8 \
-    LC_ALL=C.UTF-8
+    LC_ALL=C.UTF-8 \
+    CARGO_HOME=/opt/tools/cargo \
+    RUSTUP_HOME=/opt/tools/rustup \
+    GOPATH=/opt/tools/go \
+    UV_INSTALL_DIR=/opt/tools/bin \
+    UV_TOOL_DIR=/opt/tools/uv/tools \
+    UV_TOOL_BIN_DIR=/opt/tools/bin \
+    UV_PYTHON_INSTALL_DIR=/opt/tools/uv/python \
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/tools/bin:/opt/tools/cargo/bin:/opt/tools/go/bin:/opt/tools/goroot/bin
 
 USER node
 WORKDIR /workspace

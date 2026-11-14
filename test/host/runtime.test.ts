@@ -5,6 +5,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileS
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { RunResult } from '../../src/core/exec.js';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
@@ -31,7 +32,7 @@ const {
 } = await import('../../src/host/runtime.js');
 const { runRuntimeSet, runRuntimeShow } = await import('../../src/host/runtime-cli.js');
 const { delegateToRuntime } = await import('../../src/host/delegate.js');
-const { coordinatorSettings, buildClaudeCommand, buildCoordinatorCommand, hostSettings } = await import('../../src/runtime/coordinator.js');
+const { coordinatorSettings, buildClaudeCommand, buildCoordinatorCommand, hostSettings, shQuote } = await import('../../src/runtime/coordinator.js');
 const { runDoctor } = await import('../../src/host/doctor.js');
 const { runUninstall } = await import('../../src/host/uninstall.js');
 const { defaults } = await import('../helpers.js');
@@ -51,7 +52,7 @@ const no: RunResult = { code: 127, stdout: '', stderr: 'not found' };
 
 async function hostProject(extra: Parameters<typeof runInit>[0] extends infer T ? Partial<T> : never = {}) {
   const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown, ...extra });
+  const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown, ...extra });
   return { repo, r, id: r.plan.projectId };
 }
 
@@ -59,12 +60,12 @@ describe('runtime path resolution', () => {
   it('container defaults, env overrides for the host runtime', () => {
     const c = runtimePaths({});
     expect(c).toMatchObject({ state: '/state', workspace: '/workspace', repo: '/workspace/repo', pluginDir: '/opt/minions/plugin',
-      coordinatorPrompt: '/opt/minions/plugin/coordinator.md', githubTokenFile: '/opt/minions/secrets/github-token', tmuxSocket: null });
+      coordinatorPrompt: '/opt/minions/plugin/coordinator.md', telegramTokenFile: '/opt/minions/secrets/telegram-bot-token', tmuxSocket: null });
     const h = runtimePaths({ MINIONS_RUNTIME: 'host', MINIONS_STATE_DIR: '/h/state', MINIONS_WORKSPACE: '/h/ws', MINIONS_SECRETS_DIR: '/h/sec dir',
       MINIONS_PLUGIN_DIR: '/h/plugin', MINIONS_TMUX_SOCKET: 'minions-abc', MINIONS_CONFIG: '/h/cfg.json' });
     expect(h).toMatchObject({ db: '/h/state/minions.db', backlog: '/h/state/backlog', repo: '/h/ws/repo', worktrees: '/h/ws/worktrees',
       configJson: '/h/cfg.json', pluginDir: '/h/plugin', coordinatorPrompt: '/h/plugin/coordinator.md',
-      githubTokenFile: '/h/sec dir/github-token', apiKeyFile: '/h/sec dir/anthropic-api-key', tmuxSocket: 'minions-abc' });
+      telegramTokenFile: '/h/sec dir/telegram-bot-token', apiKeyFile: '/h/sec dir/anthropic-api-key', tmuxSocket: 'minions-abc' });
   });
 
   it('host runtime env points every runtime path at <project>/host and drops tokens', async () => {
@@ -79,7 +80,7 @@ describe('runtime path resolution', () => {
     expect(e.PATH).toBe(`${hp.bin}:/usr/bin:/bin`);
     for (const k of ['GH_TOKEN', 'GITHUB_TOKEN', 'TMUX']) expect(e).not.toHaveProperty(k);
     expect(e.CLAUDE_CONFIG_DIR).toBeUndefined(); // login reuses the user's own Claude Code login
-    expect(e.MINIONS_GIT_CREDENTIAL_HELPER).toBe(`!${hp.minionsShim.includes(' ') ? `'${hp.minionsShim}'` : hp.minionsShim} git-credential`);
+    expect(e).not.toHaveProperty('MINIONS_GIT_CREDENTIAL_HELPER');
   });
 
   it('modes: host-runtime may run runtime commands, never host-control commands', () => {
@@ -96,13 +97,13 @@ describe('runtime selection is host-controlled', () => {
   it('repository config cannot select the host runtime (strict schema)', async () => {
     expect(() => validateConfig({ ...defaults(), runtime: 'host' }, 'x')).toThrow(expect.objectContaining({ code: 'INVALID_CONFIG' }));
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'shared', dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'shared', dockerProbe: dockerUp });
     const shared = repoPaths(repo).configJson;
     writeFileSync(shared, JSON.stringify({ ...JSON.parse(readFileSync(shared, 'utf8')), runtime: 'host' }));
     const project = await loadProjectJson(r.plan.projectId);
     expect(project.runtime).toBeUndefined();
     await expect(loadEffectiveConfig(project)).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
-    await expect(runInit({ path: repo, yes: true, dockerProbe: dockerUp })).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
+    await expect(runInit({ mode: 'independent', path: repo, yes: true, dockerProbe: dockerUp })).rejects.toMatchObject({ code: 'INVALID_CONFIG' });
   });
 
   it('init --runtime host needs no Docker, records the runtime in project.json, and warns', async () => {
@@ -114,57 +115,29 @@ describe('runtime selection is host-controlled', () => {
     for (const l of HOST_RUNTIME_WARNING) expect(text).toContain(l);
     expect(r.plan.externalSetup.join('\n')).toMatch(/tmux, claude .* backlog/);
     // the docker runtime still refuses without Docker
-    await expect(runInit({ path: makeRepo(env.root, 'other'), yes: true, visibility: 'private', dockerProbe: dockerDown }))
+    await expect(runInit({ mode: 'independent', path: makeRepo(env.root, 'other'), yes: true, visibility: 'private', dockerProbe: dockerDown }))
       .rejects.toMatchObject({ code: 'DOCKER_UNAVAILABLE' });
   });
 
-  it('a global default of host is never inherited by a non-interactive init; the wizard asks with the typed word', async () => {
+  it('the mode picks the runtime: independent docker (even with a host default), supervised host (or the default); --runtime wins', async () => {
     await saveDefaults({ runtime: 'host' });
     const repo = makeRepo(env.root);
-    const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const r = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     expect(r.plan.runtime).toBe('docker');
-    expect(r.plan.notes.join(' ')).toMatch(/never inherits it/);
     await runUninstall({ cwd: repo, yes: true, runner: async () => no });
-    const asked: string[] = [];
-    const io = { info: () => undefined, ask: async (q: string, def: string) => { asked.push(`${q}=${def}`); return q.startsWith('Type "host"') ? 'host' : q.startsWith('Apply this plan') ? 'y' : def; } };
-    const r2 = await runInit({ path: repo, io, dockerProbe: dockerDown, visibility: 'private' });
+    const r2 = await runInit({ mode: 'supervised', path: repo, yes: true, dockerProbe: dockerDown });
     expect(r2.plan.runtime).toBe('host');
-    expect(asked.some((a) => a.startsWith('Agent runtime (docker/host)=host'))).toBe(true);
-    expect(r2.plan.warnings.join('\n')).toMatch(/Use Docker for untrusted repositories/);
-  });
-
-  it('--runtime host: non-interactive needs --yes; interactive needs the typed word', async () => {
-    const repo = makeRepo(env.root);
-    await expect(runInit({ path: repo, visibility: 'private', runtime: 'host', dockerProbe: dockerDown })).rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/needs confirmation/) });
-    const io = (typed: string) => ({ info: () => undefined, ask: async (q: string, def: string) => (q.startsWith('Type "host"') ? typed : q.startsWith('Apply this plan') ? 'y' : def) });
-    const r1 = await runInit({ path: repo, io: io('no'), visibility: 'private', runtime: 'host', dockerProbe: dockerUp });
-    expect(r1.plan.runtime).toBe('docker');
+    expect(r2.plan.warnings.join('\n')).toMatch(/agents run as your macOS user/);
     await runUninstall({ cwd: repo, yes: true, runner: async () => no });
-    const r2 = await runInit({ path: repo, io: io('host'), visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
-    expect(r2.plan.runtime).toBe('host');
-  });
-
-  it('wizard: host needs the typed word, anything else keeps docker', async () => {
-    const repo = makeRepo(env.root);
-    const mk = (typed: string) => {
-      const info: string[] = [];
-      return { info, io: { info: (l: string) => info.push(l), ask: async (q: string, def: string) =>
-        q.startsWith('Agent runtime') ? 'host' : q.startsWith('Type "host"') ? typed : q.startsWith('Apply this plan') ? 'y' : def } };
-    };
-    const a = mk('nope');
-    const r1 = await runInit({ path: repo, io: a.io, dockerProbe: dockerUp, visibility: 'private' });
-    expect(r1.plan.runtime).toBe('docker');
-    expect(a.info.join('\n')).toContain(HOST_RUNTIME_WARNING[1]);
-    expect(r1.plan.notes.join(' ')).toMatch(/not confirmed/);
-    const b = mk('host');
+    await saveDefaults({ runtime: 'docker' });
+    expect((await runInit({ mode: 'supervised', path: repo, yes: true, dockerProbe: dockerUp })).plan.runtime).toBe('docker');
     await runUninstall({ cwd: repo, yes: true, runner: async () => no });
-    const r2 = await runInit({ path: repo, io: b.io, dockerProbe: dockerDown, visibility: 'private' });
-    expect(r2.plan.runtime).toBe('host');
+    expect((await runInit({ mode: 'independent', path: repo, yes: true, runtime: 'host', visibility: 'private', dockerProbe: dockerDown })).plan.runtime).toBe('host');
   });
 
   it('runtime set host: warning always, typed confirmation or --yes, refuses while running', async () => {
     const repo = makeRepo(env.root);
-    const { plan } = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    const { plan } = await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const warned: string[][] = [];
     const deps = { cwd: repo, warn: (l: string[]) => warned.push(l), isRunning: async () => false };
     await expect(runRuntimeSet('host', {}, { ...deps, ask: async () => null })).rejects.toMatchObject({ code: 'PRECONDITION' });
@@ -189,14 +162,14 @@ describe('runtime selection is host-controlled', () => {
 describe('host runtime coordinator settings', () => {
   const h = { home: '/Users/u', workspace: '/m/host/workspace', state: '/m/host/state', secretsDir: '/m/My Proj/secrets', credentialsDir: '/m/credentials', projectDir: '/m/proj' };
 
-  it('adds the sandbox and credential denies, never bypass; container settings are unchanged', () => {
+  it('adds the sandbox (sandboxed commands run without a prompt) and credential denies; bypass off by default; container settings are unchanged', () => {
     const s = coordinatorSettings(defaults(), { auth: 'api-key', host: h, paths: { apiKeyFile: '/m/My Proj/secrets/anthropic-api-key' } }) as {
       permissions: { deny: string[]; disableBypassPermissionsMode: string }; sandbox: Record<string, unknown>; apiKeyHelper: string };
     expect(s.permissions.disableBypassPermissionsMode).toBe('disable');
-    expect(s.sandbox).toMatchObject({ enabled: true, autoAllowBashIfSandboxed: false, allowUnsandboxedCommands: false, failIfUnavailable: true });
+    expect(s.sandbox).toMatchObject({ enabled: true, autoAllowBashIfSandboxed: true, allowUnsandboxedCommands: false, failIfUnavailable: true });
     expect((s.sandbox.filesystem as { allowWrite: string[] }).allowWrite).toEqual([h.workspace, h.state]);
     expect((s.sandbox.filesystem as { denyRead: string[] }).denyRead).toEqual(expect.arrayContaining(['~/.ssh', '~/.aws', '~/Library/Keychains', h.credentialsDir]));
-    expect((s.sandbox.network as { allowedDomains: string[] }).allowedDomains).toContain('github.com');
+    expect((s.sandbox.network as { allowedDomains: string[] }).allowedDomains).toEqual(['registry.npmjs.org']);
     expect(s.permissions.deny).toEqual(expect.arrayContaining(['Read(~/.ssh/**)', 'Read(~/.aws/**)', 'Bash(security *)', 'Read(//m/credentials/**)',
       'Read(//m/My Proj/secrets/anthropic-api-key)', 'Read(//m/My Proj/secrets/telegram-bot-token)', 'Edit(//m/proj/*.json)']));
     // no data root derivable from /m/proj: never deny `/` or the home directory
@@ -207,6 +180,16 @@ describe('host runtime coordinator settings', () => {
     expect(c).not.toHaveProperty('sandbox');
     expect(c.apiKeyHelper).toBe('cat /opt/minions/secrets/anthropic-api-key');
     expect(hostSettings(h).deny.some((d) => d.includes('bypass'))).toBe(false);
+  });
+
+  it('the owner\'s local choices: bypassPermissions keeps the deny rules; sandbox false drops only the sandbox', () => {
+    type S = { permissions: { deny: string[]; disableBypassPermissionsMode?: string; blockReadsOutsideWorkingDirectories?: boolean }; sandbox?: unknown };
+    const cfg = { ...defaults(), coordinator: { permissionMode: 'bypassPermissions' as const, sandbox: false } };
+    const s = coordinatorSettings(cfg, { auth: 'login', host: h }) as S;
+    expect(s.permissions).not.toHaveProperty('disableBypassPermissionsMode');
+    expect(s).not.toHaveProperty('sandbox');
+    expect(s.permissions).not.toHaveProperty('blockReadsOutsideWorkingDirectories');
+    expect(s.permissions.deny).toEqual(expect.arrayContaining(['Bash(git push *)', 'Read(~/.ssh/**)', 'Bash(minions work approve *)']));
   });
 
   it('host runtime launch: dedicated tmux socket, sandbox in --settings, host prompt note', async () => {
@@ -229,51 +212,14 @@ describe('host runtime coordinator settings', () => {
 });
 
 describe('host runtime processes', () => {
-  it('shim pins the runtime environment (quoted paths) and execs the CLI', async () => {
+  it('removes the gh token wrapper an older minions wrote into the shim dir', async () => {
     const { id } = await hostProject();
     const project = await loadProjectJson(id);
-    const cli = join(env.root, 'fake cli.mjs');
-    writeFileSync(cli, 'process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), env: process.env }))\n');
-    // An empty dir as PATH: hosts and CI runners may have gh in /usr/bin (GitHub runners do).
-    const noGh = join(env.root, 'empty-bin');
-    mkdirSync(noGh);
-    await prepareHostRuntime(project, { target: { node: process.execPath, cli }, pathEnv: noGh });
-    const hp = hostRuntimePaths(id);
-    expect(readFileSync(hp.minionsShim, 'utf8')).toMatch(/^#!\/bin\/sh\n/);
-    expect(existsSync(hp.ghShim)).toBe(false); // no gh on that PATH
-    const out = await new HostRuntime(project).exec(['minions', 'status', '--json']);
-    const d = JSON.parse(out.stdout) as { argv: string[]; env: Record<string, string> };
-    expect(d.argv).toEqual(['status', '--json']);
-    expect(d.env).toMatchObject({ MINIONS_RUNTIME: 'host', MINIONS_STATE_DIR: hp.state, MINIONS_WORKSPACE: hp.workspace, MINIONS_TMUX_SOCKET: hp.tmuxSocket });
-    expect(d.env.GH_TOKEN).toBeUndefined();
-    expect(minionsShim(project, { node: '/a b/node', cli: "/c'd/cli.js" })).toContain(`exec '/a b/node' '/c'\\''d/cli.js' "$@"`);
-  });
-
-  it('gh shim only when gh exists; it reads the project token file, not the user login', async () => {
-    const { id } = await hostProject();
-    const project = await loadProjectJson(id);
-    const bin = join(env.root, 'tools');
-    mkdirSync(bin);
-    writeFileSync(join(bin, 'gh'), '#!/bin/sh\necho real\n'); chmodSync(join(bin, 'gh'), 0o755);
-    await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/x' }, pathEnv: `${hostRuntimePaths(id).bin}:${bin}` });
-    const sh = readFileSync(hostRuntimePaths(id).ghShim, 'utf8');
-    expect(sh).toContain(`REAL_GH=${join(bin, 'gh')}`);
-    expect(sh).toContain(`TOKEN_FILE=${projectPaths(id).githubTokenFile.includes(' ') ? `'${projectPaths(id).githubTokenFile}'` : projectPaths(id).githubTokenFile}`);
-  });
-
-  it('delegation: host runtime runs the shim directly; docker runtime needs a running container', async () => {
-    const { repo, id } = await hostProject();
-    const project = await loadProjectJson(id);
-    await expect(delegateToRuntime(['status'], { json: true, cwd: repo })).rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/host runtime has not been started/) });
-    await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/nonexistent' } });
-    // a real shim run (re-prepared with the package CLI) would start the CLI; check the docker branch instead:
-    const other = makeRepo(env.root, 'docker-repo');
-    await runInit({ path: other, yes: true, visibility: 'private', dockerProbe: dockerUp });
-    const only = join(env.root, 'only-git');
-    mkdirSync(only);
-    symlinkSync(execFileSync('which', ['git'], { encoding: 'utf8' }).trim(), join(only, 'git'));
-    process.env.PATH = only; // no docker CLI: the container is not running
-    await expect(delegateToRuntime(['status'], { json: true, cwd: other })).rejects.toMatchObject({ code: 'PRECONDITION', message: expect.stringMatching(/container is not running/) });
+    const legacy = join(hostRuntimePaths(id).bin, 'gh');
+    mkdirSync(hostRuntimePaths(id).bin, { recursive: true });
+    writeFileSync(legacy, '#!/bin/sh\n');
+    await prepareHostRuntime(project, { target: { node: process.execPath, cli: '/x' } });
+    expect(existsSync(legacy)).toBe(false);
   });
 
   it('isRunning / down use the dedicated tmux server only', async () => {
@@ -289,7 +235,7 @@ describe('host runtime processes', () => {
     const tools = await hostTools(async (cmd) => (cmd === 'tmux' ? ok('tmux 3.5a') : cmd === 'claude' ? ok('2.1.292 (Claude Code)') : no));
     expect(tools.find((t) => t.name === 'tmux')).toMatchObject({ ok: true, version: 'tmux 3.5a' });
     expect(tools.find((t) => t.name === 'backlog')).toMatchObject({ ok: false, required: true, hint: expect.stringMatching(/npm install -g backlog.md/) });
-    expect(tools.find((t) => t.name === 'gh')).toMatchObject({ ok: false, required: false });
+    expect(tools.find((t) => t.name === 'gh')).toBeUndefined();
   });
 
   it('doctor in host mode: warn-level runtime check, host tools, no Docker calls', async () => {
@@ -309,57 +255,13 @@ describe('host runtime processes', () => {
     expect(by('host.backlog')).toMatchObject({ status: 'fail', hint: expect.stringMatching(/backlog.md/) });
     expect(by('docker.daemon')).toBeUndefined();
     expect(by('coordinator')!.status).toBe('warn');
+    expect(by('workspace.worktrees')).toMatchObject({ status: 'warn', detail: expect.stringMatching(/no repository yet/) });
     expect(calls).not.toContain('docker');
   });
 
-  it('uninstall --delete-data removes the host workspace; without it the data is kept', async () => {
-    const { repo, id } = await hostProject();
-    await prepareHostRuntime(await loadProjectJson(id), { target: { node: process.execPath, cli: '/x' } });
-    writeFileSync(join(hostRuntimePaths(id).state, 'minions.db'), 'x');
-    const runner = async () => no;
-    const kept = await runUninstall({ cwd: repo, yes: true, runner });
-    expect(kept.hostData).toEqual({ path: hostRuntimePaths(id).root, deleted: false });
-    expect(existsSync(hostRuntimePaths(id).state)).toBe(true);
-    expect(existsSync(hostRuntimePaths(id).bin)).toBe(false);
-    const again = await runInit({ path: repo, yes: true, visibility: 'private', runtime: 'host', dockerProbe: dockerDown });
-    const id2 = again.plan.projectId;
-    await prepareHostRuntime(await loadProjectJson(id2), { target: { node: process.execPath, cli: '/x' } });
-    const del = await runUninstall({ cwd: repo, yes: true, deleteData: true, runner });
-    expect(del.hostData).toMatchObject({ deleted: true });
-    expect(existsSync(hostRuntimePaths(id2).root)).toBe(false);
-    expect(git(repo, 'status', '--porcelain')).toBe('');
-  });
 });
 
 describe('minions upgrade on the host runtime', () => {
-  it('refuses with PRECONDITION before any source or container step, also with --dry-run, --from-container and --rebuild-cli', async () => {
-    const { Command } = await import('commander');
-    const { register } = await import('../../src/host/commands.js');
-    const { repo } = await hostProject();
-    const exit = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => { throw new Error(`exit ${code}`); }) as never);
-    const err = vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
-    const out = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
-    vi.stubEnv('MINIONS_RUNTIME', ''); // the host CLI
-    const cwd = process.cwd();
-    process.chdir(repo);
-    try {
-      for (const args of [['upgrade'], ['upgrade', '--dry-run'], ['upgrade', '--from-container', '--rebuild-cli', '--now']]) {
-        err.mockClear();
-        const program = new Command();
-        register(program);
-        await expect(program.parseAsync(args, { from: 'user' })).rejects.toThrow(/^exit [1-9]/);
-        const text = err.mock.calls.map((c) => String(c[0])).join('');
-        expect(text).toContain('supports the Docker runtime only');
-        expect(text).toContain('minions down && minions start');
-      }
-      expect(git(repo, 'status', '--porcelain')).toBe('');
-    } finally {
-      process.chdir(cwd);
-      exit.mockRestore(); err.mockRestore(); out.mockRestore();
-      vi.unstubAllEnvs();
-    }
-  });
-
   it('help: --rebuild-cli is offered and --from-container does not promise a host build', async () => {
     const { Command } = await import('commander');
     const { register } = await import('../../src/host/commands.js');
@@ -368,7 +270,7 @@ describe('minions upgrade on the host runtime', () => {
     const up = program.commands.find((c) => c.name() === 'upgrade')!;
     const opt = (flag: string) => up.options.find((o) => o.long === flag);
     expect(opt('--rebuild-cli')?.description).toMatch(/rebuilding\/reinstalling the global CLI .*review it first/);
-    expect(opt('--from-container')?.description).toMatch(/^local delivery only: .*strict fast-forward on a clean tree only \(GitHub delivery always takes origin\/<base>\)$/);
+    expect(opt('--from-container')?.description).toMatch(/^first export the container branches .*strict fast-forward on a clean tree only$/);
     expect(opt('--from-container')?.description).not.toMatch(/built|install/);
     expect(opt('--timeout')).toBeDefined();
     expect(opt('--now')).toBeDefined();

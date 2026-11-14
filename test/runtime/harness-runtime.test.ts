@@ -4,16 +4,16 @@ import { mkdirSync } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { PHASE_RULES } from '../../src/config/harnesses.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import type { MinionsError } from '../../src/core/errors.js';
 import { generatePlugin } from '../../src/plugin/generate.js';
 import { humanNext } from '../../src/runtime/commands.js';
-import { preAgentHook } from '../../src/runtime/hooks.js';
-import { checkProposal, formatSummary } from '../../src/runtime/role-proposals.js';
 import { Scheduler } from '../../src/runtime/scheduler.js';
 import { commitFile, makeDefaultEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const CODEX = { models: { default: 'gpt-6.1-sol', allowed: ['gpt-6.1-sol', 'gpt-6.1-mini'] }, effort: 'medium' as const };
 const PILOT_ROLE = { description: 'Second-opinion review on Codex.', promptText: 'Review the head.', contract: 'gate', harness: 'codex', deepVariant: true };
@@ -31,9 +31,6 @@ async function engineerStage(e: Env, id: string) {
   await e.sched.record(brief.leaseId, result({ branch: brief.branch, headSha: head }));
   return brief;
 }
-const loader = (e: Env) => () => ({ db: e.db, backlog: e.backlog, config: e.config });
-const agent = (subagent_type: string, prompt: string) => ({ hook_event_name: 'PreToolUse', tool_name: 'Agent', tool_input: { subagent_type, prompt, description: 'x' } });
-const decision = (o: { stdout?: string }) => (o.stdout ? JSON.parse(o.stdout) as { hookSpecificOutput: { permissionDecision: string; permissionDecisionReason: string } } : null);
 
 describe('back-compat: no harnesses', () => {
   it('the brief says harness claude and keeps the Claude model fields; work next launches an agent', async () => {
@@ -79,18 +76,6 @@ describe('phase 1 (b) pilot: codex-reviewer gate after the Claude engineer', () 
     expect(await e.sched.claim('task-1')).toMatchObject({ model: 'gpt-6.1-mini', harness: 'codex' });
   });
 
-  it('the pre-agent hook refuses to spawn a process-harness role as a Claude subagent, even with its lease', async () => {
-    const e = pilotEnv();
-    e.backlog.add({ id: 'task-1', workflow: 'pilot' });
-    await engineerStage(e, 'task-1');
-    const brief = await e.sched.claim('task-1');
-    for (const type of ['minions:codex-reviewer', 'minions:codex-reviewer-deep']) {
-      const d = decision(await preAgentHook(agent(type, brief.briefMarker), loader(e)))!;
-      expect(d.hookSpecificOutput.permissionDecision).toBe('deny');
-      expect(d.hookSpecificOutput.permissionDecisionReason).toMatch(/runs on OpenAI Codex CLI \(harness codex\), not as a Claude subagent/);
-    }
-  });
-
   it('the plugin has no Claude agent file for a process-harness role, only its resolved prompt for the runner', async () => {
     const e = pilotEnv();
     const out = await mkdtemp(join(tmpdir(), 'minions-harness-plugin-'));
@@ -100,21 +85,6 @@ describe('phase 1 (b) pilot: codex-reviewer gate after the Claude engineer', () 
       expect(files.filter((f) => f.includes('codex-reviewer'))).toEqual(['harness-prompts/codex-reviewer.md']);
       expect(await readFile(join(out, 'harness-prompts', 'codex-reviewer.md'), 'utf8')).toBe('Review the head.\n');
     } finally { await rm(out, { recursive: true, force: true }); }
-  });
-});
-
-describe('role proposals', () => {
-  it('a proposal may put a project gate on a configured harness; the summary shows it; the phase rules still apply', async () => {
-    const e = makeDefaultEnv((c) => set(c, { harnesses: { codex: CODEX } }));
-    const { summary } = await checkProposal(e.config, { name: 'codex-reviewer', role: { description: 'Second opinion.', contract: 'gate', harness: 'codex' }, promptText: 'Review.', reason: 'cross-model review' });
-    expect(summary.harness).toBe('codex');
-    expect(formatSummary(summary)).toMatch(/, harness codex/);
-    const claude = await checkProposal(e.config, { name: 'judge', role: { description: 'Judge.', contract: 'gate' }, promptText: 'Judge.', reason: 'r' });
-    expect(claude.summary.harness).toBe('claude');
-    expect(formatSummary(claude.summary)).not.toMatch(/harness/);
-    const x = await err(checkProposal(e.config, { name: 'maker', role: { description: 'Makes.', contract: 'producer', edits: 'any', harness: 'codex' }, promptText: 'Make.', reason: 'r' }));
-    expect(x.code).toBe('INVALID_CONFIG');
-    expect(JSON.stringify(x.details)).toMatch(/roles\.maker\.harness/);
   });
 });
 

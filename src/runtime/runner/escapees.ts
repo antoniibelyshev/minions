@@ -36,11 +36,17 @@ export async function procStatus(pid: number, proc = '/proc'): Promise<ProcStatu
 export const RUN_MARKER_ENV = 'MINIONS_WORKER_LEASE';
 
 /** True when /proc/<pid>/environ has `MINIONS_WORKER_LEASE=<leaseId>`; false when it has not or is unreadable. */
-export async function hasRunMarker(pid: number, leaseId: string, proc = '/proc'): Promise<boolean> {
+export const hasRunMarker = (pid: number, leaseId: string, proc = '/proc'): Promise<boolean> => hasEnvEntry(pid, `${RUN_MARKER_ENV}=${leaseId}`, proc);
+
+/** True when /proc/<pid>/environ has the exact `NAME=value` entry; false when it has not or is unreadable. */
+export async function hasEnvEntry(pid: number, entry: string, proc = '/proc'): Promise<boolean> {
   let env: string;
   try { env = await readFile(join(proc, String(pid), 'environ'), 'utf8'); } catch { return false; }
-  return env.split('\0').includes(`${RUN_MARKER_ENV}=${leaseId}`);
+  return env.split('\0').includes(entry);
 }
+
+/** The pid and its ancestors (through PPid), nearest first. */
+export const ancestorsOf = (pid: number, proc = '/proc'): Promise<number[]> => ancestors(pid, proc);
 
 export interface EscapeeSweepOptions {
   /** The lease being recovered: only processes carrying its marker are candidates. */

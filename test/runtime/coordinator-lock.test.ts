@@ -10,7 +10,6 @@ import {
   ESCALATE_KILL_MS, ESCALATE_TERM_MS, LOCK_RELEASE_WAIT_MS, LOCK_WAIT_MS, STUCK_TERM_WAIT_MS, stopStuckCoordinator,
   TMUX_SESSION, waitForLockRelease, type ProcessControl, type SpawnLike,
 } from '../../src/runtime/coordinator.js';
-import { intakeOnStart, STARTUP_INTAKE_BUDGET_MS } from '../../src/runtime/commands.js';
 import { pidAlive, RuntimeDb } from '../../src/runtime/db.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { defaults } from '../helpers.js';
@@ -576,7 +575,7 @@ describe('wrapper signal handling releases the lock', () => {
       const probing = deferred<void>();
       const report = deferred<never>();
       const p = coordinatorWrapper(async () => cfg, {
-        paths, spawn: child.spawn, permissionModes: autoModes, probe: () => { probing.resolve(); return report.promise; }, env: {}, log: () => {}, signals: bus,
+        paths, spawn: child.spawn, permissionModes: autoModes, claudeVersion: () => { probing.resolve(); return report.promise; }, env: {}, log: () => {}, signals: bus,
       });
       await probing.promise;
       expect(lockOf(paths)).toMatchObject({ pid: process.pid });
@@ -589,30 +588,28 @@ describe('wrapper signal handling releases the lock', () => {
       expect(child.count()).toBe(0);
     });
 
-    // Merge of task-19: the GitHub startup intake runs between the lock and the spawn, inside the guard.
-    it('SIGHUP during the startup intake aborts the pass, releases the lock, exits 129, and never starts claude', async () => {
+    // The startup step runs between the lock and the spawn, inside the guard.
+    it('SIGHUP during the startup step aborts it, releases the lock, exits 129, and never starts claude', async () => {
       const { paths } = layout();
       const cfg = terminalCfg();
-      cfg.intake.github = { enabled: true, repository: 'acme/demo', labels: [], assignee: null, milestone: null, state: 'open' };
       const bus = signalBus();
       const child = signalledChild();
-      const syncing = deferred<AbortSignal>();
+      const starting = deferred<AbortSignal>();
       const exits: number[] = [];
       const logs: string[] = [];
-      // The real CLI wiring (intakeOnStart with the wrapper's stop signal) and the default 25 s budget.
-      const sync = (o: { signal: AbortSignal }) => { syncing.resolve(o.signal); return new Promise<never>((_, rej) => o.signal.addEventListener('abort', () => rej(new Error('aborted')))); };
       const t0 = Date.now();
       const p = coordinatorWrapper(async () => cfg, {
         paths, spawn: child.spawn, permissionModes: autoModes, env: { TMUX: 'x' }, log: (l) => logs.push(l), signals: bus,
-        onStart: (c, l, stop) => intakeOnStart(c, l, sync, undefined, stop), exitAfterSignal: (c) => exits.push(c),
+        onStart: (_c, _l, stop) => { starting.resolve(stop); return new Promise<void>((res) => stop.addEventListener('abort', () => res())); },
+        exitAfterSignal: (c) => exits.push(c),
       });
-      const passSignal = await syncing.promise;
+      const stop = await starting.promise;
       expect(lockOf(paths)).toMatchObject({ pid: process.pid, session: TMUX_SESSION });
-      expect(bus.count()).toBe(4); // guarded during the intake
+      expect(bus.count()).toBe(4); // guarded during the startup step
       bus.emit('SIGHUP');
       expect(await p).toBe(129);
-      expect(Date.now() - t0).toBeLessThan(STARTUP_INTAKE_BUDGET_MS); // promptly, not after the intake budget
-      expect(passSignal.aborted).toBe(true); // the intake pass is aborted with the wrapper
+      expect(Date.now() - t0).toBeLessThan(10_000); // promptly
+      expect(stop.aborted).toBe(true); // the startup step is aborted with the wrapper
       expect(lockOf(paths)).toBeUndefined();
       expect(bus.count()).toBe(0);
       expect(exits).toEqual([129]);
@@ -736,9 +733,10 @@ describe('lock holder identity (start time)', () => {
     expect(coordinatorPidAlive(OTHER_PID, { start: '100' }, pcOf(null, null))).toBe(true);
   });
 
-  it('reads the real start time from /proc where it exists', () => {
+  it('reads the real start time (from /proc, or ps off Linux)', () => {
     const start = procStartTime(process.pid);
-    if (!existsSync('/proc/self/stat')) { expect(start).toBeNull(); return; }
+    // Off Linux the start time comes from ps (task-103.2), or null where that is unavailable.
+    if (!existsSync('/proc/self/stat') && start === null) return;
     expect(start).toMatch(/^\d+$/);
     expect(procStartTime(process.pid)).toBe(start); // stable for the process lifetime
     const pc = { alive: pidAlive, cmdline: () => WRAPPER_CMD, startTime: procStartTime };

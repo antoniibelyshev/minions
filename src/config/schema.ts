@@ -2,12 +2,24 @@ import { z } from 'zod';
 import { isRequiredCoordinatorTool } from './coordinator-tools.js';
 import { HARNESS_IDS, PROCESS_HARNESS_IDS } from './harnesses.js';
 
+/** An SSH target of coordinator.sshHosts: `host` or `user@host`, nothing a permission pattern or a shell would expand. */
+export const SSH_TARGET = /^(?:[A-Za-z_][A-Za-z0-9_.-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*$/;
+
+/** A pattern of coordinator.unsandboxedCommands: a program name or path, then plain words or `*`; no shell operators or quotes. */
+export const UNSANDBOXED_PATTERN = /^[A-Za-z0-9_./][A-Za-z0-9_./+=:@-]*(?: (?:[A-Za-z0-9_./+=:@,%-]+|\*))*$/;
+
+/** A host of coordinator.allowedDomains: a DNS name, optionally with a leading `*.` wildcard. */
+export const SANDBOX_DOMAIN = /^(?:\*\.)?[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)+$/;
+
+/** Permission modes the coordinator (and its workers) may run in. */
+export const COORDINATOR_PERMISSION_MODES = ['auto', 'acceptEdits', 'bypassPermissions'] as const;
+
 export const CAPABILITIES = [
   'task.read', 'task.create', 'task.update', 'task.start',
-  'external.read', 'external.comment', 'external.changeStatus', 'external.create',
   'code.edit', 'dependencies.edit', 'architecture.change', 'migrations.edit',
-  'git.commit', 'git.push',
-  'pr.create', 'pr.review', 'pr.merge',
+  'git.commit',
+  // Local integration (docs/design/local-auto-integration.md): the runtime merging an approved head into the local base.
+  'base.merge',
   'ci.edit', 'infrastructure.edit',
   'network.use',
   'deploy.execute',
@@ -40,12 +52,20 @@ export const CapabilityRuleSchema = z.union([
 ]);
 export type CapabilityRule = z.infer<typeof CapabilityRuleSchema>;
 
+/**
+ * Capabilities added after configs were first written default when an effective config lacks them, fail closed:
+ * an effective config generated before base.merge existed (task-82.3) keeps local integration off (deny: approvals
+ * end delivered, as before) until the host regenerates it from the mode defaults.
+ */
+const LATER_CAPABILITY_DEFAULTS: Partial<Record<Capability, 'deny'>> = { 'base.merge': 'deny' };
+
 export const CapabilitiesSchema = z.object(
-  Object.fromEntries(CAPABILITIES.map((c) => [c, CapabilityRuleSchema])) as Record<Capability, typeof CapabilityRuleSchema>,
+  Object.fromEntries(CAPABILITIES.map((c) => [c, LATER_CAPABILITY_DEFAULTS[c] ? CapabilityRuleSchema.default(LATER_CAPABILITY_DEFAULTS[c]) : CapabilityRuleSchema])) as Record<Capability, typeof CapabilityRuleSchema>,
 ).strict();
 
-export const PROFILES = ['project-owner', 'personal-work', 'supervised'] as const;
-export type Profile = (typeof PROFILES)[number];
+/** Operating modes (docs/design/autonomy.md Decision 11): the agents run the project, or the owner reviews and merges. */
+export const MODES = ['independent', 'supervised'] as const;
+export type Mode = (typeof MODES)[number];
 
 /** communication.channel values. */
 export const CHANNELS = ['terminal', 'telegram', 'auto'] as const;
@@ -57,6 +77,12 @@ const modelId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:@\[\]-]*$/, 'must be 
 /** Git branch name; also passed to git argv, so it may not start with '-' or contain '..'. */
 const branchName = z.string().regex(/^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$/, 'must be a plain git branch name');
 const port = z.number().int().min(1).max(65535);
+/** A local clock time "HH:MM" (routine.digestAt). */
+export const DIGEST_TIME = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
+/** Whether Intl knows this IANA time zone (no dependency: the runtime's ICU data). */
+export function isTimeZone(tz: string): boolean {
+  try { new Intl.DateTimeFormat('en-US', { timeZone: tz }); return true; } catch { return false; }
+}
 /** Claude Code reasoning effort levels (`--effort`, agent frontmatter `effort`; Claude Code 2.1.292). */
 export const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const;
 export type Effort = (typeof EFFORTS)[number];
@@ -78,7 +104,22 @@ const effectColumn = z.object(
   Object.fromEntries(CAPABILITIES.map((c) => [c, EffectSchema.optional()])) as Record<Capability, z.ZodOptional<typeof EffectSchema>>,
 ).strict();
 
+/** A worker env variable name (an owner secret or an `env` entry; docs/design/autonomy.md Decision 4). */
+export const SECRET_NAME = /^[A-Z][A-Z0-9_]{1,63}$/;
+/**
+ * Names a worker env entry may never set: minions' own variables, and those that change what a program runs or where
+ * it reads code and config (the worker's unsandboxed hooks inherit the env).
+ */
+export const RESERVED_ENV = /^(CLAUDE_|ANTHROPIC_|MINIONS_|TELEGRAM_|GIT_|GH_|SSH_|LD_|DYLD_|NODE_(?!ENV$)|NPM_CONFIG_|PYTHON|PERL|RUBY|XDG_|BASH|ZDOTDIR$|ENV$|SHELL|IFS$|PS4$|PROMPT_COMMAND$|PATH$|HOME$|TMPDIR$|USER$|LOGNAME$|(HTTPS?|ALL|NO|FTP)_PROXY$|SSL_CERT_|CURL_|CARGO_HOME$|RUSTUP_HOME$|GO(PATH|ROOT|BIN|TOOLCHAIN)$|UV_(INSTALL_DIR|TOOL_DIR|TOOL_BIN_DIR|PYTHON_INSTALL_DIR)$)/;
+
+/** A Debian package name (Debian Policy 5.6.1), as `container.aptPackages` takes it: no version, no architecture. */
+export const APT_PACKAGE = /^[a-z0-9][a-z0-9+.-]{1,99}$/;
+export const MAX_APT_PACKAGES = 50;
+export const AptPackagesSchema = z.array(z.string().regex(APT_PACKAGE, 'must be a Debian package name (lowercase letters, digits, + - .)'))
+  .max(MAX_APT_PACKAGES);
+
 /** A project-defined worker role (D3). */
+
 export const CustomRoleSchema = z.object({
   description: nonEmpty,
   /** Markdown prompt body, relative to the config dir (e.g. `agents/researcher.md`). Exactly one of prompt / promptText. */
@@ -173,15 +214,13 @@ export const HarnessesSchema = z.object({
 }).strict();
 export type HarnessesConfig = z.infer<typeof HarnessesSchema>;
 
-/** Conditions of a conditional workflow stage (D5): `qa` = run only when the task needs QA. */
-export const STAGE_WHEN = ['qa'] as const;
 /**
- * One workflow stage (D5): a role name, or `{ role, when?, model? }`; `model` is a model hint validated against the
+ * One workflow stage (D5): a role name, or `{ role, model? }`; `model` is a model hint validated against the
  * stage role's harness (models.allowed for claude). A hint never names a harness (agent-runtimes D8).
  */
 export const WorkflowStageSchema = z.union([
   nonEmpty,
-  z.object({ role: nonEmpty, when: z.enum(STAGE_WHEN).optional(), model: modelId.optional() }).strict(),
+  z.object({ role: nonEmpty, model: modelId.optional() }).strict(),
 ]);
 export type WorkflowStageConfig = z.infer<typeof WorkflowStageSchema>;
 /**
@@ -195,12 +234,11 @@ export const MinionsConfigSchema = z.object({
   configRevision: z.number().int().min(1),
   projectId: z.uuid(),
   packageVersion: nonEmpty,
-  profile: z.enum(PROFILES),
+  mode: z.enum(MODES),
   visibility: z.enum(['shared', 'private']),
   backlog: z.object({
-    backend: z.enum(['backlogmd', 'github']),
+    backend: z.enum(['backlogmd']),
     ownership: z.enum(['direct', 'personal', 'assigned']),
-    repository: z.string().nullable(),
   }).strict(),
   intake: z.object({
     sources: z.array(z.enum(['user', 'milestone', 'external'])).min(1),
@@ -211,22 +249,6 @@ export const MinionsConfigSchema = z.object({
       requiredLabels: z.array(nonEmpty),
       allowedPaths: z.array(nonEmpty).min(1),
     }).strict(),
-    /**
-     * GitHub-filtered intake sync (src/runtime/intake-sync.ts): `minions sync` and coordinator startup import
-     * matching issues into the backlog (read-only on GitHub, additive, idempotent). Unset or disabled = off.
-     */
-    github: z.object({
-      enabled: z.boolean(),
-      /** "owner/repo"; null = the workspace origin. */
-      repository: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, 'must be "owner/repo"').nullable(),
-      /** Issues must carry all of these labels. */
-      labels: z.array(z.string().regex(/^[^,\r\n]+$/, 'must be non-empty, without commas or newlines')),
-      /** GitHub login, "none" (unassigned) or "*" (any assignee); null = no assignee filter. */
-      assignee: z.string().regex(/^(?:\*|none|[A-Za-z0-9][A-Za-z0-9-]{0,38})$/, 'must be a GitHub login, "none" or "*"').nullable(),
-      /** Milestone title or number, "none" or "*"; null = no milestone filter. */
-      milestone: z.string().regex(/^[^\r\n]+$/, 'must be a single non-empty line').nullable(),
-      state: z.enum(['open', 'closed', 'all']),
-    }).strict().optional(),
   }).strict(),
   container: z.object({
     required: z.literal(true),
@@ -240,6 +262,13 @@ export const MinionsConfigSchema = z.object({
     network: z.enum(['outbound-internet', 'none']),
     mountHostRepository: z.boolean(),
     mountDockerSocket: z.boolean(),
+    /** Docker runtime: Debian packages added to the image (a derived image, rebuilt by `minions start` / `upgrade`). */
+    aptPackages: AptPackagesSchema.optional(),
+    /**
+     * Docker runtime: GPUs in the container. Unset/"auto" = every NVIDIA GPU when the host has the NVIDIA container
+     * toolkit (Linux); "nvidia" always; "none" never. Docker on macOS cannot pass Metal (MPS) through.
+     */
+    gpus: z.enum(['auto', 'nvidia', 'none']).optional(),
   }).strict(),
   execution: z.object({
     maxActiveTasks: z.number().int().min(1),
@@ -270,42 +299,60 @@ export const MinionsConfigSchema = z.object({
     }).strict().optional(),
     /** Model of the coordinator session (`--model`); unset = Claude Code default. Must be in `allowed`. */
     coordinator: modelId.optional(),
+    /**
+     * Model of the router session (docs/design/coordinator-sessions.md decision 3; used only with
+     * coordinator.sessions.enabled). Unset = `haiku` (DEFAULT_ROUTER_MODEL). When set, it must be in `allowed`.
+     */
+    router: modelId.optional(),
   }).strict(),
   delivery: z.object({
-    provider: z.enum(['none', 'github']),
-    mode: z.enum(['local', 'branch', 'pull-request']),
-    merge: z.enum(['disabled', 'manual', 'auto-when-eligible']),
-    method: z.enum(['squash', 'merge', 'rebase']),
-    deleteMergedBranches: z.boolean(),
-    identityMode: z.enum(['git-identity', 'user-token', 'github-apps']),
-    requireIndependentApproval: z.boolean(),
-    requiredChecksConfigured: z.boolean(),
+    /** "auto-when-eligible": the local integrator lands approved heads on the base (docs/design/local-auto-integration.md). */
+    merge: z.enum(['disabled', 'auto-when-eligible']),
+    /**
+     * Local integration (docs/design/local-auto-integration.md, src/runtime/integrator.ts): the wall-clock limit of
+     * each setup and verification command of the integration gate, in minutes. A timeout is transient (one retry).
+     * Default 30.
+     */
+    integrationTimeoutMinutes: z.number().int().min(1).optional(),
   }).strict(),
   verification: z.object({
-    commands: z.array(nonEmpty),
-    /** true: every task gets a tester stage (the old flow). false: only tasks that need QA (qaLabels, sensitive paths, reviewer needsQa). */
-    testerRequired: z.boolean(),
-    reviewerRequired: z.boolean(),
-    /** Labels that opt a task into a tester stage; the first is added when the runtime records a QA need. Default ["qa"]. */
-    qaLabels: z.array(nonEmpty).min(1).optional(),
     /**
-     * "github": tester/reviewer stages may rely on passing required CI checks (branch protection or
-     * rulesets on the base) observed by `minions sync` for the exact head under test/review, instead of
-     * re-running the full verification locally (src/runtime/ci-gate.ts). Missing, failing, unknown or
-     * pending-too-long CI never approves; the stage falls back to the full local verification (every verification.commands entry passing locally). "none": local only.
+     * The fast tier (docs/design/autonomy.md Decision 12): unit tests, typecheck, lint. The dispatcher runs them on
+     * every producer head before the reviewer, and the local integrator on the merged tree before it lands.
      */
-    ciAuthority: z.enum(['none', 'github']),
-    /** ciAuthority github: minutes required checks may stay pending (from the first observation of a head) before CI counts as timed out. Default 60. */
-    ciPendingTimeoutMinutes: z.number().int().min(1).optional(),
+    commands: z.array(nonEmpty),
+    /**
+     * Commands that install dependencies in a verification worktree before the commands (for example `npm ci`).
+     * Run only when they or the lockfile changed since the last successful setup; a failure is transient. Default [].
+     */
+    setupCommands: z.array(nonEmpty).optional(),
+    reviewerRequired: z.boolean(),
+    /**
+     * The slow tier (Decision 12): run by the dispatcher on the base head every `everyHours` (default 24) when the
+     * base moved since the last run, and on the head of a task labelled `verify:full`. A failure becomes one backlog task.
+     */
+    periodic: z.object({
+      commands: z.array(nonEmpty).min(1),
+      everyHours: z.number().positive().optional(),
+    }).strict().optional(),
   }).strict(),
   communication: z.object({
     /** "auto": Telegram when a bot token is stored and the runtime supports it, else terminal (src/telegram/channel.ts). */
     channel: z.enum(CHANNELS),
     progress: z.enum(['milestones', 'tasks', 'quiet']),
   }).strict(),
+  /**
+   * The owner's spend caps (docs/design/autonomy.md Decisions 13 and 15); only the owner changes them. USD caps count
+   * the estimate and are enforced with API-key billing only; token caps are enforced on any billing. Daily caps count
+   * everything (coordinator and workers) since local midnight in routine.timezone; per-task caps count the task's workers.
+   */
   budgets: z.object({
     taskUsd: z.number().positive().nullable(),
     dailyUsd: z.number().positive().nullable(),
+    /** Tokens of a task's workers (all attempts); at the cap its next stage waits and the task is held for the coordinator. Unset or null = off. */
+    taskTokens: z.number().int().positive().nullable().optional(),
+    /** Tokens of everything since local midnight (routine.timezone); at the cap no new stage starts. Unset or null = off. */
+    dailyTokens: z.number().int().positive().nullable().optional(),
   }).strict(),
   capabilities: CapabilitiesSchema,
   /** Built-in role overrides and project-defined worker roles (docs/design/roles-and-workflows.md D3, D9). */
@@ -323,11 +370,33 @@ export const MinionsConfigSchema = z.object({
   /** Coordinator session settings (src/runtime/coordinator.ts). */
   coordinator: z.object({
     /**
-     * Claude Code permission mode of the coordinator session (container runtime). Unset = "auto": a
-     * classifier may approve actions outside the allow list; the deny and ask rules still apply.
-     * "acceptEdits" opts back into prompting for every non-allowlisted Bash call. Never bypassPermissions.
+     * Claude Code permission mode of the coordinator session and its workers. Unset = "auto": a classifier
+     * may approve actions outside the allow list; the deny rules still apply. "acceptEdits" opts back into
+     * prompting for every non-allowlisted Bash call. "bypassPermissions" never prompts (fully unattended;
+     * deny rules still apply); only the host-only config.local.json may select it (src/config/resolve.ts).
      */
-    permissionMode: z.enum(['auto', 'acceptEdits']).optional(),
+    permissionMode: z.enum(COORDINATOR_PERMISSION_MODES).optional(),
+    /**
+     * Host runtime only: the Claude Code sandbox around Bash (src/runtime/coordinator.ts hostSettings). Unset = on;
+     * false runs commands unsandboxed as the owner's user. Only config.local.json may turn it off.
+     */
+    sandbox: z.boolean().optional(),
+    /**
+     * Host runtime only: SSH targets (`user@host` or `host`) that `ssh`, `scp` and `rsync` may reach. Those calls run
+     * outside the sandbox with the owner's SSH setup, without a prompt (workers too). Only config.local.json and the
+     * owner set it, never the coordinator's control overlay.
+     */
+    sshHosts: z.array(z.string().regex(SSH_TARGET, 'must be host or user@host (letters, digits, . _ -)')).optional(),
+    /**
+     * Host runtime only: Bash permission patterns (`uv run python -m train *`) whose calls run outside the sandbox, without
+     * a prompt (workers too), e.g. GPU training: the sandbox blocks Metal (MPS). Same owner-only rule as sshHosts.
+     */
+    /**
+     * Host runtime only: hosts sandboxed commands may reach besides the npm registry (`crates.io`, `*.pythonhosted.org`),
+     * through the sandbox proxy (HTTP(S)-aware tools). Same owner-only rule as sshHosts.
+     */
+    allowedDomains: z.array(z.string().regex(SANDBOX_DOMAIN, 'must be a host name, optionally *.<domain>')).optional(),
+    unsandboxedCommands: z.array(z.string().regex(UNSANDBOXED_PATTERN, 'must be a plain command pattern (a program, then words or *; no shell operators)')).optional(),
     /**
      * Claude Code tools removed from the coordinator session (`--disallowedTools`). Unset = the default
      * trim (COORDINATOR_DISALLOWED_TOOLS, src/config/coordinator-tools.ts); a list replaces it; [] keeps
@@ -360,7 +429,78 @@ export const MinionsConfigSchema = z.object({
       /** Reset after this many worker hand-offs (records and releases) in this session (default 10). */
       handoffs: z.number().int().min(1).nullable().optional(),
     }).strict().optional(),
+    /**
+     * Router plus per-task coordinator sessions (docs/design/coordinator-sessions.md; src/runtime/sessions.ts). Unset =
+     * off: the single coordinator, as before. Built in phases; until phase 9 it stays off.
+     */
+    sessions: z.object({
+      /** Default false. */
+      enabled: z.boolean().optional(),
+      /** Headless session processes at once (default execution.maxActiveTasks + 1). */
+      max: z.number().int().min(1).optional(),
+      /** One session per Telegram thread: a top-level owner message opens a new one (default true; docs/design/autonomy.md Decision 6). */
+      threads: z.boolean().optional(),
+      /** A thread session closes after this many minutes without a message (default 240); a reply reopens it. */
+      threadIdleMinutes: z.number().int().min(5).max(7 * 24 * 60).optional(),
+    }).strict().optional(),
   }).strict().optional(),
+  /**
+   * Unattended routine (docs/design/unattended-delivery.md, phase 1; src/runtime/routine.ts): a deterministic pass
+   * (`minions sync --routine`: the wake decision) every `tickMinutes`, run by the
+   * coordinator wrapper's clock. It wakes the coordinator with a fresh session only
+   * when a model is needed. Unset = off; every unset field takes its default.
+   */
+  routine: z.object({
+    /** Default false: no clock, no watchdog pass, no wake or crash start. */
+    enabled: z.boolean().optional(),
+    /** Minutes between routine passes (default 15). */
+    tickMinutes: z.number().int().min(1).max(1440).optional(),
+    /** Minimum minutes between two coordinator wakes (default 30). */
+    minWakeGapMinutes: z.number().int().min(1).optional(),
+    /** Coordinator wakes per day in `timezone` (default 8; the digest wake always counts and is always allowed). */
+    maxWakesPerDay: z.number().int().min(0).optional(),
+    /**
+     * Local digest times, "HH:MM" in `timezone` (default ["08:00"], phase 4): the routine wakes the coordinator to
+     * send one digest with the held notifications and questions; a missed time is caught up at the next pass.
+     */
+    digestAt: z.array(z.string().regex(DIGEST_TIME, 'must be HH:MM (00:00 to 23:59)')).min(1).max(4).optional(),
+    /** IANA time zone of digestAt and of the routine's days (default Europe/Berlin). */
+    timezone: z.string().min(1).refine(isTimeZone, 'must be an IANA time zone such as Europe/Berlin').optional(),
+    /**
+     * Planning wakes (docs/design/autonomy.md Decision 16): with the queue empty and an open goal in the goals file, wake
+     * the coordinator to plan the next tasks. Default: true in independent mode, false in supervised.
+     */
+    planWhenIdle: z.boolean().optional(),
+    /** Planning wakes per day in `timezone` (default 4; each also counts as a wake). */
+    maxPlanWakesPerDay: z.number().int().min(0).optional(),
+    /** Minimum minutes between two planning wakes (default 120). */
+    minPlanGapMinutes: z.number().int().min(1).optional(),
+    /** Legacy: the removed auto-promotion caps (task-130). Accepted so old configs still load, and ignored. */
+    autoPromote: z.record(z.string(), z.unknown()).optional(),
+  }).strict().optional(),
+  /**
+   * The autopilot dispatcher (docs/design/autonomy.md Decisions 1 and 10; src/runtime/dispatcher.ts), the only way
+   * stages run: it claims runnable stages, runs each as a headless worker, records the result and hands only decisions
+   * to the coordinator.
+   */
+  dispatch: z.object({
+    /** Wall-clock limit of one headless worker in minutes (default 120). */
+    workerTimeoutMinutes: z.number().int().min(5).max(24 * 60).optional(),
+    /** Seconds between dispatcher passes (default 10). */
+    tickSeconds: z.number().int().min(2).max(600).optional(),
+  }).strict().optional(),
+  /**
+   * Plain (non-secret) env variables of the dispatcher's workers, which the coordinator may change
+   * (docs/design/autonomy.md Decision 4). Visible in config and the journal: never a credential (those are owner secrets).
+   */
+  env: z.record(z.string(), z.string().max(4096).refine((v) => !v.includes('\0'), 'must not contain NUL')).superRefine((r, ctx) => {
+    const names = Object.keys(r);
+    if (names.length > 50) ctx.addIssue({ code: 'custom', message: 'at most 50 entries' });
+    for (const n of names) {
+      if (!SECRET_NAME.test(n)) ctx.addIssue({ code: 'custom', path: [n], message: 'must be an env variable name (A-Z, 0-9, _)' });
+      else if (RESERVED_ENV.test(n)) ctx.addIssue({ code: 'custom', path: [n], message: 'is reserved (minions sets it, or it changes what programs run)' });
+    }
+  }).optional(),
   /**
    * Legacy coordinator permission mode. Only "default" is still honoured (as a stricter choice) when
    * coordinator.permissionMode is unset; "acceptEdits" and "auto" mean the default (auto).
@@ -371,8 +511,10 @@ export const MinionsConfigSchema = z.object({
 export type MinionsConfig = z.infer<typeof MinionsConfigSchema>;
 
 export function configJsonSchema(): Record<string, unknown> {
-  return {
-    title: 'Minions configuration',
-    ...z.toJSONSchema(MinionsConfigSchema, { target: 'draft-2020-12', reused: 'ref' }),
-  };
+  const schema = z.toJSONSchema(MinionsConfigSchema, { target: 'draft-2020-12', reused: 'ref' }) as Record<string, unknown>;
+  // A capability added later (LATER_CAPABILITY_DEFAULTS) has a default, so a config may leave it out: the output
+  // schema marks defaulted keys required, which would reject such a config in an editor (task-82.4).
+  const caps = (schema.properties as Record<string, { required?: string[] }> | undefined)?.capabilities;
+  if (caps?.required) caps.required = caps.required.filter((k) => !(k in LATER_CAPABILITY_DEFAULTS));
+  return { title: 'Minions configuration', ...schema };
 }

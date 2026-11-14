@@ -16,15 +16,14 @@ export interface Control {
 }
 
 export const CONTROLS: readonly Control[] = [
-  { id: 'pause-intake', phrases: ['pause intake'], argv: ['pause', '--intake'], description: 'stop turning new requests/issues into tasks' },
+  { id: 'pause-intake', phrases: ['pause intake'], argv: ['pause', '--intake'], description: 'stop turning new requests into tasks' },
   { id: 'pause-starts', phrases: ['pause starts', 'pause new starts', 'stop starting'], argv: ['pause', '--starts'], description: 'start no new tasks; running workers finish' },
   { id: 'pause', phrases: ['pause', 'pause all', 'pause everything'], argv: ['pause'], description: 'pause intake and starts' },
   { id: 'resume-intake', phrases: ['resume intake'], argv: ['resume', '--intake'], description: 'resume intake only' },
   { id: 'resume-starts', phrases: ['resume starts'], argv: ['resume', '--starts'], description: 'resume starts only' },
   { id: 'resume', phrases: ['resume', 'resume all', 'unpause'], argv: ['resume'], description: 'resume intake and starts' },
   { id: 'status', phrases: ['status', 'progress'], argv: ['status'], description: 'queue, workers, pause state, pending notifications' },
-  { id: 'sync', phrases: ['sync'], argv: ['sync'], description: 'import issues, refresh PR/CI state, report pending notifications' },
-  { id: 'cancel', phrases: ['cancel <task>', 'stop <task>'], argv: ['work', 'cancel', '<task>', '--reason', 'owner cancelled'], description: 'release the task\'s worker leases (best effort; worktree kept) and mark it blocked so it is not re-dispatched; stop its running subagents' },
+  { id: 'cancel', phrases: ['cancel <task>', 'stop <task>'], argv: ['work', 'cancel', '<task>', '--reason', 'owner cancelled'], description: 'release the task\'s worker leases (best effort; worktree kept) and mark it blocked so the dispatcher does not start it again (it stops the running workers)' },
   { id: 'cancel-all', phrases: ['cancel all', 'stop all workers'], argv: ['work', 'cancel', '--all', '--reason', 'owner cancelled'], description: 'release every worker lease (best effort; worktrees kept) and mark those tasks blocked' },
 ];
 

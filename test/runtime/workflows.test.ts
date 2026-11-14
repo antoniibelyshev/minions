@@ -1,8 +1,10 @@
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { MinionsError } from '../../src/core/errors.js';
 import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
 import { commitFile, makeDefaultEnv, result, tmp, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const err = async (p: Promise<unknown>) => {
   try { await p; } catch (e) { return e as MinionsError; }
@@ -65,39 +67,7 @@ describe('workflows: the docs workflow', () => {
   });
 });
 
-describe('workflows: QA cannot be skipped by choosing a workflow (invariant 3)', () => {
-  it('a QA label inserts the built-in tester before the final gate of a workflow without one', async () => {
-    const env = makeDefaultEnv((c) => { c.workflows = DOCS; });
-    env.backlog.add({ id: 'task-1', workflow: 'docs', labels: ['qa'] });
-    const { r } = await engineer(env, 'task-1');
-    expect(r).toMatchObject({ to: 'testing' });
-    expect(r.message).toMatch(/QA required \(label qa\): task → testing/);
-    expect(stageRow(env, 'task-1')).toEqual({ workflow: 'docs', position: 1, roles: ['engineer', 'tester', 'reviewer'] });
-    expect((await err(env.sched.claim('task-1', 'reviewer'))).code).toBe('PRECONDITION');
-    expect((await tester(env, 'task-1')).r).toMatchObject({ to: 'reviewing' });
-    expect((await reviewer(env, 'task-1')).r).toMatchObject({ approved: true, to: 'delivered' });
-  });
-
-  it('a sensitive path gets a tester in any workflow, and the QA label is recorded', async () => {
-    const env = makeDefaultEnv((c) => { c.workflows = DOCS; });
-    env.backlog.add({ id: 'task-1', workflow: 'docs' });
-    const { r } = await engineer(env, 'task-1', 'CLAUDE.md');
-    expect(r).toMatchObject({ to: 'testing' });
-    expect(env.backlog.tasks.get('task-1')!.labels).toContain('qa');
-  });
-
-  it('a gate flagging needsQa sends the task to an inserted tester, then back to the gate', async () => {
-    const env = makeDefaultEnv((c) => { c.workflows = DOCS; });
-    env.backlog.add({ id: 'task-1', workflow: 'docs' });
-    await engineer(env, 'task-1');
-    const first = await reviewer(env, 'task-1', { needsQa: true });
-    expect(first.r).toMatchObject({ approved: false, to: 'testing' });
-    expect(first.r.message).toMatch(/no passing tester evidence/);
-    expect(stageRow(env, 'task-1')).toEqual({ workflow: 'docs', position: 1, roles: ['engineer', 'tester', 'reviewer'] });
-    expect((await tester(env, 'task-1')).r).toMatchObject({ to: 'reviewing' });
-    expect((await reviewer(env, 'task-1')).r).toMatchObject({ approved: true, to: 'delivered' });
-  });
-
+describe('workflows: QA sweeps', () => {
   it('a QA sweep ignores workflows (tester only)', async () => {
     const env = makeDefaultEnv((c) => { c.workflows = DOCS; });
     env.backlog.add({ id: 'task-1', workflow: 'docs', labels: ['qa-sweep'] });
@@ -111,7 +81,7 @@ describe('workflows: QA cannot be skipped by choosing a workflow (invariant 3)',
 
 describe('workflows: repair targets and replan', () => {
   it('a reviewer request-changes goes to the engineer (not the committing tester before it) and counts repair cycles', async () => {
-    const env = makeDefaultEnv((c) => { c.verification.testerRequired = true; c.execution.maxRepairCyclesBeforeReplan = 2; });
+    const env = makeDefaultEnv((c) => { c.workflows = { default: ['engineer', 'tester', 'reviewer'] }; c.execution.maxRepairCyclesBeforeReplan = 2; });
     env.backlog.add({ id: 'task-1' });
     await engineer(env, 'task-1');
     await tester(env, 'task-1');
@@ -126,7 +96,7 @@ describe('workflows: repair targets and replan', () => {
   });
 
   it('a tester needs_changes goes to the engineer without counting a repair cycle', async () => {
-    const env = makeDefaultEnv((c) => { c.verification.testerRequired = true; });
+    const env = makeDefaultEnv((c) => { c.workflows = { default: ['engineer', 'tester', 'reviewer'] }; });
     env.backlog.add({ id: 'task-1' });
     await engineer(env, 'task-1');
     const b = await env.sched.claim('task-1', 'tester');
@@ -152,7 +122,7 @@ describe('workflows: legacy tasks and assignment', () => {
     expect((await env.sched.record(t.leaseId, result({ branch: t.branch, headSha: t.expectedHead }))).to).toBe('reviewing');
     env.db.exec('DELETE FROM task_stages');
     const rv = await reviewer(env, 'task-1');
-    expect(rv.brief.stage).toMatchObject({ position: 2, role: 'reviewer' });
+    expect(rv.brief.stage).toMatchObject({ position: 1, role: 'reviewer' });
     expect(rv.r).toMatchObject({ approved: true, to: 'delivered' });
     expect(brief.stage!.position).toBe(0);
   });
@@ -161,13 +131,13 @@ describe('workflows: legacy tasks and assignment', () => {
     const env = makeDefaultEnv();
     env.backlog.add({ id: 'task-1' });
     await engineer(env, 'task-1');
-    expect(stageRow(env, 'task-1')!.position).toBe(2);
+    expect(stageRow(env, 'task-1')!.position).toBe(1);
     env.backlog.tasks.get('task-1')!.status = 'ready';
     expect((await env.sched.claim('task-1', 'engineer')).stage!.position).toBe(0);
   });
 
   it('a workflow changed between stages takes effect at the next claim', async () => {
-    const env = makeDefaultEnv((c) => { c.verification.testerRequired = true; c.workflows = DOCS; });
+    const env = makeDefaultEnv((c) => { c.workflows = { ...DOCS, default: ['engineer', 'tester', 'reviewer'] }; });
     env.backlog.add({ id: 'task-1' });
     await engineer(env, 'task-1');
     expect(env.backlog.status('task-1')).toBe('testing');

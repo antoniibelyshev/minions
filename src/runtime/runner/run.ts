@@ -130,7 +130,7 @@ export async function assertRunAllowed(leaseId: string, deps: RunnerDeps): Promi
     const drain = db.drain();
     throw deny(drain ? `Starts are paused for a drain (${drain.reason}).` : 'Starts are paused (paused_starts).', drain ? undefined : 'Run `minions resume` to allow new work.');
   }
-  assertBudgetAllowsStart({ db, billing: deps.billing ?? billingOf(), config, now: (deps.now ?? (() => new Date()))() });
+  assertBudgetAllowsStart({ db, billing: deps.billing ?? billingOf(), config, now: (deps.now ?? (() => new Date()))() }, lease.task_id);
   const others = active.filter((l) => l.id !== leaseId);
   const otherTasks = new Set(others.map((l) => l.task_id).filter((t) => t !== lease.task_id));
   if (otherTasks.size >= config.execution.maxActiveTasks) throw deny(`Active task limit reached without this lease (${otherTasks.size}/${config.execution.maxActiveTasks}).`);
@@ -178,7 +178,8 @@ function instructionsFor(brief: TaskBrief, rolePrompt: string | undefined): stri
   return [
     `You are the minions ${brief.role} for lease ${brief.leaseId}. Work only in ${brief.worktree} (your private clone of branch ${brief.branch}).`,
     'Your brief is in the file named by $MINIONS_BRIEF_FILE (also below). Do not run `minions work brief` or `minions work submit`:',
-    'write exactly one WorkerResult JSON object to the file named by $MINIONS_RESULT_FILE before you finish.',
+    'the runner submits your result for you. Your result is your WorkerResult as a single JSON object, as for every minions worker:',
+    'write it to the file named by $MINIONS_RESULT_FILE before you finish. A result file wins over your final message.',
     `Result contract: ${brief.resultContract}`,
     ...(rolePrompt ? ['', 'Role instructions (from the project):', '', rolePrompt] : []),
     '',
@@ -193,6 +194,19 @@ async function rolePromptOf(def: RoleDef, dir: string | undefined): Promise<stri
   const text = dir ? await readWorkerFile(join(dir, `${def.name}.md`), MAX_ROLE_PROMPT_BYTES) : null;
   if (!text?.trim()) throw new MinionsError('PRECONDITION', `The prompt of role ${def.name} (${def.prompt}) is not in the generated plugin.`, 'Regenerate it with `minions start` on the host.');
   return text.trimEnd();
+}
+
+/**
+ * A worker's result text with credential-shaped substrings masked (the CLI-wide redact()) and every value in
+ * `secrets` (the keys passed to this worker) replaced, raw or JSON-escaped. Masks keep JSON text valid JSON.
+ */
+export function redactSecrets(text: string, secrets: readonly string[]): string {
+  let out = redact(text);
+  for (const s of secrets) {
+    if (s.length < 4) continue;
+    for (const form of new Set([s, JSON.stringify(s).slice(1, -1)])) out = out.split(form).join('[REDACTED]');
+  }
+  return out;
 }
 
 const isObjectJson = (s: string): boolean => { try { const v = JSON.parse(s) as unknown; return !!v && typeof v === 'object' && !Array.isArray(v); } catch { return false; } };
@@ -401,7 +415,9 @@ export async function runLease(leaseId: string, deps: RunnerDeps): Promise<RunOu
     } else {
       const fromFile = await readWorkerFile(join(scratch, 'result.json'));
       const fm = finalMessage as string | null;
-      const norm = (t: string | null) => (t && adapter.normalizeResult ? adapter.normalizeResult(t) : t);
+      // Redacted before submit: the result is stored, shown to the coordinator and may quote the worker's env or
+      // output. The spawn secrets are masked verbatim too, in case one does not match a redact() pattern.
+      const norm = (t: string | null) => (t ? redactSecrets(adapter.normalizeResult ? adapter.normalizeResult(t) : t, secretValues) : t);
       const file = norm(fromFile);
       const final = norm(fm);
       raw = file && isObjectJson(file) ? file : final && isObjectJson(final) ? final : null;
@@ -473,6 +489,16 @@ function outcomeNote(rec: RunRecord): string | null {
   return parts.join('; ');
 }
 
+/**
+ * True when `leader` is still the recorded process (same pid and start time; a zombie still holds its pid) and leads
+ * process group `pgid`. False after pid reuse, when the record has no wrapper or group, or when /proc cannot tell.
+ */
+async function leadsGroup(leader: ProcIdentity | null, pgid: number | null, proc: string): Promise<boolean> {
+  if (!leader || !pgid || leader.pid !== pgid) return false;
+  const s = await procStat(pgid, proc);
+  return !!s && s.startTime === leader.startTime && s.pgrp === pgid;
+}
+
 /** Waits up to `ms` for the record to be `done`; returns it then, else null. */
 async function waitDone(state: string, leaseId: string, ms: number, poll: number): Promise<RunRecord | null> {
   const until = Date.now() + ms;
@@ -491,7 +517,7 @@ async function waitDone(state: string, leaseId: string, ms: number, poll: number
  * 1. No record or `done`: nothing to do (the note repeats a finished run's outcome).
  * 2. The runner (or another reaper) is alive: mark cancel and wait `waitMs` (60 s) for `done`.
  * 3. Otherwise, or on timeout: SIGKILL the recorded runner, wrapper and process group (each checked against its
- *    recorded start time), then sweep for sandboxed escapees whose ancestry reaches no live wrapper. A record from
+ *    recorded start time; the group only while the recorded wrapper still leads it), then sweep for sandboxed escapees whose ancestry reaches no live wrapper. A record from
  *    another boot or container start skips this step: its processes are gone.
  * 4. Take the owner lock, run post-exit with a drain-style `wip:` commit, mark the record `done`.
  * A live reaper that still holds the lock after the wait is a CONFLICT (the caller retries; the lease stays).
@@ -527,11 +553,15 @@ export async function reapRun(leaseId: string, deps: ReapDeps): Promise<ReapOutc
   const killed: number[] = [];
   let escapees: EscapeeSweep | null = null;
   if (live) {
+    // Checked before anything is killed: the wrapper must still be the recorded process and lead the recorded group.
+    const groupOk = await leadsGroup(rec.wrapper, rec.pgid, proc);
     const targets: (ProcIdentity | null)[] = [rec.runner, rec.wrapper, holder?.role === 'runner' && sameHost(holder.host, host) ? holder : null];
     for (const p of targets) {
       if (p && p.pid !== process.pid && !killed.includes(p.pid) && await isAlive(p, proc)) { try { process.kill(p.pid, 'SIGKILL'); killed.push(p.pid); } catch { /* gone */ } }
     }
-    if (rec.pgid && rec.wrapper) {
+    // A dead wrapper's pid may now lead an unrelated, newer group (any detached spawn), which the start-time filter
+    // alone does not exclude: the group is swept only when the wrapper matched; the marker-based sweep runs anyway.
+    if (groupOk && rec.pgid && rec.wrapper) {
       for (const pid of await groupMembers(rec.pgid, rec.wrapper.startTime, proc)) {
         if (pid === process.pid || killed.includes(pid)) continue;
         try { process.kill(pid, 'SIGKILL'); killed.push(pid); } catch { /* gone */ }

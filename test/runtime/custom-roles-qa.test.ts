@@ -3,11 +3,13 @@
 // config, the workflow-reset fallback to the final gate, and repeated `requires` refusals.
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { validateConfig } from '../../src/config/resolve.js';
 import type { MinionsConfig } from '../../src/config/schema.js';
 import type { MinionsError } from '../../src/core/errors.js';
 import { commitFile, gitSync, makeDefaultEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const err = async (p: Promise<unknown>) => {
   try { await p; } catch (e) { return e as MinionsError; }
@@ -47,7 +49,7 @@ describe('config: reserved evidence kinds are refused as project role names', ()
     const { defaults } = await import('../helpers.js');
     for (const name of ['check', 'ci-gate']) {
       const roles = { [name]: { description: 'x', promptText: 'x', contract: 'verifier' } };
-      expect(() => validateConfig({ ...defaults('project-owner'), roles }), name).toThrow(/reserved/);
+      expect(() => validateConfig({ ...defaults('independent'), roles }), name).toThrow(/reserved/);
     }
   });
 });

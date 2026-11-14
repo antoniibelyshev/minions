@@ -198,14 +198,23 @@ for my $a (['127.0.0.1', AF_INET], ['::1', AF_INET6], ['::ffff:127.0.0.1', AF_IN
 { my $sym = "$c->{scratch}/race-$$"; my $w = "$c->{scratch}/race-target-$$";
   my $h; open($h, '>', $w) and close($h);
   my $kid = fork;
-  if (defined $kid && !$kid) { for (1 .. 40000) { unlink $sym; symlink($file, $sym); unlink $sym; symlink($w, $sym); } POSIX::_exit(0); }
-  my $hits = 0; for (1 .. 40000) { $hits++ if chmod(0777, $sym); }
+  if (defined $kid && !$kid) { for (1 .. $c->{raceRounds}) { unlink $sym; symlink($file, $sym); unlink $sym; symlink($w, $sym); } POSIX::_exit(0); }
+  my $hits = 0; for (1 .. $c->{raceRounds}) { $hits++ if chmod(0777, $sym); }
   waitpid($kid, 0) if $kid; unlink $sym, $w;
   r('chmod:toctou-race', 1, "chmods=$hits"); }
 print "end\n";
 `;
 
 interface Outside { pid: number; signals: string[]; proc: ChildProcess }
+
+// Generous wall-clock limits for the real subprocesses below (task-93). The attack script takes ~15 s on an
+// idle machine (mostly the 40000-round chmod TOCTOU race through the seccomp user-notification handler) and
+// more than twice that while other suites load the machine; the old 30 s limit then cut it short and failed
+// "ran to completion" and the race test. The limits only bound a hang; no assertion depends on them.
+const ATTACK_TIMEOUT_MS = 180_000;
+const ATTACK_HOOK_TIMEOUT_MS = ATTACK_TIMEOUT_MS + 60_000;
+/** The supervisor test's leftovers sleep for >= 600 s (or fork forever), so this still proves nothing waited for them. */
+const SUPERVISOR_EXIT_BOUND_MS = 60_000;
 
 describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real helper, engineer and gate rules)', () => {
   const bin = REAL!;
@@ -273,6 +282,9 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
     await writeFile(rulesFile, serializeRules(rules), { mode: 0o600 });
     const protectedFile = d('secrets', 'github-token');
     const plan = {
+      // The chmod TOCTOU race goes through the same notify handler for every role: the full 40000 rounds run once
+      // (engineer); the gate repeats it shorter (task-104: the race was most of this file's ~16 s).
+      raceRounds: role.contract === 'producer' ? 40_000 : 5_000,
       nr: SYS, scratch: d('scratch'), protectedFile, outsidePid: outside.pid, outsideGroup: outsideGroup.pid, port, oAsync: 0o20000, oPath: 0o10000000, // O_ASYNC and O_PATH on x86_64 and aarch64
       read: [d('state', 'minions.db'), d('state'), protectedFile, d('secrets'), d('common', 'config'), d('common', 'refs'), d('worktrees', 'other', 'README'), d('lease'), d('other-lease', 'scratch'), root],
       write: [d('state'), d('secrets'), d('common', 'objects'), d('common', 'refs', 'heads'), d('worktrees', 'other'), d('lease'), d('other-lease', 'scratch'), root],
@@ -286,7 +298,7 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
     const groupBefore = await outsideGroup.state();
     const affinityBefore = await affinity();
     const argv = sandboxArgv(rulesFile, [PERL!, d('scratch', 'attack.pl'), d('scratch', 'plan.json')], { bin, scratchDir: d('scratch'), secretValues: ['not-a-real-token'] });
-    const r = await run(argv[0]!, argv.slice(1), { allowFailure: true, timeoutMs: 30_000 });
+    const r = await run(argv[0]!, argv.slice(1), { allowFailure: true, timeoutMs: ATTACK_TIMEOUT_MS });
     const results = new Map<string, { ok: boolean; detail: string }>();
     for (const line of r.stdout.split('\n')) {
       const [name, outcome, detail] = line.split('\t');
@@ -315,7 +327,7 @@ describe.skipIf(!REAL || !SYS || !PERL)('minions-sandbox escape attempts (real h
   for (const role of roles) {
     describe(`${role.name} (${role.contract})`, () => {
       let out: Awaited<ReturnType<typeof attack>>;
-      beforeAll(async () => { tcpSeen.length = 0; outside.signals.length = 0; out = await attack(role); }, 60_000);
+      beforeAll(async () => { tcpSeen.length = 0; outside.signals.length = 0; out = await attack(role); }, ATTACK_HOOK_TIMEOUT_MS);
 
       it('the attack script ran to completion inside the sandbox', () => {
         expect(out.r.stdout).toContain('\nend\n');
@@ -500,17 +512,17 @@ sleep 1; exit 0;
       // stdio ignored: a leftover holding an inherited pipe must not make this wait for EOF.
       const child = spawn(bin, ['--rules', rulesFile, '--', PERL!, script, tag], { stdio: 'ignore' });
       const code = await new Promise<number | null>((r) => {
-        const timer = setTimeout(() => { child.kill('SIGKILL'); r(null); }, 15_000);
+        const timer = setTimeout(() => { child.kill('SIGKILL'); r(null); }, SUPERVISOR_EXIT_BOUND_MS + 30_000);
         child.on('exit', (c) => { clearTimeout(timer); r(c); });
       });
       expect(code).toBe(0);
-      expect(Date.now() - t0).toBeLessThan(10_000);
+      expect(Date.now() - t0).toBeLessThan(SUPERVISOR_EXIT_BOUND_MS);
       expect(leftovers()).toEqual([]);
     } finally {
       // A broken helper leaves the tree behind (the runaway chain keeps forking): sweep it.
       for (let i = 0; i < 200 && leftovers().length; i++) for (const l of leftovers()) { try { process.kill(Number(l.split(' ')[0]), 'SIGKILL'); } catch { /* gone */ } }
     }
-  }, 40_000);
+  }, SUPERVISOR_EXIT_BOUND_MS + 60_000);
 
   // The chmod user-notification handler must still let the harness's own git work: git chmods its loose
   // objects, lock files and the executable bit on checked-out files, all inside the writable worktree.

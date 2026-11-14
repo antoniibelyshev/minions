@@ -3,6 +3,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import type { Command } from 'commander';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
@@ -24,10 +25,9 @@ vi.mock('../../src/host/docker.js', async (orig) => {
 vi.mock('../../src/runtime/paths.js', async (orig) => ({ ...await orig<typeof import('../../src/runtime/paths.js')>(), inMinionsContainer: () => false }));
 
 const { buildProgram } = await import('../../src/program.js');
-const { runInit } = await import('../../src/host/install.js');
 const { projectPaths } = await import('../../src/core/paths.js');
 const C = await import('../../src/host/credentials.js');
-const { makeRepo, withHome, dockerUp } = await import('./fixtures.js');
+const { initFromTemplate, withHome } = await import('./fixtures.js');
 
 const TOKEN = '123456789:AAHfakefakefakefakefakefakefake_-0123';
 let env: ReturnType<typeof withHome>;
@@ -67,9 +67,8 @@ async function cli(cwd: string, args: string[]): Promise<{ out: string; code: nu
 const envelope = (out: string) => JSON.parse(out.trim().split('\n').at(-1)!) as { ok: boolean; data?: any; error?: { code: string; message: string } };
 
 async function install() {
-  const repo = makeRepo(env.root);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
-  return { repo, projectId: r.plan.projectId, local: projectPaths(r.plan.projectId).configLocalJson };
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility: 'private' });
+  return { repo, projectId: projectId, local: projectPaths(projectId).configLocalJson };
 }
 
 describe('minions settings (CLI)', () => {
@@ -80,26 +79,26 @@ describe('minions settings (CLI)', () => {
     expect(code).toBe(0);
     expect(out).not.toContain('AAHfake');
     const d = envelope(out).data as { settings: { key: string; value: unknown; source: string }[] };
-    expect(d.settings.find((s) => s.key === 'execution.maxActiveTasks')).toMatchObject({ value: 2, source: 'project config' });
+    expect(d.settings.find((s) => s.key === 'execution.maxActiveTasks')).toMatchObject({ value: 3, source: 'project config' });
     expect(d.settings.find((s) => s.key === 'secrets.telegram')).toMatchObject({ value: 'provisioned' });
   });
 
   it('set --json: a loosening change is refused without --yes, applied with it; the config set alias works too', async () => {
     const { repo, local } = await install();
-    const refused = await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '3', '--json']);
+    const refused = await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '4', '--json']);
     expect(refused.code).not.toBe(0);
     expect(envelope(refused.out).error).toMatchObject({ code: 'POLICY_DENIED' });
-    const ok = await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '3', '--yes', '--json']);
+    const ok = await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '4', '--yes', '--json']);
     expect(ok.code).toBe(0);
-    expect(envelope(ok.out).data).toMatchObject({ key: 'execution.maxActiveTasks', from: 2, to: 3, layer: 'local', written: true });
-    const alias = await cli(repo, ['config', 'set', 'execution.maxEngineers', '3', '--yes']);
+    expect(envelope(ok.out).data).toMatchObject({ key: 'execution.maxActiveTasks', from: 3, to: 4, layer: 'local', written: true });
+    const alias = await cli(repo, ['config', 'set', 'execution.maxEngineers', '4', '--yes']);
     expect(alias.code).toBe(0);
-    expect(alias.out).toContain('execution.maxEngineers: 2 -> 3');
-    expect(JSON.parse(readFileSync(local, 'utf8'))).toEqual({ execution: { maxActiveTasks: 3, maxEngineers: 3 } });
+    expect(alias.out).toContain('execution.maxEngineers: 2 -> 4');
+    expect(JSON.parse(readFileSync(local, 'utf8'))).toEqual({ execution: { maxActiveTasks: 4, maxEngineers: 4 } });
     const list = await cli(repo, ['config', 'list']);
-    expect(list.out).toContain('execution.maxEngineers = 3  (local override)');
+    expect(list.out).toContain('execution.maxEngineers = 4  (local override)');
     const show = await cli(repo, ['config', 'show', '--json']);
-    expect(envelope(show.out).data.execution.maxEngineers).toBe(3);
+    expect(envelope(show.out).data.execution.maxEngineers).toBe(4);
   });
 
   it('set: a restart-needing change with the runtime down reports not-running; --shared is refused on a private install', async () => {
@@ -110,27 +109,12 @@ describe('minions settings (CLI)', () => {
     expect(envelope(s.out).error).toMatchObject({ code: 'PRECONDITION' });
   });
 
-  it('without a terminal, plain `minions settings` opens the menu (numbered prompts), not a refusal; --list never opens it', async () => {
+  it('plain `minions settings` prints the same list as --list (no menu, no prompt)', async () => {
     const { repo } = await install();
-    const { Command } = await import('commander');
-    const { registerSettings } = await import('../../src/host/settings-cli.js');
-    const tty = process.stdin.isTTY;
-    Object.defineProperty(process.stdin, 'isTTY', { value: undefined, configurable: true });
-    vi.spyOn(process, 'cwd').mockReturnValue(repo);
-    try {
-      const opened: { layer: string }[] = [];
-      const program = new Command().option('--json');
-      registerSettings(program, { confirm: async () => null, menu: async (_p, o) => { opened.push(o); } });
-      program.exitOverride();
-      await program.parseAsync(['node', 'minions', 'settings']);
-      expect(opened).toEqual([{ layer: 'local' }]);
-      const w = process.stdout.write.bind(process.stdout);
-      process.stdout.write = (() => true) as typeof process.stdout.write;
-      try { await program.parseAsync(['node', 'minions', 'settings', '--list']); } finally { process.stdout.write = w; }
-      expect(opened).toHaveLength(1);
-    } finally {
-      Object.defineProperty(process.stdin, 'isTTY', { value: tty, configurable: true });
-    }
+    const plain = await cli(repo, ['settings']);
+    expect(plain.code).toBe(0);
+    expect(plain.out).toBe((await cli(repo, ['settings', '--list'])).out);
+    expect(plain.out).toContain('execution.maxActiveTasks = ');
   });
 
   it('settings --list / --list --json and set errors never contain a stored token', async () => {
@@ -153,13 +137,13 @@ describe('minions settings (CLI)', () => {
 
   it('set: the reverse order (maxEngineers before maxActiveTasks) fails with a clear message and writes nothing', async () => {
     const { repo, local } = await install();
-    const r = await cli(repo, ['settings', 'set', 'execution.maxEngineers', '3', '--yes', '--json']);
+    const r = await cli(repo, ['settings', 'set', 'execution.maxEngineers', '4', '--yes', '--json']);
     expect(r.code).not.toBe(0);
     const err = envelope(r.out).error!;
     expect(err.code).toBe('INVALID_CONFIG');
     expect(err.message).toMatch(/maxEngineers/);
     expect(err.message).toMatch(/maxActiveTasks/);
-    const human = await cli(repo, ['settings', 'set', 'execution.maxEngineers', '3', '--yes']);
+    const human = await cli(repo, ['settings', 'set', 'execution.maxEngineers', '4', '--yes']);
     expect(human.code).not.toBe(0);
     expect(human.out).toMatch(/maxEngineers[\s\S]*maxActiveTasks/);
     expect(existsSync(local)).toBe(false);
@@ -170,7 +154,7 @@ describe('minions settings (CLI)', () => {
     const tty = process.stdin.isTTY;
     Object.defineProperty(process.stdin, 'isTTY', { value: undefined, configurable: true });
     try {
-      const r = await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '3']);
+      const r = await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '4']);
       expect(r.code).not.toBe(0);
       expect(r.out).toMatch(/loosens policy/);
       expect(r.out).toMatch(/--yes/);
@@ -184,7 +168,7 @@ describe('minions settings (CLI)', () => {
 describe('settings set: what took effect now vs needs a restart or an upgrade (task-53.2)', () => {
   it('--json reports class, hostOwned and takesEffect for live, restart and host-owned keys; --list --json carries the new fields', async () => {
     const { repo } = await install();
-    const live = envelope((await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '3', '--yes', '--json'])).out);
+    const live = envelope((await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '4', '--yes', '--json'])).out);
     expect(live.ok).toBe(true);
     expect(live.data).toMatchObject({ key: 'execution.maxActiveTasks', class: 'live', hostOwned: false, takesEffect: 'now',
       needsRestart: false, needsUpgrade: false, restart: null, written: true });
@@ -195,17 +179,17 @@ describe('settings set: what took effect now vs needs a restart or an upgrade (t
       restart: { action: 'offered' } });
     expect(restart.data.effect).toMatch(/after a coordinator restart/);
 
-    const owned = envelope((await cli(repo, ['settings', 'set', 'capabilities.git.push', 'deny', '--no-restart', '--json'])).out);
+    const owned = envelope((await cli(repo, ['settings', 'set', 'capabilities.base.merge', 'deny', '--no-restart', '--json'])).out);
     expect(owned.data).toMatchObject({ class: 'restart', hostOwned: true, takesEffect: 'restart' });
 
     // Unchanged: nothing takes effect.
-    const same = envelope((await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '3', '--yes', '--json'])).out);
+    const same = envelope((await cli(repo, ['settings', 'set', 'execution.maxActiveTasks', '4', '--yes', '--json'])).out);
     expect(same.data).toMatchObject({ changed: false, takesEffect: null, effect: '' });
 
     const list = envelope((await cli(repo, ['settings', '--list', '--json'])).out).data as { settings: Record<string, unknown>[] };
     const row = (k: string) => list.settings.find((s) => s.key === k)!;
     expect(row('execution.maxActiveTasks')).toMatchObject({ apply: 'live', class: 'live', hostOwned: false, needsRestart: false, needsUpgrade: false });
-    expect(row('delivery.mode')).toMatchObject({ apply: 'prompt', class: 'restart', hostOwned: true, needsRestart: true, needsUpgrade: false });
+    expect(row('delivery.merge')).toMatchObject({ apply: 'prompt', class: 'restart', hostOwned: true, needsRestart: true, needsUpgrade: false });
     expect(row('models.coordinator')).toMatchObject({ apply: 'launch', class: 'restart', hostOwned: false, needsRestart: true });
     for (const s of list.settings) expect(Object.keys(s), String(s.key)).toEqual(expect.arrayContaining(['class', 'hostOwned', 'needsUpgrade', 'apply', 'needsRestart']));
   });
@@ -221,37 +205,12 @@ describe('settings set: what took effect now vs needs a restart or an upgrade (t
     const dry = (await cli(repo, ['settings', 'set', 'communication.progress', 'tasks', '--dry-run'])).out;
     expect(dry).toMatch(/would take effect after a coordinator restart/);
     const list = (await cli(repo, ['settings', '--list'])).out;
-    expect(list).toMatch(/delivery\.mode = \S+ +\([^)]*; restart; host-owned\)/);
+    expect(list).toMatch(/delivery\.merge = \S+ +\([^)]*; restart; host-owned\)/);
     expect(list).toMatch(/execution\.maxActiveTasks = \S+ +\(project config\)\n/);
   });
 });
 
-describe('settings set delivery.requiredChecksConfigured (task-79)', () => {
-  it('is listed under Delivery as a live, host-owned bool; turning it on loosens (needs --yes) and takes effect now; off needs no confirmation', async () => {
-    const { repo, local } = await install();
-    const list = envelope((await cli(repo, ['settings', '--list', '--json'])).out).data as { settings: Record<string, unknown>[] };
-    expect(list.settings.find((s) => s.key === 'delivery.requiredChecksConfigured')).toMatchObject({ group: 'Delivery', type: 'bool', value: false,
-      apply: 'live', class: 'live', hostOwned: true, needsRestart: false, canLoosen: true });
-
-    const refused = await cli(repo, ['settings', 'set', 'delivery.requiredChecksConfigured', 'true', '--json']);
-    expect(refused.code).not.toBe(0);
-    expect(envelope(refused.out).error).toMatchObject({ code: 'POLICY_DENIED' });
-    expect(envelope(refused.out).error!.message).toMatch(/auto-merge may arm for pull requests once their required checks pass/);
-
-    const on = envelope((await cli(repo, ['settings', 'set', 'delivery.requiredChecksConfigured', 'true', '--yes', '--json'])).out);
-    expect(on.ok).toBe(true);
-    expect(on.data).toMatchObject({ key: 'delivery.requiredChecksConfigured', from: false, to: true, written: true, class: 'live', hostOwned: true,
-      takesEffect: 'now', needsRestart: false, loosens: expect.stringMatching(/auto-merge may arm/) });
-    expect(JSON.parse(readFileSync(local, 'utf8')).delivery).toEqual({ requiredChecksConfigured: true });
-
-    // Turning it off tightens: no confirmation needed.
-    const off = envelope((await cli(repo, ['settings', 'set', 'delivery.requiredChecksConfigured', 'false', '--json'])).out);
-    expect(off.data).toMatchObject({ from: true, to: false, written: true, loosens: null });
-    expect(JSON.parse(readFileSync(local, 'utf8')).delivery).toEqual({ requiredChecksConfigured: false });
-  });
-});
-
-describe('settings change requests on the host CLI (task-53.3)', () => {
+describe('settings set --expect-revision and settings requests on the host CLI', () => {
   it('set --expect-revision: a stale revision is refused with CONFLICT (exit 4) and writes nothing; the current one writes', async () => {
     const { repo, local } = await install();
     const stale = await cli(repo, ['settings', 'set', 'communication.progress', 'quiet', '--no-restart', '--expect-revision', '99', '--json']);
@@ -263,12 +222,11 @@ describe('settings change requests on the host CLI (task-53.3)', () => {
     expect(ok.code).toBe(0);
     expect(envelope(ok.out).data).toMatchObject({ written: true });
     expect((await cli(repo, ['settings', 'set', 'communication.progress', 'tasks', '--expect-revision', 'x', '--json'])).out).toMatch(/--expect-revision must be a whole number/);
-    expect((await cli(repo, ['settings', 'set', 'communication.progress', 'tasks', '--reason', 'r', '--json'])).out).toMatch(/--reason is for change requests recorded in the runtime/);
   });
 
-  it('settings requests / apply / reject need the runtime (it holds the requests); restart --dry-run restarts nothing', async () => {
+  it('settings requests needs the runtime (it holds the requests); restart --dry-run restarts nothing', async () => {
     const { repo } = await install();
-    for (const args of [['settings', 'requests'], ['settings', 'apply', 'cr_00000001'], ['settings', 'reject', 'cr_00000001']]) {
+    for (const args of [['settings', 'requests'], ['settings', 'requests', '--all']]) {
       const r = await cli(repo, [...args, '--json']);
       expect(envelope(r.out).error, args.join(' ')).toMatchObject({ code: 'PRECONDITION' });
       expect(envelope(r.out).error!.message).toMatch(/runtime is not running/);

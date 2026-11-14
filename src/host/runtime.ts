@@ -10,10 +10,12 @@
 //   from the `minions` shim in <project>/host/bin, which pins MINIONS_RUNTIME=host and the paths.
 // - The coordinator runs in a dedicated tmux server (`tmux -L minions-<id>`), never the user's default one.
 // - Claude Code's sandbox and credential deny rules are added to the coordinator settings
-//   (src/runtime/coordinator.ts `hostSettings`); bypassPermissions stays disabled.
+//   (src/runtime/coordinator.ts `hostSettings`) unless the owner turns the sandbox off (coordinator.sandbox false,
+//   config.local.json only); bypassPermissions likewise only from config.local.json.
 import { spawn } from 'node:child_process';
-import { chmod, readFile, rm } from 'node:fs/promises';
-import { isAbsolute, join } from 'node:path';
+import { realpathSync } from 'node:fs';
+import { chmod, lstat, mkdir, rm } from 'node:fs/promises';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import { MinionsError } from '../core/errors.js';
 import { run, type RunOptions, type RunResult } from '../core/exec.js';
 import { atomicWrite, copyRegularFileNoFollow, ensureDir, ensureRealDir, exists } from '../core/fsutil.js';
@@ -21,7 +23,7 @@ import { hostRoot, hostRuntimePaths, projectPaths } from '../core/paths.js';
 import { shQuote } from '../runtime/coordinator.js';
 import { hardenedGitArgs, hardenedGitEnv } from '../runtime/git-hardening.js';
 import { moveKeychainTokensToFileStore, type MovedToken } from './credentials.js';
-import { KEY_HELPER_TTL_MS, authOf, isKeyAuth, resolveOnPath } from './auth.js';
+import { KEY_HELPER_TTL_MS, authOf, isKeyAuth } from './auth.js';
 import { packageRoot, type Runner } from './docker.js';
 import type { ProjectJson } from './project.js';
 import { fastPathHint } from '../backlog/taskfile.js';
@@ -96,9 +98,7 @@ export function hostRuntimeVars(project: ProjectJson): Record<string, string> {
     MINIONS_PLUGIN_DIR: pp.pluginDir,
     MINIONS_TMUX_SOCKET: hp.tmuxSocket,
     MINIONS_AUTH_METHOD: auth.method,
-    MINIONS_GIT_CREDENTIAL_HELPER: `!${shQuote(hp.minionsShim)} git-credential`,
     GIT_TERMINAL_PROMPT: '0',
-    GH_PROMPT_DISABLED: '1',
     // Tool caches live in the agent state, so sandboxed commands never write ~/.npm or ~/.cache (cache poisoning).
     ...cacheVars(hp.cache),
     ...(isKeyAuth(auth) ? { CLAUDE_CODE_API_KEY_HELPER_TTL_MS: String(KEY_HELPER_TTL_MS) } : {}),
@@ -145,35 +145,92 @@ export function minionsShim(project: ProjectJson, target: ShimTarget): string {
   return L.join('\n') + '\n';
 }
 
-/** Host gh wrapper from docker/gh-wrapper.sh: same token handling, host paths. */
-export async function ghShim(realGh: string, tokenFile: string, root: string = packageRoot()): Promise<string> {
-  const src = await readFile(join(root, 'docker', 'gh-wrapper.sh'), 'utf8');
-  const out = src
-    .replace(/^REAL_GH=.*$/m, `REAL_GH=${shQuote(realGh)}`)
-    .replace(/^TOKEN_FILE=.*$/m, `TOKEN_FILE=${shQuote(tokenFile)}`)
-    .replace('# minions gh wrapper, installed as /usr/local/bin/gh (the real binary is /opt/gh/bin/gh, off PATH).',
-      '# minions gh wrapper for the host runtime (generated; the real gh is REAL_GH). Your own gh login is not used.');
-  if (!out.includes(`REAL_GH=${shQuote(realGh)}`)) throw new MinionsError('INTERNAL', 'gh wrapper template has an unexpected shape.');
-  return out;
+/** realpath of the deepest existing ancestor, with the rest appended (a missing file still resolves its links). */
+export function realPathOf(p: string): string {
+  try { return realpathSync(p); } catch {
+    const up = dirname(p);
+    return up === p ? p : join(realPathOf(up), basename(p));
+  }
+}
+/** Whether p is dir or below it (lexically). */
+export const isInside = (p: string, dir: string): boolean => { const r = relative(dir, p); return r === '' || (!!r && !r.startsWith('..') && !isAbsolute(r)); };
+
+/** The dirs of the host runtime agents may write (the sandbox allows the workspace and the state dir only). */
+export function agentWritableDirs(projectId: string): string[] {
+  const hp = hostRuntimePaths(projectId);
+  return [hp.workspace, hp.state];
+}
+
+/** The agent-writable dir one of these paths is in (as given or after resolving symlinks), or null. */
+export function agentWritableHit(paths: string[], agentWritable: string[]): { path: string; dir: string } | null {
+  const dirs = agentWritable.map((d) => ({ d, r: realPathOf(d) }));
+  for (const p of paths) {
+    const hit = dirs.find(({ d, r }) => isInside(p, d) || isInside(realPathOf(p), r));
+    if (hit) return { path: realPathOf(p), dir: hit.d };
+  }
+  return null;
 }
 
 /**
- * Writes the shims (0755 in a 0700 dir) and creates the 0700 host runtime dirs. The gh shim exists
- * only when gh is installed on the host (needed for pull-request delivery). Tokens still in the macOS
+ * Refuses a shim target inside the agent-writable host dirs (task-7): the shim runs outside the Claude Code
+ * sandbox, so pointing it at a CLI an agent can write would let agents run unsandboxed code. Throws before any write.
+ */
+export function assertShimTargetSafe(projectId: string, target: ShimTarget): void {
+  const hit = agentWritableHit([target.cli, dirname(dirname(target.cli))], agentWritableDirs(projectId));
+  if (hit) {
+    throw new MinionsError('PRECONDITION', `Refusing to point the host runtime shim at ${hit.path}: it is inside the agent-writable ${hit.dir}.`,
+      'Run minions from an install outside the host runtime dirs (npm pack in your checkout, then npm install -g <tarball>).');
+  }
+}
+
+/**
+ * Writes the shim (0755 in a 0700 dir) and creates the 0700 host runtime dirs. Tokens still in the macOS
  * Keychain are moved to the 0600 file store first (see moveKeychainTokensToFileStore: sandboxed agent
  * commands can run /usr/bin/security, which every minions Keychain item trusts).
  */
-export async function prepareHostRuntime(project: ProjectJson, opts: { target?: ShimTarget; pathEnv?: string; runner?: Runner } = {}): Promise<{ gh: string | null; movedToFileStore: MovedToken[]; keychainWarnings: string[] }> {
+export async function prepareHostRuntime(project: ProjectJson, opts: { target?: ShimTarget; runner?: Runner } = {}): Promise<{ movedToFileStore: MovedToken[]; keychainWarnings: string[] }> {
+  const target = opts.target ?? defaultShimTarget();
+  assertShimTargetSafe(project.projectId, target); // before any write: a refused target leaves the shim as it was
   const hp = hostRuntimePaths(project.projectId);
   for (const d of [hp.root, hp.bin, hp.workspace, hp.state, hp.cache, hp.logs, hp.transfer, hp.import, hp.exports]) { await ensureRealDir(d, 0o700); await chmod(d, 0o700); }
   await ensureDir(projectPaths(project.projectId).secretsDir, 0o700);
   const moved = await moveKeychainTokensToFileStore(opts.runner ?? run);
-  await atomicWrite(hp.minionsShim, minionsShim(project, opts.target ?? defaultShimTarget()), { mode: 0o755 });
-  const pathEnv = (opts.pathEnv ?? process.env.PATH ?? '').split(':').filter((d) => d && d !== hp.bin && isAbsolute(d)).join(':');
-  const gh = await resolveOnPath('gh', pathEnv);
-  if (gh) await atomicWrite(hp.ghShim, await ghShim(gh, projectPaths(project.projectId).githubTokenFile), { mode: 0o755 });
-  else await rm(hp.ghShim, { force: true });
-  return { gh, movedToFileStore: moved.moved, keychainWarnings: moved.warnings };
+  await atomicWrite(hp.minionsShim, minionsShim(project, target), { mode: 0o755 });
+  // The gh token wrapper of the removed GitHub delivery (docs/design/autonomy.md Decision 8).
+  await rm(join(hp.bin, 'gh'), { force: true });
+  await ensureHostWorktreesDir(hp.repo);
+  return { movedToFileStore: moved.moved, keychainWarnings: moved.warnings };
+}
+
+/**
+ * State of `<repo>/.git/worktrees` in the host workspace: `ok` (a real directory), `missing`, `no-repo` (no
+ * `.git` directory yet, e.g. before the first import) or `invalid` (`.git` or `.git/worktrees` is a symlink or
+ * not a directory).
+ */
+export type WorktreesDirState = 'ok' | 'missing' | 'no-repo' | 'invalid';
+
+export async function hostWorktreesDirState(repo: string): Promise<WorktreesDirState> {
+  const gitDir = await lstat(join(repo, '.git')).catch(() => null);
+  if (!gitDir) return 'no-repo';
+  if (!gitDir.isDirectory()) return 'invalid';
+  const wt = await lstat(join(repo, '.git', 'worktrees')).catch(() => null);
+  if (!wt) return 'missing';
+  return wt.isDirectory() ? 'ok' : 'invalid';
+}
+
+/**
+ * Creates `<repo>/.git/worktrees` outside the sandbox (task-3). The coordinator settings deny Edit of
+ * `.git/worktrees/<name>/config.worktree` (hostSettings); on macOS Claude Code turns that into a sandbox write
+ * deny that also refuses creating the missing ancestors of the denied path, so a sandboxed `git worktree add`
+ * could never create `.git/worktrees` itself. Once the directory exists, `.git/worktrees/<name>/` can be created
+ * (the glob only matches the `config.worktree` file). Never follows a symlinked `.git`; an invalid layout is
+ * left alone and reported (doctor `workspace.worktrees`).
+ */
+export async function ensureHostWorktreesDir(repo: string): Promise<WorktreesDirState> {
+  const state = await hostWorktreesDirState(repo);
+  if (state !== 'missing') return state;
+  await mkdir(join(repo, '.git', 'worktrees'), { mode: 0o755 }).catch((e: NodeJS.ErrnoException) => { if (e.code !== 'EEXIST') throw e; });
+  return hostWorktreesDirState(repo);
 }
 
 // ---------------------------------------------------------------- lifecycle
@@ -196,7 +253,7 @@ export class HostRuntime {
     const [cmd, ...rest] = args;
     if (cmd === 'git') {
       const env = this.env();
-      return this.runner('git', [...hardenedGitArgs({ credentialHelper: env.MINIONS_GIT_CREDENTIAL_HELPER }), ...rest], { cwd: this.paths.workspace, timeoutMs: 300_000, ...opts, env: hardenedGitEnv(env) });
+      return this.runner('git', [...hardenedGitArgs(), ...rest], { cwd: this.paths.workspace, timeoutMs: 300_000, ...opts, env: hardenedGitEnv(env) });
     }
     const bin = cmd === 'minions' ? this.paths.minionsShim : cmd!;
     return this.runner(bin, rest, { cwd: this.paths.workspace, timeoutMs: 300_000, ...opts, env: this.env() });
@@ -223,6 +280,8 @@ export class HostRuntime {
   /** Stops the coordinator: kills the dedicated tmux server (only minions sessions live there). */
   async down(): Promise<boolean> {
     const was = await this.isRunning();
+    // The detached supervisor and dispatcher are not in the tmux server: stop them too, so a start runs current code.
+    if (await this.prepared()) await this.exec(['minions', 'coordinator', 'stop-helpers', '--json'], { allowFailure: true, timeoutMs: 30_000 });
     await this.runner('tmux', ['-L', this.paths.tmuxSocket, 'kill-server'], { allowFailure: true, timeoutMs: 10_000, env: this.env() });
     return was;
   }
@@ -240,7 +299,8 @@ export class HostRuntime {
     return {
       dirs: { import: hp.import, exports: hp.exports },
       hostFs: true,
-      exec: async (args: string[], opts?: RunOptions) => { await dirs(hp.exports); return this.exec(args, opts); },
+      // After every transfer command (e.g. the first `workspace import` clones the repo): .git/worktrees, see ensureHostWorktreesDir.
+      exec: async (args: string[], opts?: RunOptions) => { await dirs(hp.exports); try { return await this.exec(args, opts); } finally { await ensureHostWorktreesDir(hp.repo).catch(() => undefined); } },
       putFile: async (local: string, remote: string) => { await dirs(hp.import); await rm(remote, { force: true }); await copyRegularFileNoFollow(local, remote); },
       getFile: async (remote: string, local: string) => { await copyRegularFileNoFollow(remote, local); },
       removeFile: async (remote: string) => { await rm(remote, { force: true }); },
@@ -258,7 +318,6 @@ const TOOLS: { name: string; args: string[]; required: boolean; hint: string; te
   { name: 'claude', args: ['--version'], required: true, hint: 'npm install -g @anthropic-ai/claude-code (or brew install --cask claude-code)', tested: '2.1.292', purpose: 'Claude Code' },
   { name: 'backlog', args: ['--version'], required: true, hint: 'npm install -g backlog.md@1.54.0', tested: '1.54.0', purpose: 'Backlog.md CLI', note: fastPathHint },
   { name: 'git', args: ['--version'], required: true, hint: 'xcode-select --install (or brew install git)', purpose: 'workspace clone' },
-  { name: 'gh', args: ['--version'], required: false, hint: 'brew install gh (needed only for pull-request delivery)', purpose: 'GitHub CLI' },
 ];
 
 const firstLine = (s: string) => s.trim().split('\n')[0]?.trim().slice(0, 120) ?? '';

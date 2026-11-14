@@ -2,17 +2,48 @@ import { spawnSync } from 'node:child_process';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { profileDefaults } from '../src/config/profiles.js';
-import type { Profile } from '../src/config/schema.js';
+import { modeDefaults } from '../src/config/modes.js';
+import type { Mode } from '../src/config/schema.js';
+import { HANG_GUARD_TIMEOUT_TEST, HOOK_WRAPPER_TIMEOUT_S } from '../src/runtime/hook-guard.js';
 
 export const ctx = {
-  hasGitHub: true,
   baseBranch: 'main',
   identity: { name: 'Ada', email: 'ada@example.com' },
   projectId: '3f2b8c1e-7d4a-4e9b-9c2f-1a2b3c4d5e6f',
   packageVersion: '0.1.0',
 };
-export const defaults = (p: Profile = 'project-owner', c = ctx) => profileDefaults(p, c).config;
+/**
+ * A test baseline: the mode's values without the subsystems a test opts into explicitly (coordinator sessions, the
+ * routine, budgets and local integration), so a test of one mechanism does not run the others. The full mode
+ * defaults are `modeDefaults` (test/config.test.ts pins them).
+ */
+export const defaults = (m: Mode = 'independent', c = ctx) => {
+  const { coordinator: _c, routine: _r, ...cfg } = modeDefaults(m, c);
+  return { ...cfg, delivery: { merge: 'disabled' as const }, budgets: { taskUsd: null, dailyUsd: null } } as ReturnType<typeof modeDefaults>;
+};
+
+/**
+ * Whether this host has the Linux /proc the runtime's process code reads. Container-only code (the process runner and
+ * its recovery, the session supervisor, the integrator's verify group) identifies processes and the host by /proc
+ * (boot id, start times) and fails closed without it; the runtime always runs in the Linux container. Tests of those
+ * paths skip on the macOS host gate (task-105) until the host runtime has a ps-based view (docs/design/host-runtime.md).
+ */
+export const HAS_PROCFS = process.platform === 'linux';
+
+/**
+ * The hook commands wrap `minions` in coreutils `timeout` (`timeout 20 minions hook ... || exit 2`); they run in the
+ * Linux runtime image, which has it. A host without one (macOS) gets test/fixtures/timeout-shim.mjs, which keeps the
+ * exit codes the wrapper relies on, so the tests still run the real command strings there (task-105).
+ * MINIONS_TEST_TIMEOUT_SHIM=1 uses the shim on Linux too.
+ */
+// Probed on first use, not at import: the unit tier refuses subprocesses and imports this file (task-137.1).
+const timeoutShim = (): string | null => (process.env.MINIONS_TEST_TIMEOUT_SHIM === '1' || !hasCoreutilsTimeout())
+  ? join(import.meta.dirname, 'fixtures', 'timeout-shim.mjs') : null;
+/**
+ * Single-quotes a value for a POSIX shell. Fixture scripts and git config commands that embed a temp path use it: the
+ * host runtime's scratch dir sits under ~/Library/Application Support, so TMPDIR has a space there (task-5).
+ */
+export const shq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
 
 /**
  * Runs a PreToolUse hook command string the way Claude Code does (through a shell, hook JSON on stdin)
@@ -25,9 +56,28 @@ export function runHookCommand(command: string, minions: string | null, stdin = 
   const bin = join(dir, 'bin');
   mkdirSync(bin);
   if (minions !== null) { writeFileSync(join(bin, 'minions'), minions); chmodSync(join(bin, 'minions'), 0o755); }
+  const shim = timeoutShim();
+  if (shim) { writeFileSync(join(bin, 'timeout'), `#!/bin/sh\nexec ${shq(process.execPath)} ${shq(shim)} "$@"\n`); chmodSync(join(bin, 'timeout'), 0o755); }
   const r = spawnSync('sh', ['-c', command], { input: stdin, env: { PATH: `${bin}:/usr/bin:/bin` }, encoding: 'utf8' });
   rmSync(dir, { recursive: true, force: true });
   return { status: r.status, stdout: r.stdout, stderr: r.stderr };
+}
+
+let coreutilsTimeout: boolean | undefined;
+/** True when runHookCommand's PATH has coreutils `timeout` (Linux; not stock macOS). Probed once, on first call. */
+export const hasCoreutilsTimeout = (): boolean =>
+  (coreutilsTimeout ??= spawnSync('sh', ['-c', 'command -v timeout'], { env: { PATH: '/usr/bin:/bin' }, stdio: 'ignore' }).status === 0);
+
+/**
+ * A hook command with its hang guard (src/runtime/hook-guard.ts) forced to one branch (`coreutils` or the `perl`
+ * fallback) and/or a shorter deadline. Throws when the command has no guard, so a test cannot silently test nothing.
+ */
+export function withHangGuard(command: string, o: { guard?: 'coreutils' | 'perl'; seconds?: number }): string {
+  if (!/; then timeout \d+ minions hook /.test(command)) throw new Error(`no hang guard in: ${command}`);
+  let c = command;
+  if (o.guard) c = c.replaceAll(HANG_GUARD_TIMEOUT_TEST, o.guard === 'coreutils' ? 'true' : 'false');
+  if (o.seconds !== undefined) c = c.replaceAll(` ${HOOK_WRAPPER_TIMEOUT_S} minions hook `, ` ${o.seconds} minions hook `);
+  return c;
 }
 
 /** Fake `minions` binaries for runHookCommand. */

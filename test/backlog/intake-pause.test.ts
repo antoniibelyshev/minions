@@ -1,17 +1,18 @@
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, join, sep } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import type { Command } from 'commander';
+import { join, sep } from 'node:path';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { assertIntakeOpen, isIntakeCreation } from '../../src/backlog/intake.js';
-import { writeBacklogConfig } from '../../src/backlog/factory.js';
 import type { MinionsError } from '../../src/core/errors.js';
 import { generatePlugin } from '../../src/plugin/generate.js';
-import { buildProgram } from '../../src/program.js';
+import { collectStatus } from '../../src/runtime/commands.js';
+import { RuntimeDb } from '../../src/runtime/db.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
 import { defaults } from '../helpers.js';
+import { MemoryBacklog, runCli } from './harness.js';
 
-const onPath = (process.env.PATH ?? '').split(delimiter).some((d) => d && existsSync(join(d, 'backlog')));
+// The CLI runs in-process against an in-memory backlog (no Backlog.md subprocess); see harness.ts.
+vi.mock('../../src/backlog/factory.js', async (orig) => (await import('./harness.js')).mockFactory(await orig()));
 
 describe('intake pause: which creation counts as intake', () => {
   it('treats owner requests, tickets and agent ideas as intake', () => {
@@ -48,18 +49,17 @@ describe('intake pause: which creation counts as intake', () => {
   });
 });
 
-// ---------------------------------------------------------------- CLI end to end (runtime mode, temp state)
+// ---------------------------------------------------------------- CLI in runtime mode (temp state, in-memory backlog)
 
 let state: string;
 const saved: Record<string, string | undefined> = {};
 const ENV = ['MINIONS_RUNTIME', 'MINIONS_STATE_DIR', 'MINIONS_CONFIG'] as const;
 
-beforeAll(async () => {
+beforeAll(() => {
   state = mkdtempSync(join(tmpdir(), 'minions-intake-'));
   for (const k of ENV) saved[k] = process.env[k];
   const config = join(state, 'config.json');
   writeFileSync(config, JSON.stringify(defaults()));
-  await writeBacklogConfig(join(state, 'backlog'));
   Object.assign(process.env, { MINIONS_RUNTIME: 'container', MINIONS_STATE_DIR: state, MINIONS_CONFIG: config });
 });
 afterAll(() => {
@@ -67,36 +67,7 @@ afterAll(() => {
   rmSync(state, { recursive: true, force: true });
 });
 
-async function cli(args: string[]): Promise<{ out: string; code: number }> {
-  const program = buildProgram();
-  let out = '';
-  const capture = (cmd: Command) => {
-    cmd.exitOverride().configureOutput({ writeOut: (s) => { out += s; }, writeErr: (s) => { out += s; } });
-    cmd.commands.forEach(capture);
-  };
-  capture(program);
-  const write = process.stdout.write.bind(process.stdout);
-  const writeErr = process.stderr.write.bind(process.stderr);
-  const sink = ((s: string | Uint8Array) => { out += String(s); return true; }) as typeof process.stdout.write;
-  process.stdout.write = sink;
-  process.stderr.write = sink;
-  const exit = process.exit.bind(process);
-  process.exit = ((c?: number) => { throw Object.assign(new Error("exit"), { exitCode: c ?? 0 }); }) as typeof process.exit;
-  const before = process.exitCode;
-  let code = 0;
-  try {
-    await program.parseAsync(['node', 'minions', ...args, '--json']);
-    code = process.exitCode === before ? 0 : Number(process.exitCode);
-  } catch (err) {
-    code = (err as { exitCode?: number }).exitCode ?? 1;
-  } finally {
-    process.stdout.write = write;
-    process.stderr.write = writeErr;
-    process.exit = exit;
-    process.exitCode = before;
-  }
-  return { out, code };
-}
+const cli = runCli;
 
 const errorCode = (out: string): string | undefined => {
   try { return (JSON.parse(out) as { error?: { code: string } }).error?.code; } catch { return undefined; }
@@ -133,7 +104,7 @@ describe('`minions backlog create` with intake paused', () => {
     ]) {
       const r = await cli(['backlog', 'create', '--title', `Exempt ${extra.at(-1)}`, ...extra]);
       expect(errorCode(r.out), extra.join(' ')).not.toBe('POLICY_DENIED');
-      if (onPath) expect(r.code, r.out).toBe(0);
+      expect(r.code, r.out).toBe(0);
     }
   });
 
@@ -143,10 +114,8 @@ describe('`minions backlog create` with intake paused', () => {
     expect((JSON.parse(resumed.out) as { data: { paused: { intake: boolean } } }).data.paused.intake).toBe(false);
     const r = await cli(ownerRequest());
     expect(errorCode(r.out)).not.toBe('POLICY_DENIED');
-    if (onPath) {
-      expect(r.code, r.out).toBe(0);
-      expect((JSON.parse(r.out) as { data: { created: boolean } }).data.created).toBe(true);
-    }
+    expect(r.code, r.out).toBe(0);
+    expect((JSON.parse(r.out) as { data: { created: boolean } }).data.created).toBe(true);
   });
 });
 
@@ -162,9 +131,9 @@ describe('intake pause: isolation, re-runs, pause/resume combinations and status
     expect(process.env.MINIONS_CONFIG?.startsWith(state + sep)).toBe(true);
   });
 
-  it.runIf(onPath)('the task created on resume landed in the temp backlog', () => {
-    const files = readdirSync(join(state, 'backlog', 'backlog', 'tasks'));
-    expect(files.some((f) => /add-login/i.test(f)), files.join(', ')).toBe(true);
+  it('the task created on resume landed in the temp backlog', async () => {
+    const tasks = await MemoryBacklog.byRoot.get(join(state, 'backlog'))!.listTasks();
+    expect(tasks.some((t) => t.title === 'Add login'), tasks.map((t) => t.title).join(', ')).toBe(true);
   });
 
   it('re-running an existing intake key is refused while paused; after resume it returns the existing task', async () => {
@@ -173,7 +142,7 @@ describe('intake pause: isolation, re-runs, pause/resume combinations and status
     expect((await cli(['resume', '--intake'])).code).toBe(0);
     const after = await cli(ownerRequest('intake:add-login'));
     expect(errorCode(after.out)).not.toBe('POLICY_DENIED');
-    if (onPath) expect((JSON.parse(after.out) as { data: { created: boolean } }).data.created).toBe(false);
+    expect((JSON.parse(after.out) as { data: { created: boolean } }).data.created).toBe(false);
   });
 
   it('plain `pause` pauses intake; `resume --starts` keeps it paused; plain `resume` re-opens it', async () => {
@@ -187,14 +156,17 @@ describe('intake pause: isolation, re-runs, pause/resume combinations and status
     expect(errorCode((await cli(ownerRequest('intake:all-resumed'))).out)).not.toBe('POLICY_DENIED');
   });
 
-  it('`status --json` reports data.paused.intake, which the intake skill checks', async () => {
+  // `minions status --json` puts collectStatus's report under data (the CLI adds the tmux/launch probes, which spawn).
+  it('the status report carries paused.intake, which the intake skill checks via `status --json`', async () => {
+    const report = async () => {
+      const db = new RuntimeDb(runtimePaths().db);
+      try { return await collectStatus({ db, config: defaults(), backlog: async () => MemoryBacklog.byRoot.get(join(state, 'backlog'))! }); }
+      finally { db.close(); }
+    };
     expect((await cli(['pause', '--intake'])).code).toBe(0);
-    const paused = await cli(['status']);
-    expect(paused.code, paused.out).toBe(0);
-    expect((JSON.parse(paused.out) as { data: { paused: { intake: boolean } } }).data.paused.intake).toBe(true);
+    expect((await report()).paused.intake).toBe(true);
     expect((await cli(['resume', '--intake'])).code).toBe(0);
-    const open = await cli(['status']);
-    expect((JSON.parse(open.out) as { data: { paused: { intake: boolean } } }).data.paused.intake).toBe(false);
+    expect((await report()).paused.intake).toBe(false);
   });
 
   it('`--parent` exempts any non-`intake:` key while paused (documented); `intake:` keys stay refused', async () => {

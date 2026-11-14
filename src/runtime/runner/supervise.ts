@@ -1,9 +1,11 @@
 // Spawn and supervision of a process worker (docs/design/agent-runtimes.md D3.5, D3.6). The worker runs in its
 // own process group (the minions-sandbox wrapper calls setsid; without the wrapper, in tests, Node's `detached`
-// does). Stop = SIGTERM to the group, SIGKILL after the grace. After the leader exits the group is SIGKILLed again
+// does). Stop = SIGINT to the group (Codex handles only SIGINT gracefully: it interrupts the turn and flushes its
+// output, agent-runtimes U-C4), SIGTERM after a short interrupt grace, then SIGKILL after the kill grace. After the leader exits the group is SIGKILLed again
 // so no member is left behind before post-exit starts (the wrapper additionally reaps setsid escapees as a
 // subreaper; D4 "Process lifetime").
 import { spawn } from 'node:child_process';
+import type { Writable } from 'node:stream';
 
 export type StopReason = 'timeout' | 'cancel' | 'drain' | 'lease-ended';
 
@@ -14,16 +16,30 @@ export interface SuperviseTiming {
   pollMs: number;
   /** SIGTERM -> SIGKILL (D4: 15 s). */
   killGraceMs: number;
+  /** SIGINT -> SIGTERM (default INTERRUPT_GRACE_MS; never longer than killGraceMs). */
+  interruptGraceMs?: number;
   /** Drain grace before the worker is stopped (D3.6: 120 s). */
   drainGraceMs: number;
+  /**
+   * Test seam: the wall-clock limit starts once this settles instead of at spawn, so a test can wait until its
+   * fake harness installed its signal handlers and still use a short limit. Unset in production.
+   */
+  timeoutStart?: Promise<unknown>;
 }
+/** SIGINT -> SIGTERM: long enough for Codex to end its turn and write its last events. */
+export const INTERRUPT_GRACE_MS = 5_000;
 export const DEFAULT_TIMING: Omit<SuperviseTiming, 'timeoutMs'> = { pollMs: 5_000, killGraceMs: 15_000, drainGraceMs: 120_000 };
 
-export interface SpawnSpec { argv: string[]; cwd: string; env: Record<string, string>; stdin: string | null }
+/**
+ * stdin: a string is written and stdin closed; null closes it at once; 'open' keeps it open for the caller (a resident
+ * coordinator session takes its inbox messages there, docs/design/coordinator-sessions.md decision 6), which gets the
+ * stream in onSpawn and ends it itself.
+ */
+export interface SpawnSpec { argv: string[]; cwd: string; env: Record<string, string>; stdin: string | null | 'open' }
 
 export interface SuperviseHooks {
-  /** Called once the process exists (pid = pgid). */
-  onSpawn(pid: number): Promise<void> | void;
+  /** Called once the process exists (pid = pgid); `stdin` is the open stream with SpawnSpec.stdin 'open', else null. */
+  onSpawn(pid: number, stdin: Writable | null): Promise<void> | void;
   /** One stdout line. */
   onLine(line: string): void;
   /** Polled: why the worker must stop now, or 'drain' to start the grace; null = keep running. */
@@ -47,9 +63,11 @@ export function supervise(spec: SpawnSpec, timing: SuperviseTiming, hooks: Super
     let stopped: StopReason | null = null;
     let stderr = '';
     let buf = '';
+    let termTimer: NodeJS.Timeout | undefined;
     let killTimer: NodeJS.Timeout | undefined;
     let drainTimer: NodeJS.Timeout | undefined;
     let polling = false;
+    const interruptGraceMs = Math.min(timing.interruptGraceMs ?? INTERRUPT_GRACE_MS, timing.killGraceMs);
     const child = spawn(spec.argv[0]!, spec.argv.slice(1), {
       cwd: spec.cwd, env: spec.env, detached: true, shell: false, windowsHide: true,
       // Only stdin, stdout and stderr are passed (Node closes every other descriptor on exec).
@@ -59,10 +77,16 @@ export function supervise(spec: SpawnSpec, timing: SuperviseTiming, hooks: Super
     const stop = (why: StopReason) => {
       if (stopped || pid === undefined) return;
       stopped = why;
-      killGroup(pid, 'SIGTERM');
-      killTimer = setTimeout(() => killGroup(pid, 'SIGKILL'), timing.killGraceMs);
+      killGroup(pid, 'SIGINT');
+      termTimer = setTimeout(() => {
+        killGroup(pid, 'SIGTERM');
+        killTimer = setTimeout(() => killGroup(pid, 'SIGKILL'), timing.killGraceMs);
+      }, interruptGraceMs);
     };
-    const deadline = setTimeout(() => stop('timeout'), timing.timeoutMs);
+    let deadline: NodeJS.Timeout | undefined;
+    let finished = false;
+    const armDeadline = () => { if (!finished) deadline = setTimeout(() => stop('timeout'), timing.timeoutMs); };
+    if (timing.timeoutStart) timing.timeoutStart.then(armDeadline, armDeadline); else armDeadline();
     const ticker = setInterval(() => {
       if (polling || stopped) return;
       polling = true;
@@ -80,10 +104,12 @@ export function supervise(spec: SpawnSpec, timing: SuperviseTiming, hooks: Super
     });
     child.stderr.setEncoding('utf8').on('data', (d: string) => { stderr = (stderr + d).slice(-STDERR_TAIL * 2); });
     child.stdin.on('error', () => undefined);
-    if (spec.stdin !== null) child.stdin.end(spec.stdin); else child.stdin.end();
+    // 'open': the caller writes and ends it (onSpawn).
+    if (spec.stdin !== 'open') { if (spec.stdin !== null) child.stdin.end(spec.stdin); else child.stdin.end(); }
     let spawnError: string | null = null;
     const finish = (code: number | null, signal: string | null) => {
-      clearTimeout(deadline); clearInterval(ticker); clearTimeout(killTimer); clearTimeout(drainTimer);
+      finished = true;
+      clearTimeout(deadline); clearInterval(ticker); clearTimeout(termTimer); clearTimeout(killTimer); clearTimeout(drainTimer);
       if (pid !== undefined) killGroup(pid, 'SIGKILL');
       if (buf) hooks.onLine(buf);
       resolveOutcome({ code, signal, stopped, stderrTail: stderr.slice(-STDERR_TAIL), spawnError });
@@ -98,6 +124,6 @@ export function supervise(spec: SpawnSpec, timing: SuperviseTiming, hooks: Super
       closeTimer = setTimeout(() => { child.stdout.destroy(); child.stderr.destroy(); once(code, signal); }, timing.killGraceMs);
     });
     child.on('close', (code, signal) => once(code, signal));
-    if (pid !== undefined) Promise.resolve(hooks.onSpawn(pid)).catch(() => stop('cancel'));
+    if (pid !== undefined) Promise.resolve(hooks.onSpawn(pid, spec.stdin === 'open' ? child.stdin : null)).catch(() => stop('cancel'));
   });
 }

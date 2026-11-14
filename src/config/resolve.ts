@@ -1,22 +1,20 @@
 import { MinionsError, invalidConfig, zodIssues, type ConfigIssue } from '../core/errors.js';
 import { CAPABILITIES, can, ruleEffects, stricter, strictness } from './capabilities.js';
 import { autoMergeConfigReasons } from './delivery.js';
+import { toMode } from './modes.js';
 import { ENGINEER_ROLE, harnessConfigIssues, registeredRoleNames, roleConfigIssues, roleLimit } from './roles.js';
 import { workflowConfigIssues } from './workflows.js';
 import { MinionsConfigSchema, CapabilityRuleSchema, type Capability, type CapabilityRule, type MinionsConfig } from './schema.js';
 
 export const SUPPORTED = {
   backlog: ['backlogmd'],
-  delivery: ['local', 'branch', 'pull-request'],
   communication: ['terminal', 'telegram', 'auto'],
 } as const;
 
 /** Features deferred in v0.1; doctor and the wizard report them as unavailable. */
 export const DEFERRED_FEATURES = [
-  'GitHub Issues backend', 'merge requests (delivery.merge "manual")', 'review publication',
-  'config plan/apply transactions', 'backlog migration', 'upgrade plan and schema migration', 'budgets',
-  'companion containers', 'GitHub App short-lived tokens (a fine-grained PAT is used instead)',
-  'CODEOWNERS mapping of sensitive paths', 'shared backlog versioned in Git',
+  'config plan/apply transactions', 'backlog migration', 'upgrade plan and schema migration',
+  'companion containers', 'shared backlog versioned in Git',
 ] as const;
 
 export interface Unavailable { path: string; value: unknown; reason: string }
@@ -26,31 +24,24 @@ export function listUnavailable(config: MinionsConfig): Unavailable[] {
   const out: Unavailable[] = [];
   const has = (list: readonly string[], v: string) => list.includes(v);
   if (!has(SUPPORTED.backlog, config.backlog.backend)) out.push({ path: 'backlog.backend', value: config.backlog.backend, reason: 'only Backlog.md is supported in v0.1' });
-  if (!has(SUPPORTED.delivery, config.delivery.mode)) out.push({ path: 'delivery.mode', value: config.delivery.mode, reason: `delivery mode is not supported (supported: ${SUPPORTED.delivery.join(', ')})` });
   if (!has(SUPPORTED.communication, config.communication.channel)) out.push({ path: 'communication.channel', value: config.communication.channel, reason: 'this communication channel is not supported in v0.1' });
   if (config.communication.channel === 'telegram' && config.container.network === 'none') {
     out.push({ path: 'communication.channel', value: 'telegram', reason: 'Telegram needs outbound network (api.telegram.org, and the npm registry for the plugin\'s dependencies) but container.network is none; the coordinator runs terminal-only' });
   }
   if (config.delivery.merge === 'auto-when-eligible') {
     const why = autoMergeConfigReasons(config);
-    if (why.length) out.push({ path: 'delivery.merge', value: config.delivery.merge, reason: `automatic merge is unavailable: ${why.join('; ')}` });
-  } else if (config.delivery.merge === 'manual') {
-    out.push({ path: 'delivery.merge', value: 'manual', reason: config.delivery.mode === 'pull-request'
-      ? 'merge requests through minions are deferred; minions never merges: merge the pull request through your normal process'
-      : 'merge requests need pull-request delivery and are deferred in v0.1' });
+      if (why.length) out.push({ path: 'delivery.merge', value: config.delivery.merge, reason: `local integration is unavailable: ${why.join('; ')}` });
   }
-  if (config.budgets.taskUsd !== null || config.budgets.dailyUsd !== null) out.push({ path: 'budgets', value: config.budgets, reason: 'budgets are not enforced in v0.1' });
   return out;
 }
 
 function crossFieldIssues(c: MinionsConfig): ConfigIssue[] {
   const issues: ConfigIssue[] = [];
-  if (!(SUPPORTED.delivery as readonly string[]).includes(c.delivery.mode)) issues.push({ path: 'delivery.mode', message: `"${c.delivery.mode}" is not supported by this build (supported: ${SUPPORTED.delivery.join(', ')})` });
   if (!(SUPPORTED.backlog as readonly string[]).includes(c.backlog.backend)) issues.push({ path: 'backlog.backend', message: `"${c.backlog.backend}" is not supported by this build (supported: ${SUPPORTED.backlog.join(', ')})` });
   if (!(SUPPORTED.communication as readonly string[]).includes(c.communication.channel)) issues.push({ path: 'communication.channel', message: `"${c.communication.channel}" is not supported by this build (supported: ${SUPPORTED.communication.join(', ')})` });
-  if (c.delivery.mode !== 'local' && c.delivery.provider !== 'github') issues.push({ path: 'delivery.provider', message: `delivery.mode "${c.delivery.mode}" publishes to GitHub and needs delivery.provider "github" (got "${c.delivery.provider}")` });
   if (!c.models.allowed.includes(c.models.default)) issues.push({ path: 'models.default', message: `"${c.models.default}" is not in models.allowed [${c.models.allowed.join(', ')}]` });
   if (c.models.coordinator !== undefined && !c.models.allowed.includes(c.models.coordinator)) issues.push({ path: 'models.coordinator', message: `"${c.models.coordinator}" is not in models.allowed [${c.models.allowed.join(', ')}]` });
+  if (c.models.router !== undefined && !c.models.allowed.includes(c.models.router)) issues.push({ path: 'models.router', message: `"${c.models.router}" is not in models.allowed [${c.models.allowed.join(', ')}]` });
   if (c.container.mountDockerSocket) issues.push({ path: 'container.mountDockerSocket', message: 'must be false: the Docker socket grants host control' });
   if (c.container.mountHostRepository) issues.push({ path: 'container.mountHostRepository', message: 'must be false: the workspace lives in a named volume' });
   // roles, role references in capability sub-rules, execution.maxByRole / maxEngineers (incl. <= maxActiveTasks).
@@ -62,16 +53,76 @@ function crossFieldIssues(c: MinionsConfig): ConfigIssue[] {
   return issues;
 }
 
-/** Strict schema parse + cross-field checks. Throws INVALID_CONFIG listing dotted paths. */
+/**
+ * Removed keys, accepted in any layer and dropped: the GitHub delivery and issue capabilities (docs/design/autonomy.md
+ * Decision 8), the dispatch mode (Decision 10; `coordinator.contextReset.barrierTokens` below) and risk-based testing
+ * (Decision 12).
+ */
+const LEGACY_KEYS: Record<string, readonly string[]> = {
+  backlog: ['repository'],
+  intake: ['github'],
+  delivery: ['provider', 'mode', 'method', 'deleteMergedBranches', 'identityMode', 'requireIndependentApproval', 'requiredChecksConfigured'],
+  verification: ['ciAuthority', 'ciPendingTimeoutMinutes', 'testerRequired', 'qaLabels'],
+  capabilities: ['git.push', 'pr.create', 'pr.review', 'pr.merge', 'external.read', 'external.comment', 'external.changeStatus', 'external.create'],
+  dispatch: ['mode'],
+};
+
+/**
+ * A copy of a config (or a layer of one) without the legacy keys. delivery.merge "manual" (never implemented) becomes
+ * "disabled", and so does an "auto-when-eligible" that meant GitHub auto-merge (delivery.mode branch or pull-request):
+ * it never switches local integration on by itself. The old `profile` becomes `mode` (Decision 11). Anything that is
+ * not an object is returned as is.
+ */
+export function stripLegacyKeys(raw: unknown): unknown {
+  if (!isObj(raw)) return raw;
+  const out: Obj = { ...raw };
+  if ('profile' in out) {
+    const { profile, ...rest } = out;
+    return stripLegacyKeys(rest.mode === undefined ? { ...rest, mode: toMode(profile) ?? profile } : rest);
+  }
+  for (const [section, keys] of Object.entries(LEGACY_KEYS)) {
+    const sec = out[section];
+    if (!isObj(sec) || !(keys.some((k) => k in sec) || (section === 'delivery' && sec.merge === 'manual'))) continue;
+    const next: Obj = { ...sec };
+    for (const k of keys) delete next[k];
+    if (section === 'delivery' && (next.merge === 'manual' || (next.merge === 'auto-when-eligible' && typeof sec.mode === 'string' && sec.mode !== 'local'))) next.merge = 'disabled';
+    out[section] = next;
+  }
+  // `{ role, when: "qa" }` stages (risk-based testing) are dropped: the verify step replaced them.
+  if (isObj(out.workflows)) {
+    out.workflows = Object.fromEntries(Object.entries(out.workflows).map(([name, list]) =>
+      [name, Array.isArray(list) ? list.filter((x) => !(isObj(x) && x.when === 'qa')) : list]));
+  }
+  if (isObj(out.backlog) && out.backlog.backend === 'github') out.backlog = { ...out.backlog, backend: 'backlogmd' };
+  const reset = isObj(out.coordinator) ? out.coordinator.contextReset : undefined;
+  if (isObj(reset) && 'barrierTokens' in reset) {
+    const { barrierTokens: _b, ...rest } = reset;
+    out.coordinator = { ...(out.coordinator as Obj), contextReset: rest };
+  }
+  // Project roles name capabilities too: their policy column and `requires`.
+  const legacyCap = (c: unknown) => LEGACY_KEYS.capabilities!.includes(c as string);
+  if (isObj(out.roles)) {
+    out.roles = Object.fromEntries(Object.entries(out.roles).map(([name, r]) => {
+      if (!isObj(r)) return [name, r];
+      const next: Obj = { ...r };
+      if (isObj(r.capabilities)) next.capabilities = Object.fromEntries(Object.entries(r.capabilities).filter(([c]) => !legacyCap(c)));
+      if (Array.isArray(r.requires)) next.requires = r.requires.filter((c) => !legacyCap(c));
+      return [name, next];
+    }));
+  }
+  return out;
+}
+
+/** Strict schema parse (after stripLegacyKeys) + cross-field checks. Throws INVALID_CONFIG listing dotted paths. */
 export function validateConfig(raw: unknown, source?: string): MinionsConfig {
-  const r = MinionsConfigSchema.safeParse(raw);
+  const r = MinionsConfigSchema.safeParse(stripLegacyKeys(raw));
   if (!r.success) throw invalidConfig(zodIssues(r.error.issues), source);
   const issues = crossFieldIssues(r.data);
   if (issues.length) throw invalidConfig(issues, source);
   return r.data;
 }
 
-export type Source = 'default' | 'project' | 'local' | 'session';
+export type Source = 'default' | 'project' | 'local' | 'control' | 'session';
 export interface EffectiveConfig { config: MinionsConfig; provenance: Record<string, Source> }
 export interface ResolveInput {
   defaults: MinionsConfig;
@@ -210,9 +261,8 @@ function applySession(base: MinionsConfig, session: unknown, prov: Record<string
     } else if (path === 'intake.scope.requiredLabels') {
       if (!Array.isArray(v) || !base.intake.scope.requiredLabels.every((l) => v.includes(l))) throw widen(path, 'must keep existing required labels');
       out.intake.scope.requiredLabels = v as string[];
-    } else if (path === 'verification.testerRequired' || path === 'verification.reviewerRequired') {
-      const k = key as 'testerRequired' | 'reviewerRequired';
-      out.verification[k] = onlyTrue(base.verification[k]);
+    } else if (path === 'verification.reviewerRequired') {
+      out.verification.reviewerRequired = onlyTrue(base.verification.reviewerRequired);
     } else if (path === 'sensitivePaths') {
       if (!Array.isArray(v) || !base.sensitivePaths.every((p) => v.includes(p))) throw widen(path, 'must keep existing sensitive paths');
       out.sensitivePaths = v as string[];
@@ -229,13 +279,51 @@ function applySession(base: MinionsConfig, session: unknown, prov: Record<string
   return validateConfig(out, 'session overrides');
 }
 
-/** defaults < project < local < session. Returns the validated config with per-leaf provenance. */
+/**
+ * The choices that drop the agents' last local boundary (no permission prompts at all, no host sandbox, SSH hosts) are the
+ * owner's alone: the project layer may be committed to the repository, so only config.local.json may make them.
+ */
+function checkHostOnlyChoices(project: MinionsConfig, label: string): void {
+  if (project.coordinator?.permissionMode === 'bypassPermissions') {
+    throw new MinionsError('POLICY_DENIED', `coordinator.permissionMode: ${label} cannot select bypassPermissions.`,
+      'Set it in the host-only config.local.json: `minions settings set coordinator.permissionMode bypassPermissions`.', { path: 'coordinator.permissionMode' });
+  }
+  if (project.coordinator?.sandbox === false) {
+    throw new MinionsError('POLICY_DENIED', `coordinator.sandbox: ${label} cannot turn the host sandbox off.`,
+      'Set it in the host-only config.local.json: `minions settings set coordinator.sandbox false`.', { path: 'coordinator.sandbox' });
+  }
+  if (project.coordinator?.allowedDomains?.length) {
+    throw new MinionsError('POLICY_DENIED', `coordinator.allowedDomains: ${label} cannot open network hosts to sandboxed commands.`,
+      'Set it in the host-only config.local.json: `minions settings set coordinator.allowedDomains <host>`.', { path: 'coordinator.allowedDomains' });
+  }
+  if (project.coordinator?.unsandboxedCommands?.length) {
+    throw new MinionsError('POLICY_DENIED', `coordinator.unsandboxedCommands: ${label} cannot run agent commands outside the sandbox.`,
+      'Set it in the host-only config.local.json: `minions settings set coordinator.unsandboxedCommands "<pattern>"`.', { path: 'coordinator.unsandboxedCommands' });
+  }
+  if (project.coordinator?.sshHosts?.length) {
+    throw new MinionsError('POLICY_DENIED', `coordinator.sshHosts: ${label} cannot let agent commands reach SSH hosts.`,
+      'Set it in the host-only config.local.json: `minions settings set coordinator.sshHosts <user@host>`.', { path: 'coordinator.sshHosts' });
+  }
+}
+
+/**
+ * A resolved config with the coordinator's control overlay on top (docs/design/autonomy.md Decision 3). The runtime
+ * applies it to the config the host resolved; it is trusted like the local layer but without the deny-preservation
+ * check (the owner gave the coordinator full control).
+ */
+export function applyControl(base: MinionsConfig, control: unknown, label = 'control overlay', prov: Record<string, Source> = {}): MinionsConfig {
+  if (control === undefined) return base;
+  return validateConfig(overlay(base as unknown as Obj, control, 'control', prov, label), label);
+}
+
+/** defaults < project < local < session (the runtime adds control, applyControl). Returns the validated config with per-leaf provenance. */
 export function resolve(input: ResolveInput): EffectiveConfig {
   const label = (s: Source) => input.sources?.[s] ?? `${s} configuration`;
   const prov: Record<string, Source> = {};
   walk(input.defaults, [], (p) => (prov[p.join('.')] = 'default'));
   let merged = overlay(input.defaults as unknown as Obj, input.project, 'project', prov, label('project'));
   const project = validateConfig(merged, label('project'));
+  checkHostOnlyChoices(project, label('project'));
   merged = overlay(merged, input.local, 'local', prov, label('local'));
   let config = validateConfig(merged, input.local === undefined ? label('project') : label('local'));
   if (input.local !== undefined) checkDenyPreserved(project, config, label('local'));

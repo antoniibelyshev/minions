@@ -1,5 +1,5 @@
 import { isRegisteredRole, roleColumnRules } from './roles.js';
-import { CAPABILITIES, type Capability, type CapabilityRule, type Effect, type MinionsConfig, type Profile, type Role } from './schema.js';
+import { CAPABILITIES, type Capability, type CapabilityRule, type Effect, type MinionsConfig, type Mode, type Role } from './schema.js';
 
 export { CAPABILITIES };
 export type { Capability, CapabilityRule, Effect, Role };
@@ -8,7 +8,10 @@ const RANK: Record<Effect, number> = { allow: 0, ask: 1, deny: 2 };
 export const strictness = (e: Effect) => RANK[e];
 export const stricter = (a: Effect, b: Effect): Effect => (RANK[a] >= RANK[b] ? a : b);
 
-/** Spec §14 defaults (`.agent-squad/**` is `.minions/**` here). */
+/** Paths whose change could take control of the agents or the owner's tooling: independent mode needs approval for them. */
+export const INDEPENDENT_SENSITIVE_PATHS = ['.claude/**', '.minions/**', 'CLAUDE.md', 'AGENTS.md', '.githooks/**', '.husky/**', '.github/workflows/**'];
+
+/** Supervised mode (the owner merges everything anyway). */
 export const DEFAULT_SENSITIVE_PATHS = [
   '.github/workflows/**', '.github/CODEOWNERS', '.minions/**', '.claude/**',
   'CLAUDE.md', 'AGENTS.md', 'automation/**',
@@ -16,8 +19,8 @@ export const DEFAULT_SENSITIVE_PATHS = [
   '**/migrations/**',
 ];
 
-/** Capabilities whose effect is upgraded allow→ask when a sensitive path is touched. */
-export const PUBLICATION_CAPABILITIES: Capability[] = ['git.push', 'pr.create', 'pr.merge'];
+/** Capabilities whose effect is upgraded allow→ask when a sensitive path is touched (the local integrator). */
+export const LANDING_CAPABILITIES: Capability[] = ['base.merge'];
 
 const globCache = new Map<string, RegExp>();
 /** Minimal glob: `**` any depth (incl. zero dirs), `*` within a segment, `?` one char. */
@@ -49,7 +52,7 @@ export interface CanContext { role?: Role; paths?: string[] }
  * `roles`) is denied everything. Deny anywhere (base or matching rule) wins; otherwise matching
  * role/path rules override the base (strictest among them); a project role's column (`roles.<r>.capabilities`
  * and its defaults, src/config/roles.ts) adds sub-rules for that role. Sensitive paths upgrade allow→ask
- * for publication capabilities.
+ * for the landing capability (base.merge).
  */
 export function can(config: Pick<MinionsConfig, 'capabilities' | 'sensitivePaths'> & Partial<Pick<MinionsConfig, 'roles'>>, capability: Capability, ctx: CanContext = {}): Effect {
   if (ctx.role !== undefined && !isRegisteredRole(config, ctx.role)) return 'deny';
@@ -64,7 +67,7 @@ export function can(config: Pick<MinionsConfig, 'capabilities' | 'sensitivePaths
       (!r.paths || paths.some((p) => matchesAny(p, r.paths!))));
     if (matching.length) effect = matching.map((r) => r.effect).reduce(stricter);
   }
-  if (effect === 'allow' && PUBLICATION_CAPABILITIES.includes(capability) && paths.some((p) => matchesAny(p, config.sensitivePaths))) {
+  if (effect === 'allow' && LANDING_CAPABILITIES.includes(capability) && paths.some((p) => matchesAny(p, config.sensitivePaths))) {
     effect = 'ask';
   }
   return effect;
@@ -75,36 +78,20 @@ export const ruleEffects = (r: CapabilityRule): Effect[] =>
   typeof r === 'string' ? [r] : [r.effect, ...(r.rules ?? []).map((x) => x.effect)];
 
 type Table = Record<Capability, CapabilityRule>;
-// Workers that only verify or review must not edit code.
-const noEditFor = (effect: Effect, roles: Role[]): CapabilityRule => ({ effect, rules: [{ effect: 'deny', roles }] });
 
-const PROJECT_OWNER: Table = {
-  'task.read': 'allow', 'task.create': 'allow', 'task.update': 'allow', 'task.start': 'allow',
-  'external.read': 'allow', 'external.comment': 'ask', 'external.changeStatus': 'ask', 'external.create': 'ask',
-  'code.edit': noEditFor('allow', ['reviewer']), 'dependencies.edit': 'allow', 'architecture.change': 'allow', 'migrations.edit': 'allow',
-  'git.commit': 'allow', 'git.push': 'allow',
-  'pr.create': 'allow', 'pr.review': 'allow', 'pr.merge': 'ask',
-  'ci.edit': 'ask', 'infrastructure.edit': 'ask',
-  'network.use': 'allow',
-  'deploy.execute': 'deny',
-};
-
-const PERSONAL_WORK: Table = {
-  ...PROJECT_OWNER,
-  'external.comment': 'deny', 'external.changeStatus': 'deny', 'external.create': 'deny',
-  'dependencies.edit': 'ask', 'architecture.change': 'ask', 'migrations.edit': 'ask',
-  'git.push': 'ask', 'pr.create': 'ask', 'pr.review': 'ask', 'pr.merge': 'deny',
-  'ci.edit': 'deny',
-};
-
-const SUPERVISED: Table = {
-  ...PROJECT_OWNER,
-  'dependencies.edit': 'ask', 'architecture.change': 'ask', 'migrations.edit': 'ask',
-  'git.push': 'deny', 'pr.create': 'deny', 'pr.review': 'ask', 'pr.merge': 'deny',
-};
-
-export const DEFAULT_CAPABILITIES: Record<Profile, Table> = {
-  'project-owner': PROJECT_OWNER, 'personal-work': PERSONAL_WORK, supervised: SUPERVISED,
-};
-
-export const defaultCapabilities = (profile: Profile): Table => structuredClone(DEFAULT_CAPABILITIES[profile]);
+/**
+ * Mode policy (docs/design/autonomy.md Decision 11): everything is allowed except deploying; reviewers never edit
+ * code. Only landing on the base differs: independent lands approved work itself, supervised leaves it to the owner.
+ */
+export function defaultCapabilities(mode: Mode): Table {
+  return {
+    'task.read': 'allow', 'task.create': 'allow', 'task.update': 'allow', 'task.start': 'allow',
+    'code.edit': { effect: 'allow', rules: [{ effect: 'deny', roles: ['reviewer'] }] },
+    'dependencies.edit': 'allow', 'architecture.change': 'allow', 'migrations.edit': 'allow',
+    'git.commit': 'allow',
+    'base.merge': mode === 'independent' ? 'allow' : 'deny',
+    'ci.edit': 'allow', 'infrastructure.edit': 'allow',
+    'network.use': 'allow',
+    'deploy.execute': 'deny',
+  };
+}

@@ -1,15 +1,9 @@
 // Source phase of `minions upgrade` (host), run before any container step:
 //   sync: `--from-container` exports the container's branches (exportRepo) and fast-forwards one host
 //         branch to refs/remotes/minions/<base>, only on a strict fast-forward with clean trees.
-//         Local delivery only.
-//   origin: GitHub delivery (branch / pull-request): origin/<base> is the single source of truth. In a
-//         minions checkout the host base is fetched from origin and strictly fast-forwarded, and the
-//         CLI is built only when the checkout is exactly the reviewed origin/<base> commit (clean tree);
-//         --from-container is refused.
 //   cli:  when the project repo is a minions checkout, compares the installed global CLI with it and
 //         rebuilds/reinstalls, or prints the exact command and stops before the container steps.
-// Decision records: docs/design/bootstrap.md, "Upgrade from the container" and "origin/<base> as the
-// single source of truth".
+// Decision record: docs/design/bootstrap.md, "Upgrade from the container".
 //
 // - The host branch only ever moves forward: `merge --ff-only` where it is checked out, else
 //   `update-ref <ref> <new> <old>`. Never a force, reset, checkout or stash; a dirty tree or a
@@ -38,11 +32,11 @@ const BUILD_DEPS = ['esbuild', 'zod', 'commander'];
 
 export interface SourceStep { id: 'sync' | 'cli'; status: 'done' | 'skipped' | 'failed' | 'planned'; detail: string }
 
-// ---------------------------------------------------------------- sync (--from-container / origin)
+// ---------------------------------------------------------------- sync (--from-container)
 
 export interface SyncResult {
-  /** container: `--from-container` (local delivery); origin: GitHub delivery, the reviewed origin/<base>. */
-  source: 'container' | 'origin';
+  /** `--from-container`: the container's base. */
+  source: 'container';
   branch: string;
   /** Remote-tracking ref the branch is fast-forwarded to. */
   target: string;
@@ -157,71 +151,14 @@ export async function syncFromContainer(opts: SyncOptions): Promise<SyncResult> 
   return { source: 'container', ...r, exported };
 }
 
-// ---------------------------------------------------------------- origin (GitHub delivery)
-
-export interface OriginSyncOptions {
-  /** The project checkout (a minions checkout). */
-  repo: string;
-  /** Base branch: fetched from origin and fast-forwarded on the host. */
-  baseBranch: string;
-  /** Remote to fetch from: the project's recorded remote URL, else `origin`. */
-  remote: string;
-  dryRun?: boolean;
-  runner?: Runner;
-}
-
-export const ORIGIN_LABEL = 'origin';
-
-/**
- * GitHub delivery: origin/<base> is the single source of truth, so the CLI is built only from it. Fetches
- * <base> into refs/remotes/origin/<base> (not on --dry-run), then fast-forwards the host <base> to it
- * with the same strict rules as --from-container. Never takes anything from the container.
- */
-export async function syncFromOrigin(opts: OriginSyncOptions): Promise<SyncResult> {
-  const git = hostGit(opts.repo, opts.runner ?? run);
-  const base = opts.baseBranch;
-  const fmt = await git(['check-ref-format', `refs/heads/${base}`]);
-  if (fmt.code !== 0 || base.startsWith('-')) throw new MinionsError('PRECONDITION', `upgrade: "${base}" is not a valid base branch name.`);
-  const target = `refs/remotes/origin/${base}`;
-  if (!opts.dryRun) {
-    const f = await git(['fetch', '--no-tags', '--', opts.remote, `+refs/heads/${base}:${target}`]);
-    if (f.code !== 0) {
-      throw new MinionsError('NETWORK_RETRYABLE', `upgrade: fetching ${base} from origin failed: ${(f.stderr || f.stdout).trim().split('\n').slice(-2).join(' ').slice(0, 300) || `git exit ${f.code}`}.`,
-        'Nothing was changed. With GitHub delivery the CLI is built only from origin; fix the network or your git credentials, then rerun `minions upgrade`.');
-    }
-  }
-  const r = await fastForwardHost(git, {
-    repo: opts.repo, branch: base, target, label: `upgrade (origin/${base})`, reflog: 'minions upgrade: fast-forward from origin', rerun: 'minions upgrade', dryRun: !!opts.dryRun,
-    missingHint: opts.dryRun ? `Run \`git fetch origin ${base}\` first to preview against origin.` : `origin has no ${base} branch.`,
-  });
-  return { source: 'origin', ...r, exported: null };
-}
-
-/**
- * The checkout the CLI is built from must be exactly the reviewed origin commit: HEAD at `sha` and no
- * uncommitted or untracked changes. Returns the reason it is not, or null.
- */
-export async function checkoutAtReviewed(repo: string, sha: string, base: string, runner: Runner = run): Promise<string | null> {
-  const git = hostGit(repo, runner);
-  const h = await git(['rev-parse', '--verify', '--quiet', 'HEAD^{commit}']);
-  const headSha = h.code === 0 ? h.stdout.trim() : null;
-  if (headSha !== sha) return `the checkout at ${repo} is at ${short(headSha)}, not the reviewed origin/${base} commit ${short(sha)}`;
-  const dirty = await dirtyEntries(git, repo, 'upgrade');
-  if (dirty.length) return `the checkout at ${repo} has uncommitted or untracked changes (${dirty.length}: ${dirty.slice(0, 5).map((l) => l.trim()).join(', ')}${dirty.length > 5 ? ', ...' : ''}), so it is not the reviewed origin/${base} commit`;
-  return null;
-}
-
 export function syncStep(s: SyncResult, dryRun: boolean): SourceStep {
   const where = s.worktree ? `checked out at ${s.worktree}` : 'not checked out';
-  const how = s.source === 'origin' ? 'fetch origin' : 'export';
   if (s.action === 'up-to-date') return { id: 'sync', status: 'skipped', detail: `${s.branch} already at ${s.target} (${short(s.to)})` };
   if (s.action === 'ahead') {
-    return { id: 'sync', status: 'skipped', detail: s.source === 'origin'
-      ? `${s.branch} (${short(s.from)}) has commits origin does not have (${s.target} at ${short(s.targetSha)}); not moved`
-      : `${s.branch} (${short(s.from)}) already contains ${s.target}; not moved` };
+    return { id: 'sync', status: 'skipped', detail: `${s.branch} (${short(s.from)}) already contains ${s.target}; not moved` };
   }
   return dryRun
-    ? { id: 'sync', status: 'planned', detail: `${how}, then fast-forward ${s.branch} ${short(s.from)} -> ${short(s.to)} (${s.target}, as of the last ${s.source === 'origin' ? 'fetch' : 'export'}) with ${s.method} (${where})` }
+    ? { id: 'sync', status: 'planned', detail: `export, then fast-forward ${s.branch} ${short(s.from)} -> ${short(s.to)} (${s.target}, as of the last export) with ${s.method} (${where})` }
     : { id: 'sync', status: 'done', detail: `fast-forwarded ${s.branch} ${short(s.from)} -> ${short(s.to)} with ${s.method} (${where})` };
 }
 
@@ -299,7 +236,14 @@ export function manualReinstallCommand(checkout: string, version: string | null)
   return `cd ${shellQuote(checkout)} && npm ci && MINIONS_BUILD_KIND=packed npm pack && npm uninstall -g minions && npm install -g ${packedTarball(version)}`;
 }
 
-export async function checkCli(opts: { checkout: string; runner?: Runner; runningRoot?: string; handoff?: boolean }): Promise<CliCheck> {
+const within = (p: string, dir: string) => { const d = real(dir) ?? dir; return p === d || p.startsWith(d.endsWith('/') ? d : `${d}/`); };
+
+/**
+ * agentWritable (host runtime): dirs agents may write. A checkout inside them is never built, and a linked install
+ * whose target is inside them is never rebuilt in place (the shims run the CLI outside the sandbox): both get the
+ * manual packed reinstall instead, which the upgrade prints and stops at.
+ */
+export async function checkCli(opts: { checkout: string; runner?: Runner; runningRoot?: string; handoff?: boolean; agentWritable?: string[] }): Promise<CliCheck> {
   const checkout = real(opts.checkout) ?? opts.checkout;
   const checkoutVersion = readJson<{ version?: string }>(join(checkout, 'package.json'))?.version ?? null;
   const checkoutSource = sourceFingerprint(checkout);
@@ -313,6 +257,11 @@ export async function checkCli(opts: { checkout: string; runner?: Runner; runnin
         : `installed source ${installed.stamp.source} != checkout ${checkoutSource}`;
   const manual = { ...base, differs, reason, action: 'manual' as const, command: manualReinstallCommand(checkout, checkoutVersion) };
   if (opts.handoff) return { ...manual, reason: `${reason}; still different after the reinstall` };
+  const writable = opts.agentWritable ?? [];
+  const unsafe = writable.find((d) => within(checkout, d) || (!!installed.realPath && within(installed.realPath, d)));
+  if (unsafe) {
+    return { ...manual, reason: `${reason}; ${within(checkout, unsafe) ? `the checkout ${checkout}` : `the global install (${installed.kind}) at ${installed.realPath}`} is inside the agent-writable ${unsafe}, so it is never built or linked: install a packed tarball from a checkout outside it` };
+  }
   if (installed.kind === 'link' && installed.realPath === checkout) {
     const deps = missingDeps(checkout);
     return { ...base, differs, reason, action: 'rebuild', command: `cd ${shellQuote(checkout)} && ${deps.length ? 'npm ci' : 'npm run build'}` };
@@ -349,7 +298,7 @@ export async function applyCli(c: CliCheck, opts: { runner?: Runner; log?: (m: s
     const tgz = join(dir, `minions-${c.checkoutVersion}.tgz`);
     if (!existsSync(tgz)) throw new MinionsError('INTERNAL', `npm pack did not produce ${tgz}.`);
     if (c.installed.realPath) {
-      try { await (opts.backup ?? backupInstalledCli)(c.installed.realPath, c.installed.version, { runner, env, log: opts.log }); } catch (e) {
+      try { await (opts.backup ?? backupInstalledCli)(c.installed.realPath, c.installed.version, { log: opts.log }); } catch (e) {
         throw new MinionsError('INTERNAL', `backing up the current CLI failed, so nothing was installed: ${(e as Error).message}`);
       }
     }
@@ -409,14 +358,8 @@ export interface SourcePhase<C = unknown> {
 }
 
 export interface SourcePhaseOptions {
-  /** --from-container sync (local delivery only); null when not requested. */
+  /** --from-container sync; null when not requested. */
   sync: SyncOptions | null;
-  /**
-   * GitHub delivery: build the CLI only from the reviewed origin/<base> commit (fetch, strict fast-forward
-   * of the host base, then require the checkout to be exactly that commit). Used only with a checkout;
-   * never combined with `sync`.
-   */
-  origin?: OriginSyncOptions | null;
   /** The project checkout when it is a minions source checkout (else the CLI check is skipped). */
   checkout: string | null;
   dryRun?: boolean;
@@ -425,6 +368,8 @@ export interface SourcePhaseOptions {
   runningRoot?: string;
   /** This process already continues an upgrade after a reinstall: never reinstall again. */
   handoff?: boolean;
+  /** Host runtime: the agent-writable dirs (see checkCli). */
+  agentWritable?: string[];
   /**
    * --rebuild-cli: the user reviewed the checkout and allows the upgrade to run its npm scripts/build
    * on the host and install the result globally. Without it the command is printed and the upgrade stops.
@@ -444,7 +389,6 @@ export async function runSourcePhase<C>(opts: SourcePhaseOptions): Promise<Sourc
   const out: SourcePhase<C> = { steps: [], ok: true, sync: null, cli: null, stop: null, continued: null };
   const push = (s: SourceStep) => { out.steps.push(s); if (!dryRun) log(`${s.id}: ${s.detail}`); };
 
-  if (opts.sync && opts.origin) throw new MinionsError('PRECONDITION', '--from-container cannot be combined with GitHub delivery (origin/<base> is the source).');
   if (opts.sync) {
     try {
       out.sync = await syncFromContainer({ ...opts.sync, dryRun, runner: opts.sync.runner ?? opts.runner });
@@ -459,33 +403,7 @@ export async function runSourcePhase<C>(opts: SourcePhaseOptions): Promise<Sourc
     push({ id: 'cli', status: 'skipped', detail: 'the project repository is not a minions checkout; installed CLI not compared' });
     return out;
   }
-  if (opts.origin) {
-    const base = opts.origin.baseBranch;
-    try {
-      out.sync = await syncFromOrigin({ ...opts.origin, dryRun, runner: opts.origin.runner ?? opts.runner });
-      push(syncStep(out.sync, dryRun));
-    } catch (e) {
-      if (!dryRun || !(e instanceof MinionsError)) throw e;
-      push({ id: 'sync', status: 'failed', detail: `would refuse: ${e.message}` });
-      push({ id: 'cli', status: 'failed', detail: `would stop: the CLI is built only from the reviewed origin/${base} commit` });
-      out.ok = false;
-      return out;
-    }
-    // A dry run that plans the fast-forward checks the checkout as it will be after it.
-    const planned = dryRun && out.sync.action === 'fast-forward';
-    const notReviewed = planned ? null : await checkoutAtReviewed(opts.checkout, out.sync.targetSha, base, opts.origin.runner ?? opts.runner);
-    if (notReviewed) {
-      const reason = `${notReviewed}; with GitHub delivery the CLI is built only from origin/${base}`;
-      push({ id: 'cli', status: 'failed', detail: dryRun ? `would stop: ${reason}` : reason });
-      out.ok = false;
-      if (!dryRun) {
-        out.stop = { reason, rerun: opts.rerun,
-          command: `cd ${shellQuote(opts.checkout)} && git status && git switch ${shellQuote(base)} && git merge --ff-only origin/${shellQuote(base)}` };
-      }
-      return out;
-    }
-  }
-  const check = () => checkCli({ checkout: opts.checkout!, runner: opts.runner, runningRoot: opts.runningRoot, handoff: opts.handoff });
+  const check = () => checkCli({ checkout: opts.checkout!, runner: opts.runner, runningRoot: opts.runningRoot, handoff: opts.handoff, agentWritable: opts.agentWritable });
   const c = out.cli = await check();
   if (!c.differs || c.action === 'manual') {
     push(cliStep(c, dryRun));
@@ -498,9 +416,8 @@ export async function runSourcePhase<C>(opts: SourcePhaseOptions): Promise<Sourc
   // Building runs the checkout's npm lifecycle scripts, esbuild config and lockfile dependencies on the
   // host and installs the result as the global CLI. Commits just taken from the container are never
   // built in the same run (a dry run plans that fast-forward), and building at all needs the explicit
-  // --rebuild-cli opt-in. origin/<base> commits were reviewed and merged on GitHub, so only container
-  // commits wait a run.
-  const moved = !!out.sync && out.sync.source === 'container' && out.sync.action === 'fast-forward' && (out.sync.applied || dryRun);
+  // --rebuild-cli opt-in.
+  const moved = !!out.sync && out.sync.action === 'fast-forward' && (out.sync.applied || dryRun);
   if (moved || !opts.rebuildCli) {
     const s = out.sync;
     const why = moved
@@ -553,41 +470,25 @@ export async function runSourcePhase<C>(opts: SourcePhaseOptions): Promise<Sourc
 
 // ---------------------------------------------------------------- which source
 
-/**
- * Where `minions upgrade` takes its source from. Local delivery: the checkout as it is, plus the
- * container's base on --from-container. GitHub delivery: origin/<base> only (in a minions checkout), and
- * --from-container is refused, because nothing may reach the host base except through pull requests.
- */
-export function upgradeSourceMode(o: { githubDelivery: boolean; fromContainer: boolean; checkout: string | null; baseBranch: string }): 'origin' | 'container' | 'checkout' | 'none' {
-  if (o.githubDelivery) {
-    if (o.fromContainer) {
-      throw new MinionsError('PRECONDITION',
-        `--from-container is available with local delivery only: with GitHub delivery origin/${o.baseBranch} is the single source of truth and container work reaches it only through pull requests.`,
-        `Merge the pull requests on GitHub, then run \`minions upgrade\` (it fetches origin/${o.baseBranch} and builds the CLI from that reviewed commit).`);
-    }
-    return o.checkout ? 'origin' : 'none';
-  }
+/** Where `minions upgrade` takes its source from: the checkout as it is, plus the container's base on --from-container. */
+export function upgradeSourceMode(o: { fromContainer: boolean; checkout: string | null }): 'container' | 'checkout' | 'none' {
   if (o.fromContainer) return 'container';
   return o.checkout ? 'checkout' : 'none';
 }
 
-// ---------------------------------------------------------------- sync only (the manager's /sync)
+// ---------------------------------------------------------------- sync only
 
 export interface SyncOnlyResult { ok: boolean; steps: SourceStep[]; sync: SyncResult | null; stopped: null }
 
 /**
- * `minions upgrade --sync-only` (task-53.5.3, the manager's /sync): only the source sync, no CLI and no container
- * steps. Local delivery: export the container branches and strictly fast-forward the host base (`sync`); GitHub
- * delivery: fetch origin/<base> and strictly fast-forward (`origin`). Never forces, resets, stashes or checks out:
+ * `minions upgrade --sync-only` (scripts/dev/self-update.mjs): only the source sync, no CLI and no container
+ * steps: export the container branches and strictly fast-forward the host base. Never forces, resets, stashes or checks out:
  * a dirty tree or a divergence refuses with the reason. A dry run reports a refusal as a failed step (ok false).
  */
-export async function runSyncOnly(o: { sync: SyncOptions | null; origin: OriginSyncOptions | null; dryRun?: boolean; runner?: Runner }): Promise<SyncOnlyResult> {
+export async function runSyncOnly(o: { sync: SyncOptions; dryRun?: boolean; runner?: Runner }): Promise<SyncOnlyResult> {
   const dryRun = !!o.dryRun;
-  if (!!o.sync === !!o.origin) throw new MinionsError('INTERNAL', 'upgrade --sync-only needs exactly one source (container or origin).');
   try {
-    const sync = o.sync
-      ? await syncFromContainer({ ...o.sync, dryRun, runner: o.sync.runner ?? o.runner })
-      : await syncFromOrigin({ ...o.origin!, dryRun, runner: o.origin!.runner ?? o.runner });
+    const sync = await syncFromContainer({ ...o.sync, dryRun, runner: o.sync.runner ?? o.runner });
     return { ok: true, steps: [syncStep(sync, dryRun)], sync, stopped: null };
   } catch (e) {
     if (!dryRun || !(e instanceof MinionsError)) throw e;

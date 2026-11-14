@@ -1,11 +1,11 @@
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
 import type { IdempotencyStore } from '../backlog/types.js';
 import { MinionsError } from '../core/errors.js';
 import { runtimePaths } from './paths.js';
 
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 13;
 
 /** The built-in worker roles (always registered). */
 export type BuiltinLeaseRole = 'engineer' | 'tester' | 'reviewer';
@@ -32,12 +32,13 @@ export interface EvidenceRow {
 }
 
 /**
- * Publication of an approved task (branch / pull-request delivery). One row per task, bound to the
- * approved head. pending: approved, not yet published (or interrupted); awaiting-approval: needs a
- * recorded human approval (sensitive paths or an "ask" capability); failed: retryable with
- * `minions work publish`; published: pushed (and PR opened in pull-request mode).
+ * The local integration of an approved task (mode `local`, docs/design/local-auto-integration.md). One row per task,
+ * bound to the approved head. queued: the approved head waits for or runs in the local integrator;
+ * awaiting-approval: the landing needs a host-signed merge approval; failed: the integration failed (repair, or a
+ * blocked transient failure); published: landed on the base. `pending` and rows of other modes come from the removed
+ * GitHub delivery.
  */
-export type PublicationState = 'pending' | 'awaiting-approval' | 'failed' | 'published';
+export type PublicationState = 'pending' | 'queued' | 'awaiting-approval' | 'failed' | 'published';
 export interface PublicationRow {
   task_id: string; branch: string; head_sha: string; mode: string; state: PublicationState;
   pr_url: string | null; error_code: string | null; error: string | null;
@@ -47,23 +48,14 @@ export interface PublicationRow {
 export interface ApprovalRow { id: number; task_id: string; scope: string; head_sha: string; approved_by: string | null; note: string | null; recorded_at: string; signature: string | null }
 
 /**
- * A role proposal (docs/design/roles-and-workflows.md D2): drafted by the coordinator with
- * `minions config roles propose`, applied on the host with `minions config roles apply <id>`. Never effective
- * by itself. pending: waiting for the owner; applied: the host applied it; superseded: a later proposal for the
- * same role name replaced it.
- */
-export type RoleProposalState = 'pending' | 'applied' | 'superseded';
-export interface RoleProposalRow { id: string; name: string; json: string; created_at: string; state: RoleProposalState; updated_at: string; applied_revision: number | null }
-
-/**
- * A change request (docs/design/host-manager.md): a setup change the coordinator proposes from the runtime.
- * proposed: waiting for the owner; confirmed: the owner confirmed the host plan and the host is applying it;
- * applied / failed: the host's outcome; rejected: the owner said no; expired: superseded by a newer request of
- * the same kind (and key). Only the host moves a request past proposed.
+ * A change request: an upgrade the coordinator proposes from the runtime (src/runtime/change-requests.ts).
+ * proposed: waiting for the host; confirmed: the host is applying it; applied / failed: the host's outcome;
+ * rejected: the owner said no; expired: superseded by a newer request. Only the host moves a request past proposed.
+ * Rows of the removed kinds (config-set, restart) may remain in old databases; they are never listed.
  */
 export const CHANGE_REQUEST_STATUSES = ['proposed', 'confirmed', 'applied', 'failed', 'rejected', 'expired'] as const;
 export type ChangeRequestStatus = (typeof CHANGE_REQUEST_STATUSES)[number];
-export const CHANGE_REQUEST_KINDS = ['config-set', 'restart', 'upgrade'] as const;
+export const CHANGE_REQUEST_KINDS = ['upgrade'] as const;
 export type ChangeRequestKind = (typeof CHANGE_REQUEST_KINDS)[number];
 export interface ChangeRequestRow {
   id: string; kind: ChangeRequestKind; payload: string; reason: string | null; created_at: string;
@@ -73,11 +65,34 @@ export interface ChangeRequestRow {
 /** A task's workflow position (D6); `stages_json` holds the stage list including runtime insertions. */
 export interface TaskStageRow { task_id: string; workflow: string; stages_json: string; position: number; updated_at: string }
 
+/**
+ * A headless coordinator session (docs/design/coordinator-sessions.md decision 4; schema 10). key: `general` or
+ * `task:<id>`; claude_session_id: the id `--resume` continues (null before the first turn); status: `open` while a
+ * process may serve it, `closed` (task delivered, done, cancelled, blocked, or awaiting the owner after a handoff),
+ * `failed` (resumes exhausted). config_dir: its persistent CLAUDE_CONFIG_DIR (src/runtime/sessions.ts).
+ */
+/** `thread`: one Telegram thread (a reply chain, keyed by its root message id; docs/design/autonomy.md Decision 6). */
+export type SessionKind = 'task' | 'general' | 'thread';
+export type SessionStatus = 'open' | 'closed' | 'failed';
+export interface SessionRow {
+  key: string; kind: SessionKind; claude_session_id: string | null; status: SessionStatus; model: string | null;
+  config_dir: string; opened_at: string; last_wake_at: string | null; closed_at: string | null; resumes: number; failure: string | null;
+}
+/** A message waiting for a session (router `coordinator send`, supervisor notices); delivered_at is set once handed over. */
+export interface SessionInboxRow { id: number; session_key: string; source: string; text: string; meta_json: string | null; created_at: string; delivered_at: string | null }
+
 export interface GuardRow { fingerprint: string | null; count: number; last_reason: string | null; updated_at: string | null }
 /** The last `controls` event that set one pause flag: its event id, time and the value it set. */
 export interface PauseChange { id: number; at: string; value: boolean }
 
-const MIGRATIONS: Record<number, string> = {
+/** A migration: SQL, or a step that inspects the schema first (ADD COLUMN has no IF NOT EXISTS). */
+type Migration = string | ((sql: DatabaseSync) => void);
+const addColumn = (sql: DatabaseSync, table: string, column: string, type: string) => {
+  const cols = (sql.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map((c) => c.name);
+  if (!cols.includes(column)) sql.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+};
+
+const MIGRATIONS: Record<number, Migration> = {
   1: `
     CREATE TABLE IF NOT EXISTS controls (key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS leases (
@@ -128,7 +143,7 @@ const MIGRATIONS: Record<number, string> = {
       task_id TEXT PRIMARY KEY, workflow TEXT NOT NULL, stages_json TEXT NOT NULL,
       position INTEGER NOT NULL, updated_at TEXT NOT NULL);
   `,
-  // Role proposals (D2): stored by the runtime, applied by the host; a row never makes a role effective.
+  // Role proposals (D2; removed, the table stays in old databases).
   6: `
     CREATE TABLE IF NOT EXISTS role_proposals (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, json TEXT NOT NULL, created_at TEXT NOT NULL,
@@ -149,6 +164,55 @@ const MIGRATIONS: Record<number, string> = {
       status TEXT NOT NULL, updated_at TEXT NOT NULL, detail TEXT);
     CREATE INDEX IF NOT EXISTS change_requests_status ON change_requests(status, created_at);
   `,
+  // Routine pass (docs/design/unattended-delivery.md, task-68.2): every pass reads the last `routine` event and counts
+  // today's wakes and crash starts by kind and time. The index keeps those reads cheap on a long event log.
+  9: `
+    CREATE INDEX IF NOT EXISTS events_kind_at ON events(kind, at);
+  `,
+  // Coordinator sessions (docs/design/coordinator-sessions.md, task-57 phase 4): one row per headless session (`general`
+  // or `task:<id>`) and the messages waiting for it. Phase 4 adds only the tables; the supervisor (phase 5) writes them.
+  // No foreign key: the router may queue a message for a session that is not open yet (the supervisor opens it).
+  10: `
+    CREATE TABLE IF NOT EXISTS sessions (
+      key TEXT PRIMARY KEY, kind TEXT NOT NULL, claude_session_id TEXT, status TEXT NOT NULL, model TEXT,
+      config_dir TEXT NOT NULL, opened_at TEXT NOT NULL, last_wake_at TEXT, closed_at TEXT,
+      resumes INTEGER NOT NULL DEFAULT 0, failure TEXT);
+    CREATE INDEX IF NOT EXISTS sessions_status ON sessions(status, key);
+    CREATE TABLE IF NOT EXISTS session_inbox (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, session_key TEXT NOT NULL, source TEXT NOT NULL, text TEXT NOT NULL,
+      meta_json TEXT, created_at TEXT NOT NULL, delivered_at TEXT);
+    CREATE INDEX IF NOT EXISTS session_inbox_pending ON session_inbox(session_key, delivered_at, id);
+  `,
+  // Router and outbound (docs/design/coordinator-sessions.md phase 8, task-57.12): the session that enqueued an outbox
+  // item (an answer to its question routes back to it) and when a question was answered, plus the sent-message map
+  // with task-67.3's columns (message id, ref, outbox key, text head, sent at) and the session. Task-67.3 reuses it.
+  11: (sql) => {
+    addColumn(sql, 'outbox', 'session', 'TEXT');
+    addColumn(sql, 'outbox', 'answered_at', 'TEXT');
+    sql.exec(`
+      CREATE TABLE IF NOT EXISTS tg_messages (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, message_id INTEGER NOT NULL, ref TEXT, outbox_key TEXT, text_head TEXT,
+        session TEXT, sent_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS tg_messages_message ON tg_messages(message_id);
+      CREATE INDEX IF NOT EXISTS tg_messages_ref ON tg_messages(ref);
+    `);
+  },
+  // Local integration (docs/design/local-auto-integration.md phase 2, task-82.2, src/runtime/integrator.ts; version 12
+  // because task-57.12 took 11): one row per queued integration of an approved head. phase is its state (queued, merging, verifying, landing, or a terminal one);
+  // the verify_* columns identify the running verification process group for crash recovery. At most one open row
+  // per task.
+  12: `
+    CREATE TABLE IF NOT EXISTS integrations (
+      id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL, branch TEXT NOT NULL, head_sha TEXT NOT NULL,
+      base_sha TEXT, candidate_sha TEXT, phase TEXT NOT NULL, attempt INTEGER NOT NULL DEFAULT 0,
+      verify_pid INTEGER, verify_start TEXT, verify_boot TEXT,
+      queued_at TEXT NOT NULL, started_at TEXT, ended_at TEXT, outcome TEXT, detail TEXT, log_path TEXT);
+    CREATE INDEX IF NOT EXISTS integrations_task ON integrations(task_id, id);
+    CREATE UNIQUE INDEX IF NOT EXISTS integrations_one_open_per_task ON integrations(task_id)
+      WHERE phase IN ('queued', 'merging', 'verifying', 'landing');
+  `,
+  // Polls (docs/design/autonomy.md Decision 5): a question's choices; the router sends it as a native Telegram poll.
+  13: (sql) => { addColumn(sql, 'outbox', 'options_json', 'TEXT'); },
 };
 
 let warningFilterInstalled = false;
@@ -196,6 +260,20 @@ export function pidAlive(pid: number): boolean {
  */
 export interface CoordinatorLock { pid: number; session: string; acquiredAt: string; start?: string }
 
+/**
+ * The session supervisor lock (meta `supervisor_lock`, docs/design/coordinator-sessions.md decision 7): holder pid,
+ * its process start time (null when unreadable), the boot it ran in, and when it was taken.
+ */
+export interface SupervisorLock { pid: number; start: string | null; bootId: string | null; at: string }
+
+/** The holder of the leases the autopilot dispatcher claims (docs/design/autonomy.md Decision 1): never the coordinator's own workers. */
+export const DISPATCH_HOLDER = 'dispatcher';
+
+/** Meta rows of the deterministic background processes' locks (same liveness rules): the session supervisor and the dispatcher. */
+export type ProcessLockKey = 'supervisor_lock' | 'dispatcher_lock';
+/** The routine pass lock: holder pid, its process start time (null when unreadable) and when it was taken. */
+export interface RoutineLock { pid: number; start: string | null; at: string }
+
 /** A durable drain request (`minions pause --starts --drain`): workers wind down to a checkpoint and return partial. */
 export interface DrainRequest { reason: string; requestedAt: string; eventId: number }
 /**
@@ -215,12 +293,45 @@ const drainNoticeOf = (r: EventRow): DrainNotice[] => {
   return [{ id: r.id, at: r.at, taskId: r.task_id, leaseId: d.leaseId, eventId: d.eventId, agentId: String(d.agentId ?? ''), agentType: String(d.agentType ?? ''), tool: String(d.tool ?? ''), via }];
 };
 
+/** Options for opening a RuntimeDb. Production callers pass none; tests shorten the WAL retry budget. */
+export interface RuntimeDbOptions {
+  /** How long to retry the switch to WAL before failing (default BUSY_TIMEOUT_MS). */
+  walRetryBudgetMs?: number;
+}
+
+function fileIdentity(path: string): { dev: number; ino: number } | null {
+  try { const st = statSync(path); return { dev: st.dev, ino: st.ino }; } catch { return null; }
+}
+
+/**
+ * The supervisor and dispatcher lock rows of a runtime DB, read-only (no migration, no write): for host-side checks
+ * (doctor) of a live DB. Null when the DB does not exist or cannot be read.
+ */
+export function readProcessLocks(path: string): Record<ProcessLockKey, SupervisorLock | null> | null {
+  let sql: DatabaseSync | undefined;
+  try {
+    statSync(path);
+    sql = new (loadSqlite().DatabaseSync)(path, { readOnly: true });
+    sql.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
+    const get = (key: ProcessLockKey): SupervisorLock | null => {
+      try {
+        const row = sql!.prepare('SELECT value FROM meta WHERE key = ?').get(key) as { value?: string } | undefined;
+        const l = row?.value ? JSON.parse(row.value) as SupervisorLock : null;
+        return l && typeof l.pid === 'number' ? { pid: l.pid, start: l.start ?? null, bootId: l.bootId ?? null, at: String(l.at) } : null;
+      } catch { return null; }
+    };
+    return { supervisor_lock: get('supervisor_lock'), dispatcher_lock: get('dispatcher_lock') };
+  } catch { return null; } finally { try { sql?.close(); } catch { /* ignore */ } }
+}
+
 export class RuntimeDb {
   readonly path: string;
   readonly sql: DatabaseSync;
   private depth = 0;
+  /** dev/ino of the file this connection opened (null for :memory: or when unreadable): see replacedOnDisk. */
+  private readonly fileId: { dev: number; ino: number } | null;
 
-  constructor(path = runtimePaths().db) {
+  constructor(path = runtimePaths().db, opts: RuntimeDbOptions = {}) {
     this.path = path;
     const { DatabaseSync } = loadSqlite();
     if (path !== ':memory:') mkdirSync(dirname(path), { recursive: true });
@@ -230,9 +341,21 @@ export class RuntimeDb {
       throw new MinionsError('INTERNAL', `Cannot open runtime database ${path}: ${(e as Error).message}`);
     }
     this.sql.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
-    if (path !== ':memory:') this.enableWal();
+    if (path !== ':memory:') this.enableWal(opts.walRetryBudgetMs ?? BUSY_TIMEOUT_MS);
     this.sql.exec('PRAGMA foreign_keys = ON');
     this.migrate();
+    this.fileId = path === ':memory:' ? null : fileIdentity(path);
+  }
+
+  /**
+   * Whether the path now names another file than the one this connection opened (a state restore renamed the DB
+   * aside and swapped a backup in) or none at all. A long-running process keeps the old inode and would otherwise
+   * see itself as lock holder in a DB nobody else reads. False when the identity is unknown.
+   */
+  replacedOnDisk(): boolean {
+    if (!this.fileId) return false;
+    const now = fileIdentity(this.path);
+    return !now || now.dev !== this.fileId.dev || now.ino !== this.fileId.ino;
   }
 
   /**
@@ -240,15 +363,21 @@ export class RuntimeDb {
    * at once, without calling the busy handler, so concurrent first opens of a fresh database failed with
    * "database is locked" (task-20.3). Retry with a short bounded backoff, then require WAL or fail loudly.
    * On a database already in WAL the pragma is a no-op that takes no write lock.
+   *
+   * When another connection holds a plain read lock, SQLite does call the busy handler, so a single attempt
+   * could wait the whole busy_timeout after the budget was nearly spent: the budget really allowed about
+   * budget + busy_timeout (5.4 s for a 300 ms budget, 7.7 s for the default under load; task-95). Each
+   * attempt therefore waits at most what is left of the budget; busy_timeout is restored afterwards.
    */
-  private enableWal(): void {
-    const deadline = Date.now() + BUSY_TIMEOUT_MS;
+  private enableWal(budgetMs: number): void {
+    const deadline = Date.now() + budgetMs;
     let delay = 5;
     let last = '';
     for (;;) {
       try {
+        this.sql.exec(`PRAGMA busy_timeout = ${Math.max(0, deadline - Date.now())}`);
         const mode = (this.sql.prepare('PRAGMA journal_mode = WAL').get() as { journal_mode?: unknown } | undefined)?.journal_mode;
-        if (String(mode).toLowerCase() === 'wal') return;
+        if (String(mode).toLowerCase() === 'wal') { this.sql.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`); return; }
         last = `journal_mode is ${String(mode)}`;
       } catch (e) {
         if (!isBusy(e)) { this.sql.close(); throw e; }
@@ -280,7 +409,8 @@ export class RuntimeDb {
       const current = Number(this.getMeta('schema_version') ?? 0);
       if (current > SCHEMA_VERSION) throw tooNew(current);
       for (let v = current + 1; v <= SCHEMA_VERSION; v++) {
-        this.sql.exec(MIGRATIONS[v]!);
+        const m = MIGRATIONS[v]!;
+        if (typeof m === 'string') this.sql.exec(m); else m(this.sql);
         this.setMeta('schema_version', String(v));
       }
       this.sql.prepare('INSERT OR IGNORE INTO guard (id, count) VALUES (1, 0)').run();
@@ -423,9 +553,23 @@ export class RuntimeDb {
     });
   }
 
-  addEvent(kind: string, taskId: string | null, data?: unknown): number {
+  /** `at`: the event time (default now; the routine pass passes its injected clock). */
+  addEvent(kind: string, taskId: string | null, data?: unknown, at?: string): number {
     return this.exec('INSERT INTO events (at, kind, task_id, data_json) VALUES (?, ?, ?, ?)',
-      nowIso(), kind, taskId, data === undefined ? null : JSON.stringify(data)).lastInsertRowid;
+      at ?? nowIso(), kind, taskId, data === undefined ? null : JSON.stringify(data)).lastInsertRowid;
+  }
+  /** The newest event of a kind (the routine pass reads its last run). */
+  lastEventOfKind(kind: string): { id: number; at: string; kind: string; data: unknown } | null {
+    const r = this.get<{ id: number; at: string; kind: string; data_json: string | null }>('SELECT * FROM events WHERE kind = ? ORDER BY id DESC LIMIT 1', kind);
+    if (!r) return null;
+    let data: unknown = null;
+    try { data = r.data_json ? JSON.parse(r.data_json) : null; } catch { data = null; }
+    return { id: r.id, at: r.at, kind: r.kind, data };
+  }
+  /** Events of a kind at or after `since` (ISO time), oldest first. */
+  eventsOfKindSince(kind: string, since: string): { id: number; at: string; taskId: string | null; data: unknown }[] {
+    return this.all<{ id: number; at: string; task_id: string | null; data_json: string | null }>('SELECT id, at, task_id, data_json FROM events WHERE kind = ? AND at >= ? ORDER BY id', kind, since)
+      .map((r) => { let data: unknown = null; try { data = r.data_json ? JSON.parse(r.data_json) : null; } catch { /* unreadable */ } return { id: r.id, at: r.at, taskId: r.task_id, data }; });
   }
   lastEventId(): number { return this.get<{ id: number | null }>('SELECT MAX(id) AS id FROM events')?.id ?? 0; }
   events(taskId: string, kind?: string): { id: number; at: string; kind: string; data: unknown }[] {
@@ -479,38 +623,7 @@ export class RuntimeDb {
       taskId, workflow, JSON.stringify(stages), position, nowIso());
   }
 
-  // Role proposals (D2)
-  roleProposal(id: string): RoleProposalRow | undefined { return this.get<RoleProposalRow>('SELECT * FROM role_proposals WHERE id = ?', id); }
-  /** Pending proposals (all: every state), oldest first. */
-  roleProposals(opts: { all?: boolean } = {}): RoleProposalRow[] {
-    return opts.all
-      ? this.all<RoleProposalRow>('SELECT * FROM role_proposals ORDER BY created_at, id')
-      : this.all<RoleProposalRow>("SELECT * FROM role_proposals WHERE state = 'pending' ORDER BY created_at, id");
-  }
-  /** Stores a pending proposal; earlier pending proposals for the same role name become `superseded`. */
-  addRoleProposal(p: { id: string; name: string; json: string }): { row: RoleProposalRow; superseded: string[] } {
-    return this.transaction(() => {
-      const at = nowIso();
-      const superseded = this.all<{ id: string }>("SELECT id FROM role_proposals WHERE name = ? AND state = 'pending'", p.name).map((r) => r.id);
-      this.exec("UPDATE role_proposals SET state = 'superseded', updated_at = ? WHERE name = ? AND state = 'pending'", at, p.name);
-      this.exec("INSERT INTO role_proposals (id, name, json, created_at, state, updated_at) VALUES (?, ?, ?, ?, 'pending', ?)", p.id, p.name, p.json, at, at);
-      this.addEvent('role-proposed', null, { id: p.id, name: p.name, superseded });
-      return { row: this.roleProposal(p.id)!, superseded };
-    });
-  }
-  /** pending -> applied (idempotent for an applied row); false when the proposal is missing or superseded. */
-  markRoleProposalApplied(id: string, revision: number | null): boolean {
-    return this.transaction(() => {
-      const row = this.roleProposal(id);
-      if (!row || row.state === 'superseded') return false;
-      if (row.state === 'applied') return true;
-      this.exec("UPDATE role_proposals SET state = 'applied', applied_revision = ?, updated_at = ? WHERE id = ?", revision, nowIso(), id);
-      this.addEvent('role-applied', null, { id, name: row.name, revision });
-      return true;
-    });
-  }
-
-  // Change requests (docs/design/host-manager.md)
+  // Change requests (upgrade requests)
   changeRequest(id: string): ChangeRequestRow | undefined { return this.get<ChangeRequestRow>('SELECT * FROM change_requests WHERE id = ?', id); }
   /** Open requests (proposed, confirmed, failed: the owner may retry or reject a failed one); all: every status. Oldest first. */
   changeRequests(opts: { all?: boolean } = {}): ChangeRequestRow[] {
@@ -518,16 +631,11 @@ export class RuntimeDb {
       ? this.all<ChangeRequestRow>('SELECT * FROM change_requests ORDER BY created_at, id')
       : this.all<ChangeRequestRow>("SELECT * FROM change_requests WHERE status IN ('proposed', 'confirmed', 'failed') ORDER BY created_at, id");
   }
-  /**
-   * Stores a proposed request. Earlier open requests (proposed or failed) for the same thing (the same kind; for
-   * config-set the same key) become `expired`: the newer request replaces them.
-   */
+  /** Stores a proposed request. Earlier open requests (proposed or failed) of the same kind become `expired`: the newer one replaces them. */
   addChangeRequest(r: { id: string; kind: ChangeRequestKind; payload: Record<string, unknown>; reason: string | null }): { row: ChangeRequestRow; expired: string[] } {
     return this.transaction(() => {
       const at = nowIso();
-      const keyOf = (payload: string): unknown => { try { return (JSON.parse(payload) as { key?: unknown }).key; } catch { return undefined; } };
-      const expired = this.all<{ id: string; payload: string }>("SELECT id, payload FROM change_requests WHERE kind = ? AND status IN ('proposed', 'failed')", r.kind)
-        .filter((x) => r.kind !== 'config-set' || keyOf(x.payload) === r.payload.key).map((x) => x.id);
+      const expired = this.all<{ id: string }>("SELECT id FROM change_requests WHERE kind = ? AND status IN ('proposed', 'failed')", r.kind).map((x) => x.id);
       for (const id of expired) this.exec("UPDATE change_requests SET status = 'expired', detail = ?, updated_at = ? WHERE id = ?", `superseded by ${r.id}`, at, id);
       this.exec("INSERT INTO change_requests (id, kind, payload, reason, created_at, status, updated_at) VALUES (?, ?, ?, ?, ?, 'proposed', ?)",
         r.id, r.kind, JSON.stringify(r.payload), r.reason, at, at);
@@ -554,7 +662,7 @@ export class RuntimeDb {
     });
   }
 
-  // Publications (branch / pull-request delivery)
+  // Publications (local integrations)
   publication(taskId: string): PublicationRow | undefined { return this.get<PublicationRow>('SELECT * FROM publications WHERE task_id = ?', taskId); }
   /** Starts (or restarts) the publication of an approved head; a new head resets any earlier state. */
   upsertPublication(p: { task_id: string; branch: string; head_sha: string; mode: string; config_revision: number }): PublicationRow {
@@ -632,6 +740,67 @@ export class RuntimeDb {
       return lock;
     });
   }
+  /**
+   * The routine pass lock (meta row `routine_lock`, {pid, start, at}): taken only when no live holder has it. A
+   * holder whose pid is gone, or whose recorded start time differs from the pid's current one (a reused pid), is
+   * taken over. Returns the lock taken, or null with the live holder left in place.
+   */
+  acquireRoutineLock(pid: number, start: string | null, alive: (l: RoutineLock) => boolean, now: Date = new Date()): RoutineLock | null {
+    return this.transaction(() => {
+      const raw = this.getMeta('routine_lock');
+      let cur: RoutineLock | null = null;
+      try { cur = raw ? JSON.parse(raw) as RoutineLock : null; } catch { cur = null; }
+      if (cur && !(cur.pid === pid && cur.start === start) && alive(cur)) return null;
+      const lock: RoutineLock = { pid, start, at: now.toISOString() };
+      this.setMeta('routine_lock', JSON.stringify(lock));
+      return lock;
+    });
+  }
+  releaseRoutineLock(lock: RoutineLock): boolean {
+    return this.transaction(() => {
+      const raw = this.getMeta('routine_lock');
+      let cur: RoutineLock | null = null;
+      try { cur = raw ? JSON.parse(raw) as RoutineLock : null; } catch { cur = null; }
+      if (!cur || cur.pid !== lock.pid || cur.at !== lock.at) return false;
+      this.deleteMeta('routine_lock');
+      return true;
+    });
+  }
+  routineLock(): RoutineLock | null {
+    try { const v = this.getMeta('routine_lock'); return v ? JSON.parse(v) as RoutineLock : null; } catch { return null; }
+  }
+  /**
+   * The session supervisor lock (meta row `supervisor_lock`; src/runtime/supervisor.ts). Taken in one IMMEDIATE
+   * transaction, so it is never seen half-written, and only when no live holder has it: `alive` decides (pid, start
+   * time, boot and command line), so a reused pid never keeps a stale lock. Returns the lock taken, or null with the
+   * live holder left in place. An unreadable row counts as no lock.
+   */
+  acquireSupervisorLock(me: Omit<SupervisorLock, 'at'>, alive: (l: SupervisorLock) => boolean, now: Date = new Date(), key: ProcessLockKey = 'supervisor_lock'): SupervisorLock | null {
+    return this.transaction(() => {
+      const cur = this.supervisorLock(key);
+      if (cur && !(cur.pid === me.pid && cur.start === me.start && cur.bootId === me.bootId) && alive(cur)) return null;
+      const lock: SupervisorLock = { pid: me.pid, start: me.start, bootId: me.bootId, at: now.toISOString() };
+      this.setMeta(key, JSON.stringify(lock));
+      if (!cur || cur.pid !== lock.pid || cur.start !== lock.start) this.addEvent(key.replace('_', '-'), null, { ...lock, replaced: cur });
+      return lock;
+    });
+  }
+  /** Drops the lock only when `lock` still is the holder (same pid and time taken). */
+  releaseSupervisorLock(lock: Pick<SupervisorLock, 'pid' | 'at'>, key: ProcessLockKey = 'supervisor_lock'): boolean {
+    return this.transaction(() => {
+      const cur = this.supervisorLock(key);
+      if (!cur || cur.pid !== lock.pid || cur.at !== lock.at) return false;
+      this.deleteMeta(key);
+      return true;
+    });
+  }
+  supervisorLock(key: ProcessLockKey = 'supervisor_lock'): SupervisorLock | null {
+    try {
+      const v = this.getMeta(key);
+      const l = v ? JSON.parse(v) as SupervisorLock : null;
+      return l && typeof l.pid === 'number' ? { pid: l.pid, start: l.start ?? null, bootId: l.bootId ?? null, at: String(l.at) } : null;
+    } catch { return null; }
+  }
   releaseCoordinatorLock(session: string, pid = process.pid): boolean {
     return this.transaction(() => {
       const cur = this.coordinatorLock();
@@ -642,4 +811,4 @@ export class RuntimeDb {
   }
 }
 
-export const openDb = (path?: string) => new RuntimeDb(path);
+export const openDb = (path?: string, opts?: RuntimeDbOptions) => new RuntimeDb(path, opts);

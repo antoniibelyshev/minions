@@ -14,7 +14,7 @@ let root = '';
 beforeAll(() => {
   root = tmp();
   mkdirSync(join(root, 'state'), { recursive: true });
-  writeFileSync(join(root, 'config.json'), JSON.stringify(defaults('project-owner')));
+  writeFileSync(join(root, 'config.json'), JSON.stringify(defaults('independent')));
   process.env.MINIONS_RUNTIME = 'container';
   process.env.MINIONS_STATE_DIR = join(root, 'state');
   process.env.MINIONS_CONFIG = join(root, 'config.json');
@@ -80,5 +80,35 @@ describe('minions work cancel argument validation', () => {
   it('needs task ids or --all, not both, and never neither', async () => {
     expect(await run('work', 'cancel')).toMatchObject({ ok: false, error: { code: 'PRECONDITION' } });
     expect(await run('work', 'cancel', 'task-1', '--all')).toMatchObject({ ok: false, error: { code: 'PRECONDITION' } });
+  });
+});
+
+describe('task-57 phase 8: sessions and the router', () => {
+  afterEach(() => { delete process.env.MINIONS_SESSION; });
+
+  it('notify enqueue takes its default session from MINIONS_SESSION; the router records none; --session wins', async () => {
+    const text = join(root, 'q.txt');
+    writeFileSync(text, 'Q1: merge now?\n');
+    process.env.MINIONS_SESSION = 'task:task-9';
+    expect((await run('notify', 'enqueue', '--key', 'question:task-9:1', '--kind', 'question', '--text-file', text)).data.item.session).toBe('task:task-9');
+    process.env.MINIONS_SESSION = 'general';
+    expect((await run('notify', 'enqueue', '--key', 'question:general:1', '--kind', 'question', '--text-file', text)).data.item.session).toBe('general');
+    process.env.MINIONS_SESSION = 'router';
+    expect((await run('notify', 'enqueue', '--key', 'status:router:1', '--kind', 'status', '--text-file', text)).data.item.session).toBeNull();
+    expect((await run('notify', 'enqueue', '--key', 'status:router:2', '--kind', 'status', '--session', 'task:task-3', '--text-file', text)).data.item.session).toBe('task:task-3');
+    delete process.env.MINIONS_SESSION;
+    expect((await run('notify', 'enqueue', '--key', 'status:none:1', '--kind', 'status', '--text-file', text)).data.item.session).toBeNull();
+    expect(await run('notify', 'enqueue', '--key', 'status:bad:1', '--kind', 'status', '--session', 'router', '--text-file', text)).toMatchObject({ ok: false, error: { code: 'PRECONDITION' } });
+  });
+
+  it('router restarts ignore task and general session leases; a live run (no exceptSessions) counts every lease', async () => {
+    const { leaseBlockers } = await import('../../src/runtime/commands.js');
+    const holders: Record<string, string> = { 'l-task': 'task:task-1', 'l-gen': 'general', 'l-coord': 'coordinator', 'l-router': 'router' };
+    const db = { lease: (id: string) => (holders[id] ? { holder: holders[id] } : undefined) } as never;
+    // withOpenRuns labels an unfinished run without an active lease "<leaseId> (unfinished process run)"; the lease id is the first word.
+    const leases = () => [{ id: 'l-task' }, { id: 'l-gen (unfinished process run)' }, { id: 'l-coord' }, { id: 'l-router' }, { id: 'l-gone' }];
+    expect(leaseBlockers(db, leases, { exceptSessions: true })().map((l) => l.id)).toEqual(['l-coord', 'l-router', 'l-gone']);
+    expect(leaseBlockers(db, leases)().map((l) => l.id)).toEqual(leases().map((l) => l.id));
+    expect(leaseBlockers(db, leases, { exceptSessions: false })()).toHaveLength(5);
   });
 });

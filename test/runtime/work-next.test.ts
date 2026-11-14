@@ -2,10 +2,12 @@
 // claim could start now, from the stage machine (stagePlan), and `claim` without a role picks the stage's role.
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import type { MinionsError } from '../../src/core/errors.js';
 import { collectStatus, humanNext, humanStatus } from '../../src/runtime/commands.js';
 import { commitFile, makeDefaultEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const err = async (p: Promise<unknown>) => {
   try { await p; } catch (e) { return e as MinionsError; }
@@ -46,28 +48,21 @@ describe('work next: runnable stages from the stage machine', () => {
     const n = await e.sched.next();
     expect(n.runnable).toEqual([{
       taskId: 'task-1', title: 'First', status: 'ready', priority: 'medium', kind: 'task',
-      role: 'engineer', agentType: 'minions:engineer', position: 0, count: 3, workflow: 'default',
+      role: 'engineer', agentType: 'minions:engineer', position: 0, count: 2, workflow: 'default',
       suggestedModel: 'sonnet', agentModel: null, modelRule: 'default',
       harness: 'claude', launch: { kind: 'agent', agentType: 'minions:engineer', agentModel: null },
-      reason: 'ready: stage 1/3 (engineer) of workflow default; model: default',
+      reason: 'ready: stage 1/2 (engineer) of workflow default; model: default',
     }]);
     expect(n).toMatchObject({ waiting: [], stuck: [], startsBlocked: null, message: '1 runnable stage(s): task-1 engineer' });
     expect(n.capacity.byRole.engineer).toMatchObject({ active: 0, max: 2, limited: true });
   });
 
-  it('follows the task through its workflow: reviewer after the engineer, the inserted tester when QA is required', async () => {
+  it('follows the task through its workflow: reviewer after the engineer', async () => {
     const e = env();
     e.backlog.add({ id: 'task-1' });
     await stageIn(e, 'task-1', undefined);
     expect(e.backlog.status('task-1')).toBe('reviewing');
-    expect((await e.sched.next()).runnable[0]).toMatchObject({ taskId: 'task-1', role: 'reviewer', agentType: 'minions:reviewer', position: 2, status: 'reviewing' });
-
-    e.backlog.add({ id: 'task-2', labels: ['qa'] });
-    await stageIn(e, 'task-2', 'engineer');
-    expect(e.backlog.status('task-2')).toBe('testing');
-    const t = (await e.sched.next()).runnable.find((x) => x.taskId === 'task-2')!;
-    expect(t).toMatchObject({ role: 'tester', position: 1, workflow: 'default' });
-    expect(t.reason).toMatch(/^testing: stage 2\/3 \(tester\) of workflow default/);
+    expect((await e.sched.next()).runnable[0]).toMatchObject({ taskId: 'task-1', role: 'reviewer', agentType: 'minions:reviewer', position: 1, status: 'reviewing' });
   });
 
   it('a multi-producer workflow: the task sits in implementing without a lease and the next producer is runnable (33.3 review)', async () => {
@@ -87,7 +82,7 @@ describe('work next: runnable stages from the stage machine', () => {
     await stageIn(e, 'task-1', 'reviewer', [], { status: 'needs_changes', verdict: 'request-changes', modifiedPaths: [] });
     const r = (await e.sched.next()).runnable[0]!;
     expect(r).toMatchObject({ taskId: 'task-1', role: 'engineer', position: 0, status: 'changes-requested' });
-    expect(r.reason).toMatch(/^changes-requested: repair \(cycle 1\) at stage 1\/3 \(engineer\)/);
+    expect(r.reason).toMatch(/^changes-requested: repair \(cycle 1\) at stage 1\/2 \(engineer\)/);
   });
 
   it('excludes leased tasks and ready tasks that are not startable (unauthorized, unmet dependency)', async () => {
@@ -325,7 +320,7 @@ describe('humanNext', () => {
     e.backlog.add({ id: 'task-4', status: 'implementing' });
     const out = humanNext(await e.sched.next());
     expect(out.split('\n')[0]).toBe('1 runnable stage(s): task-1 engineer');
-    expect(out).toMatch(/ {2}task-1 engineer -> minions:engineer: ready: stage 1\/3/);
+    expect(out).toMatch(/ {2}task-1 engineer -> minions:engineer: ready: stage 1\/2/);
     expect(out).toMatch(/waiting:\n {2}task-2 engineer: active task limit \(2\/2\)\n {2}task-3 engineer: active task limit/);
     expect(out).toMatch(/stuck:\n {2}task-4 \(implementing\):/);
   });
@@ -339,5 +334,98 @@ describe('status: per-role capacity', () => {
     const s = await collectStatus({ db: e.db, config: e.config, backlog: async () => e.backlog });
     expect(s.capacity!.byRole).toMatchObject({ engineer: { active: 0, max: 2, limited: true }, writer: { active: 0, max: 1, limited: true }, researcher: { active: 1, limited: false } });
     expect(humanStatus(s)).toMatch(/capacity: 1\/2 tasks, 0\/2 engineer, 0 tester, 0 reviewer, 1 researcher, 0\/1 writer, 0 fetcher/);
+  });
+});
+
+// task-97: the small-task lane keeps the last engineer slot for a runnable `small` task.
+describe('work next: small-task lane', () => {
+  const roomy = (maxEngineers: number) => env((c) => { c.execution.maxActiveTasks = 5; c.execution.maxEngineers = maxEngineers; });
+
+  it('small + big ready: at most maxEngineers-1 big engineer stages; the small task gets the last slot', async () => {
+    const e = roomy(2);
+    e.backlog.add({ id: 'task-1', priority: 'high' });
+    e.backlog.add({ id: 'task-2', priority: 'high' });
+    e.backlog.add({ id: 'task-3', priority: 'low', labels: ['small'] });
+    const n = await e.sched.next();
+    expect(ids(n.runnable)).toEqual(['task-1', 'task-3']);
+    expect(n.waiting).toEqual([expect.objectContaining({
+      taskId: 'task-2', role: 'engineer', waitingOn: 'small-task-slot',
+      why: 'last engineer slot kept for small task(s) task-3 (non-small engineers 1/1)',
+    })]);
+  });
+
+  it('counts running big engineers, leaves reviewer stages alone, and status capacity stays correct', async () => {
+    const e = roomy(3);
+    for (const id of ['task-1', 'task-2', 'task-3', 'task-4']) e.backlog.add({ id, priority: 'high' });
+    e.backlog.add({ id: 'task-5', priority: 'low', labels: ['small'] });
+    await stageIn(e, 'task-1', 'engineer'); // task-1 waits for its reviewer
+    await e.sched.claim('task-2', 'engineer'); // a running big engineer
+    const n = await e.sched.next();
+    expect(n.runnable.map((x) => `${x.taskId}:${x.role}`)).toEqual(['task-1:reviewer', 'task-3:engineer', 'task-5:engineer']);
+    expect(n.waiting).toEqual([expect.objectContaining({ taskId: 'task-4', waitingOn: 'small-task-slot', why: expect.stringMatching(/\(non-small engineers 2\/2\)$/) })]);
+    expect(n.capacity.byRole.engineer).toMatchObject({ active: 1, max: 3, free: 2 });
+    const s = await collectStatus({ db: e.db, config: e.config, backlog: async () => e.backlog });
+    expect(s.capacity!.byRole.engineer).toMatchObject({ active: 1, max: 3, free: 2 });
+  });
+
+  it('only big ready: unchanged greedy capacity', async () => {
+    const e = roomy(2);
+    for (const id of ['task-1', 'task-2', 'task-3']) e.backlog.add({ id });
+    const n = await e.sched.next();
+    expect(ids(n.runnable)).toEqual(['task-1', 'task-2']);
+    expect(n.waiting).toEqual([expect.objectContaining({ taskId: 'task-3', waitingOn: 'role-capacity', why: 'engineer limit (2/2)' })]);
+  });
+
+  it('only small ready: the lane does not cap small tasks (two small tasks run together)', async () => {
+    const e = roomy(2);
+    e.backlog.add({ id: 'task-1', labels: ['small'] });
+    e.backlog.add({ id: 'task-2', labels: ['small'] });
+    e.backlog.add({ id: 'task-3', labels: ['small'] });
+    const n = await e.sched.next();
+    expect(ids(n.runnable)).toEqual(['task-1', 'task-2']);
+    expect(n.waiting).toEqual([expect.objectContaining({ taskId: 'task-3', waitingOn: 'role-capacity' })]);
+  });
+
+  it('maxEngineers 1: no reservation, plain priority order', async () => {
+    const e = roomy(1);
+    e.backlog.add({ id: 'task-1', priority: 'high' });
+    e.backlog.add({ id: 'task-2', priority: 'low', labels: ['small'] });
+    const n = await e.sched.next();
+    expect(ids(n.runnable)).toEqual(['task-1']);
+    expect(n.waiting).toEqual([expect.objectContaining({ taskId: 'task-2', waitingOn: 'role-capacity', why: 'engineer limit (1/1)' })]);
+  });
+
+  it('2/2 with a free task slot: a new big task is held for the small one', async () => {
+    const e = env((c) => { c.execution.maxActiveTasks = 2; c.execution.maxEngineers = 2; });
+    e.backlog.add({ id: 'task-1', priority: 'high' });
+    e.backlog.add({ id: 'task-2', priority: 'high' });
+    e.backlog.add({ id: 'task-3', priority: 'low', labels: ['small'] });
+    await e.sched.claim('task-1', 'engineer'); // a running big engineer
+    const n = await e.sched.next();
+    expect(ids(n.runnable)).toEqual(['task-3']);
+    expect(n.waiting).toEqual([expect.objectContaining({ taskId: 'task-2', waitingOn: 'small-task-slot' })]);
+  });
+
+  it('2/2 with both task slots held by big tasks: the big repair runs instead of idling the engineer slot', async () => {
+    const e = env((c) => { c.execution.maxActiveTasks = 2; c.execution.maxEngineers = 2; });
+    e.backlog.add({ id: 'task-1', priority: 'high' });
+    e.backlog.add({ id: 'task-2', priority: 'high' });
+    await stageIn(e, 'task-2', 'engineer');
+    await stageIn(e, 'task-2', 'reviewer', [], { status: 'needs_changes', verdict: 'request-changes', modifiedPaths: [] });
+    expect(e.backlog.status('task-2')).toBe('changes-requested');
+    await e.sched.claim('task-1', 'engineer'); // a running big engineer
+    e.backlog.add({ id: 'task-3', priority: 'low', labels: ['small'] });
+    const n = await e.sched.next();
+    expect(n.runnable.map((x) => `${x.taskId}:${x.role}`)).toEqual(['task-2:engineer']);
+    expect(n.waiting).toEqual([expect.objectContaining({ taskId: 'task-3', waitingOn: 'capacity', why: 'active task limit (2/2)' })]);
+  });
+
+  it('the active task limit still applies to the small task', async () => {
+    const e = env((c) => { c.execution.maxActiveTasks = 1; c.execution.maxEngineers = 2; });
+    e.backlog.add({ id: 'task-1', priority: 'high' });
+    e.backlog.add({ id: 'task-2', priority: 'low', labels: ['small'] });
+    const n = await e.sched.next();
+    expect(ids(n.runnable)).toEqual(['task-1']);
+    expect(n.waiting).toEqual([expect.objectContaining({ taskId: 'task-2', waitingOn: 'capacity' })]);
   });
 });

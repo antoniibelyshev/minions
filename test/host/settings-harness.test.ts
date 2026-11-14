@@ -4,6 +4,7 @@
 // so refused values fail before anything is written. Temp MINIONS_HOME, file credential store; no Docker.
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 
 vi.mock('../../src/plugin/generate.js', async () => {
   const { mkdir, writeFile } = await import('node:fs/promises');
@@ -17,14 +18,13 @@ vi.mock('../../src/plugin/generate.js', async () => {
   };
 });
 
-const { runInit } = await import('../../src/host/install.js');
 const { projectPaths } = await import('../../src/core/paths.js');
 const { loadEffectiveConfig, loadProjectJson, projectConfigPath } = await import('../../src/host/project.js');
 const { workerRole } = await import('../../src/config/roles.js');
 const C = await import('../../src/host/credentials.js');
 const S = await import('../../src/host/settings.js');
 const SC = await import('../../src/host/settings-cli.js');
-const { makeRepo, withHome, dockerUp } = await import('./fixtures.js');
+const { initFromTemplate, withHome } = await import('./fixtures.js');
 
 const OPENAI_KEY = 'sk-proj-abcdefghijklmnopqrstuvwxyz0123456789ABCD';
 const CODEX = { models: { default: 'gpt-test', allowed: ['gpt-test'] } };
@@ -40,9 +40,8 @@ afterEach(() => {
 
 /** A private install whose project config gets `extra` merged in (roles, harnesses blocks). */
 async function install(extra: Record<string, unknown> = {}, name?: string) {
-  const repo = makeRepo(env.root, name);
-  const r = await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
-  const project = await loadProjectJson(r.plan.projectId);
+  const { repo, projectId } = await initFromTemplate(env.root, { visibility: 'private', name });
+  const project = await loadProjectJson(projectId);
   const file = projectConfigPath(project);
   writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), ...extra }, null, 2));
   return { repo, project, local: projectPaths(project.projectId).configLocalJson };

@@ -7,11 +7,14 @@ import type { MinionsConfig } from '../../src/config/schema.js';
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 import {
   buildClaudeCommand, decideTelegram, launchFingerprint, readMountedToken, runCoordinator, syncCoordinator,
-  coordinatorSettings, coordinatorWrapper, exitCodeOf, readExitRecord, TELEGRAM_ALL_TOOLS, TELEGRAM_HOOK_COMMAND,
-  TELEGRAM_TOKEN_ENV, TELEGRAM_TOOLS, type SignalTarget, type SpawnLike,
+  coordinatorSettings, coordinatorWrapper, exitCodeOf, readExitRecord, TELEGRAM_HOOK_COMMAND,
+  TELEGRAM_TOKEN_ENV, type SignalTarget, type SpawnLike,
 } from '../../src/runtime/coordinator.js';
+import { hangGuarded } from '../../src/runtime/hook-guard.js';
 import { runtimePaths } from '../../src/runtime/paths.js';
-import { evaluateTelegram, TELEGRAM_CHANNEL_SPEC, TELEGRAM_PLUGIN_ID, type TelegramProbeReport } from '../../src/telegram/probe.js';
+import type { TelegramProbeReport } from '../../src/telegram/probe.js';
+import { hostChannelServerProbe, MINIONS_TELEGRAM_TOOLS } from '../../src/telegram/channel/launch.js';
+import { LAUNCH_ENV, TOKEN_FILE_ENV } from '../../src/telegram/channel/server.js';
 import { defaults, FAKE_MINIONS, runHookCommand } from '../helpers.js';
 import { tmp } from '../runtime/fixtures.js';
 
@@ -19,21 +22,12 @@ const TOKEN = '123456789:AAHfakefakefakefakefakefakefake_-0123';
 const TOKEN2 = '123456789:BBHotherotherotherotherotherother_-9876';
 
 const ok = (stdout: string): RunResult => ({ code: 0, stdout, stderr: '' });
-const available = (): TelegramProbeReport => evaluateTelegram({
-  claude: ok('2.1.292 (Claude Code)\n'), bun: ok('1.4.3\n'),
-  marketplaces: ok(JSON.stringify([{ name: 'claude-plugins-official', source: 'github', repo: 'anthropics/claude-plugins-official' }])),
-  plugins: ok(JSON.stringify([{ id: TELEGRAM_PLUGIN_ID, version: '0.0.7', scope: 'user', enabled: true }])),
-  managed: { present: false },
-});
-const noBun = (): TelegramProbeReport => evaluateTelegram({ ...factsOf(), bun: { code: 127, stdout: '', stderr: 'bun: not found' } });
-const factsOf = () => ({
-  claude: ok('2.1.292 (Claude Code)\n'), bun: ok('1.4.3\n'),
-  marketplaces: ok(JSON.stringify([{ name: 'claude-plugins-official', source: 'github', repo: 'anthropics/claude-plugins-official' }])),
-  plugins: ok(JSON.stringify([{ id: TELEGRAM_PLUGIN_ID, version: '0.0.7', scope: 'user', enabled: true }])),
-  managed: { present: false } as const,
-});
+const available = (): TelegramProbeReport => hostChannelServerProbe({ claudeVersion: '2.1.308 (Claude Code)', token: 'ok', command: true });
+const oldClaude = (): TelegramProbeReport => hostChannelServerProbe({ claudeVersion: '2.0.1 (Claude Code)', token: 'ok', command: true });
+/** runCoordinator deps for the channel server check: this Claude Code version (null: `claude --version` failed). */
+const version = (v: string | null = '2.1.308 (Claude Code)') => ({ claudeVersion: async () => v, newLaunchId: () => 'launch-1' });
 
-/** Explicit terminal (the profile default is auto). */
+/** Explicit terminal (the independent default is auto). */
 /** --permission-mode choices of Claude Code 2.1.292 (stub for `claude --help`). */
 const autoModes = async () => ['acceptEdits', 'auto', 'bypassPermissions', 'manual', 'dontAsk', 'plan'];
 const terminalCfg = (): MinionsConfig => { const c = defaults(); c.communication.channel = 'terminal'; return c; };
@@ -87,15 +81,13 @@ function fakeSpawn() {
 
 describe('Telegram launch decision', () => {
   const tok = { state: 'ok' as const, token: TOKEN, botId: '123456789' };
-  it('enables Telegram only when selected, networked, provisioned and the probe is available', () => {
-    expect(decideTelegram(telegramCfg(), tok, available())).toMatchObject({ enabled: true });
+  it('enables Telegram only when selected, networked, provisioned and the channel server can run', () => {
+    expect(decideTelegram(telegramCfg(), tok, available())).toMatchObject({ enabled: true, server: 'minions' });
     expect(decideTelegram(terminalCfg(), tok, available())).toEqual({ enabled: false, reason: 'communication.channel is terminal' });
     expect(decideTelegram(telegramCfg({ network: 'none' }), tok, available()).reason).toMatch(/network is none/);
     expect(decideTelegram(telegramCfg(), { state: 'missing' }, available()).reason).toMatch(/not provisioned; run `minions auth telegram`/);
     expect(decideTelegram(telegramCfg(), { state: 'invalid', detail: 'not a Telegram bot token' }, available()).reason).toMatch(/not a Telegram bot token/);
-    const r = decideTelegram(telegramCfg(), tok, noBun());
-    expect(r.enabled).toBe(false);
-    expect(r.reason).toMatch(/Bun is not installed/);
+    expect(decideTelegram(telegramCfg(), tok, oldClaude()).enabled).toBe(false);
   });
 
   it('reads and validates the mounted token before use', async () => {
@@ -106,40 +98,38 @@ describe('Telegram launch decision', () => {
     expect(await readMountedToken(paths.telegramTokenFile)).toMatchObject({ state: 'invalid' });
   });
 
-  it('allows the Telegram tools only for a Telegram launch; never bypass mode', async () => {
+  it('allows the channel server tools only for a Telegram launch', async () => {
     const { paths } = layout();
-    const on = await buildClaudeCommand(telegramCfg(), paths, { telegram: true });
+    const on = await buildClaudeCommand(telegramCfg(), paths, { telegram: true, channelServer: { command: 'minions', launchId: 'l1', tokenFile: paths.telegramTokenFile, stateDir: paths.telegramStateDir } });
     const off = await buildClaudeCommand(telegramCfg(), paths, { telegram: false });
-    expect(on.args.slice(-2)).toEqual(['--channels', TELEGRAM_CHANNEL_SPEC]);
-    expect(off.args).not.toContain('--channels');
+    expect(on.args).toContain('--mcp-config');
+    expect(on.args).not.toContain('--channels');
+    expect(off.args).not.toContain('--mcp-config');
     const allow = (c: typeof on) => JSON.parse(c.args[c.args.indexOf('--settings') + 1]!).permissions.allow as string[];
-    expect(allow(on)).toEqual(expect.arrayContaining(TELEGRAM_TOOLS));
+    expect(allow(on)).toEqual(expect.arrayContaining(MINIONS_TELEGRAM_TOOLS));
     expect(allow(off).some((t) => t.startsWith('mcp__'))).toBe(false);
+    await expect(buildClaudeCommand(telegramCfg(), paths, { telegram: true })).rejects.toThrow(/without the channel server/);
   });
 });
 
 describe('coordinator exec wrapper', () => {
-  it('passes the token only through the claude child environment, with --channels', async () => {
+  it('Docker uses the minions channel server: `minions` on PATH, the token only in its file', async () => {
     const { paths } = layout();
     const { calls, spawn } = fakeSpawn();
     const logs: string[] = [];
-    const parentEnv = { PATH: '/usr/bin', HOME: '/home/node' };
-    const code = await runCoordinator(telegramCfg(), { paths, permissionModes: autoModes, spawn, env: parentEnv, probe: async () => available(), log: (l) => logs.push(l) });
+    const parentEnv = { PATH: '/usr/bin', HOME: '/home/node', [TELEGRAM_TOKEN_ENV]: TOKEN };
+    const code = await runCoordinator(telegramCfg(), { paths, permissionModes: autoModes, spawn, env: parentEnv, ...version(), log: (l) => logs.push(l) });
     expect(code).toBe(0);
-    expect(calls).toHaveLength(1);
     const c = calls[0]!;
     expect(c.cmd).toBe('claude');
-    expect(c.args).toContain('--channels');
-    expect(c.env[TELEGRAM_TOKEN_ENV]).toBe(TOKEN);
-    expect(c.env.PATH).toBe('/usr/bin');
-    // Never in argv, logs, the parent environment, or the launch record.
+    const mcp = JSON.parse(c.args[c.args.indexOf('--mcp-config') + 1]!) as { mcpServers: Record<string, { command: string; env: Record<string, string> }> };
+    expect(Object.values(mcp.mcpServers)[0]).toMatchObject({ command: 'minions', env: { [TOKEN_FILE_ENV]: paths.telegramTokenFile, [LAUNCH_ENV]: 'launch-1' } });
+    expect(c.env).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
     expect(JSON.stringify(c.args)).not.toContain(TOKEN);
     expect(logs.join('\n')).not.toContain(TOKEN);
-    expect(parentEnv).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
     const rec = readFileSync(paths.coordinatorLaunch, 'utf8');
-    expect(rec).not.toContain(TOKEN);
     expect(rec).not.toContain(TOKEN.split(':')[1]!);
-    expect(JSON.parse(rec)).toMatchObject({ version: 1, channel: 'telegram', telegram: { enabled: true } });
+    expect(JSON.parse(rec)).toMatchObject({ version: 1, channel: 'telegram', telegram: { enabled: true, server: 'minions' }, launchId: 'launch-1' });
   });
 
   it('falls back to terminal with a precise reason and drops an inherited token', async () => {
@@ -147,52 +137,48 @@ describe('coordinator exec wrapper', () => {
     const { calls, spawn } = fakeSpawn();
     const logs: string[] = [];
     let probed = false;
-    await runCoordinator(telegramCfg(), { paths, permissionModes: autoModes, spawn, env: { [TELEGRAM_TOKEN_ENV]: TOKEN }, probe: async () => { probed = true; return available(); }, log: (l) => logs.push(l) });
-    expect(calls[0]!.args).not.toContain('--channels');
+    await runCoordinator(telegramCfg(), { paths, permissionModes: autoModes, spawn, env: { [TELEGRAM_TOKEN_ENV]: TOKEN }, claudeVersion: async () => { probed = true; return '2.1.308'; }, log: (l) => logs.push(l) });
+    expect(calls[0]!.args).not.toContain('--mcp-config');
     expect(calls[0]!.env).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
     expect(logs.join('\n')).toMatch(/Telegram disabled for this session: Telegram bot token is not provisioned.*Terminal mode is active/);
     expect(probed).toBe(false);
   });
 
-  it('auto channel: Telegram with a mounted token; quiet terminal mode without one (no probe)', async () => {
+  it('auto channel: Telegram with a mounted token; quiet terminal mode without one', async () => {
     const auto = defaults();
     expect(auto.communication.channel).toBe('auto');
     const withTok = layout();
     const a = fakeSpawn();
     const logs: string[] = [];
-    await runCoordinator(auto, { paths: withTok.paths, permissionModes: autoModes, spawn: a.spawn, env: {}, probe: async () => available(), log: (l) => logs.push(l) });
-    expect(a.calls[0]!.args).toContain('--channels');
-    expect(a.calls[0]!.env[TELEGRAM_TOKEN_ENV]).toBe(TOKEN);
+    await runCoordinator(auto, { paths: withTok.paths, permissionModes: autoModes, spawn: a.spawn, env: {}, ...version(), log: (l) => logs.push(l) });
+    expect(a.calls[0]!.args).toContain('--mcp-config');
     expect(logs.join('\n')).toMatch(/Telegram enabled \(communication.channel auto: bot token stored\)/);
 
     const noTok = layout(null);
     const b = fakeSpawn();
     const logs2: string[] = [];
-    await runCoordinator(auto, { paths: noTok.paths, permissionModes: autoModes, spawn: b.spawn, env: { [TELEGRAM_TOKEN_ENV]: TOKEN }, probe: async () => { throw new Error('must not probe'); }, log: (l) => logs2.push(l) });
-    expect(b.calls[0]!.args).not.toContain('--channels');
+    await runCoordinator(auto, { paths: noTok.paths, permissionModes: autoModes, spawn: b.spawn, env: { [TELEGRAM_TOKEN_ENV]: TOKEN }, claudeVersion: async () => { throw new Error('must not probe'); }, log: (l) => logs2.push(l) });
+    expect(b.calls[0]!.args).not.toContain('--mcp-config');
     expect(b.calls[0]!.env).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
     expect(logs2.join('\n')).toMatch(/^minions: terminal mode \(auto: no Telegram bot token is stored/);
-    expect(logs2.join('\n')).not.toMatch(/disabled/);
   });
 
-  it('terminal channel: no probe, no token, no Telegram message', async () => {
+  it('terminal channel: no check, no token, no Telegram message', async () => {
     const { paths } = layout();
     const { calls, spawn } = fakeSpawn();
     const logs: string[] = [];
-    await runCoordinator(terminalCfg(), { paths, permissionModes: autoModes, spawn, env: {}, probe: async () => { throw new Error('must not probe'); }, log: (l) => logs.push(l) });
-    expect(calls[0]!.args).not.toContain('--channels');
-    expect(calls[0]!.env).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
+    await runCoordinator(terminalCfg(), { paths, permissionModes: autoModes, spawn, env: {}, claudeVersion: async () => { throw new Error('must not probe'); }, log: (l) => logs.push(l) });
+    expect(calls[0]!.args).not.toContain('--mcp-config');
     expect(logs).toEqual([]);
   });
 
-  it('probe failure keeps terminal mode', async () => {
+  it('a Claude Code without development channels keeps terminal mode', async () => {
     const { paths } = layout();
     const { calls, spawn } = fakeSpawn();
     const logs: string[] = [];
-    await runCoordinator(telegramCfg(), { paths, permissionModes: autoModes, spawn, env: {}, probe: async () => noBun(), log: (l) => logs.push(l) });
-    expect(calls[0]!.args).not.toContain('--channels');
-    expect(calls[0]!.env).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
-    expect(logs.join('\n')).toMatch(/Telegram disabled for this session: .*Bun is not installed/);
+    await runCoordinator(telegramCfg(), { paths, permissionModes: autoModes, spawn, env: {}, ...version('2.0.1 (Claude Code)'), log: (l) => logs.push(l) });
+    expect(calls[0]!.args).not.toContain('--mcp-config');
+    expect(logs.join('\n')).toMatch(/Telegram disabled for this session/);
   });
 });
 
@@ -212,7 +198,7 @@ describe('controlled coordinator restart', () => {
   }
   const launchWith = async (paths: ReturnType<typeof layout>['paths'], cfg: MinionsConfig) => {
     const { spawn } = fakeSpawn();
-    await runCoordinator(cfg, { paths, permissionModes: autoModes, spawn, env: {}, probe: async () => available(), log: () => {} });
+    await runCoordinator(cfg, { paths, permissionModes: autoModes, spawn, env: {}, ...version(), log: () => {} });
   };
 
   it('no change: nothing is restarted', async () => {
@@ -292,7 +278,7 @@ describe('tester edge cases: terminal mode through the wrapper', () => {
       const { paths } = layout(bad);
       const { calls, spawn } = fakeSpawn();
       const logs: string[] = [];
-      await runCoordinator(telegramCfg(), { paths, permissionModes: autoModes, spawn, env: {}, probe: async () => available(), log: (l) => logs.push(l) });
+      await runCoordinator(telegramCfg(), { paths, permissionModes: autoModes, spawn, env: {}, ...version(), log: (l) => logs.push(l) });
       expect(calls[0]!.args, bad).not.toContain('--channels');
       expect(calls[0]!.env, bad).not.toHaveProperty(TELEGRAM_TOKEN_ENV);
       expect(logs.join('\n'), bad).toMatch(/Telegram disabled.*not a Telegram bot token/);
@@ -352,7 +338,7 @@ describe('tester edge cases: restart with leases', () => {
   };
   const launched = async (paths: ReturnType<typeof layout>['paths'], cfg: MinionsConfig) => {
     const { spawn } = fakeSpawn();
-    await runCoordinator(cfg, { paths, permissionModes: autoModes, spawn, env: {}, probe: async () => available(), log: () => {} });
+    await runCoordinator(cfg, { paths, permissionModes: autoModes, spawn, env: {}, ...version(), log: () => {} });
   };
 
   it('--force restarts but never touches the lease source; the leases are reported for recovery', async () => {
@@ -457,26 +443,25 @@ describe('wrapper signal handling', () => {
 describe('Telegram tools are coordinator-only', () => {
   it('the generated settings gate every Telegram tool behind the pre-telegram hook', async () => {
     const { paths } = layout();
-    const on = await buildClaudeCommand(telegramCfg(), paths, { telegram: true });
+    const on = await buildClaudeCommand(telegramCfg(), paths, { telegram: true, channelServer: { command: 'minions', launchId: 'l1', tokenFile: paths.telegramTokenFile, stateDir: paths.telegramStateDir } });
     const settings = JSON.parse(on.args[on.args.indexOf('--settings') + 1]!);
     const entries = settings.hooks.PreToolUse as { matcher: string; hooks: { type: string; command: string }[] }[];
     expect(entries).toHaveLength(1);
     expect(entries[0]!.hooks).toEqual([{ type: 'command', command: TELEGRAM_HOOK_COMMAND, timeout: 30 }]);
     const matcher = new RegExp(`^(?:${entries[0]!.matcher})$`);
-    for (const t of TELEGRAM_ALL_TOOLS) expect(matcher.test(t), t).toBe(true);
-    expect(TELEGRAM_ALL_TOOLS).toEqual(['reply', 'react', 'edit_message', 'download_attachment'].map((t) => `mcp__plugin_telegram_telegram__${t}`));
-    for (const t of ['Bash', 'Agent', 'mcp__other__reply', 'mcp__plugin_telegram_telegramx']) expect(matcher.test(t), t).toBe(false);
+    for (const t of ['reply', 'poll', 'close_poll']) expect(matcher.test(`mcp__minions-telegram__${t}`), t).toBe(true);
+    for (const t of ['Bash', 'Agent', 'mcp__other__reply', 'mcp__plugin_telegram_telegram__reply']) expect(matcher.test(t), t).toBe(false);
     // Terminal launches carry no Telegram hook (and no Telegram allow).
     expect(coordinatorSettings(telegramCfg())).not.toHaveProperty('hooks');
   });
 
   it('the generated pre-telegram hook fails closed: a missing or crashing minions blocks the Telegram call', async () => {
     const { paths } = layout();
-    const on = await buildClaudeCommand(telegramCfg(), paths, { telegram: true });
+    const on = await buildClaudeCommand(telegramCfg(), paths, { telegram: true, channelServer: { command: 'minions', launchId: 'l1', tokenFile: paths.telegramTokenFile, stateDir: paths.telegramStateDir } });
     const settings = JSON.parse(on.args[on.args.indexOf('--settings') + 1]!);
     const command = settings.hooks.PreToolUse[0].hooks[0].command as string;
-    expect(command).toBe('timeout 20 minions hook pre-telegram || exit 2');
-    const stdin = JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'mcp__plugin_telegram_telegram__reply', tool_input: { chat_id: '1', text: 'hi' } });
+    expect(command).toBe(`${hangGuarded('minions hook pre-telegram')} || exit 2`);
+    const stdin = JSON.stringify({ hook_event_name: 'PreToolUse', tool_name: 'mcp__minions-telegram__reply', tool_input: { chat_id: '1', text: 'hi' } });
     // Exit 2 is the only blocking PreToolUse exit; 127 (not found), 1 (crash) or 137 (killed) would allow the call.
     expect(runHookCommand(command, null, stdin).status).toBe(2);
     expect(runHookCommand(command, FAKE_MINIONS.crash, stdin).status).toBe(2);

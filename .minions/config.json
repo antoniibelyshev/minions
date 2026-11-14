@@ -67,11 +67,18 @@
   "verification": {
     "commands": [
       "npm run typecheck",
-      "npm test"
+      "npm run test:unit"
     ],
-    "testerRequired": true,
+    "periodic": {
+      "commands": [
+        "npm run test:integration"
+      ]
+    },
     "reviewerRequired": true,
-    "ciAuthority": "none"
+    "ciAuthority": "none",
+    "setupCommands": [
+      "npm ci"
+    ]
   },
   "communication": {
     "channel": "auto",

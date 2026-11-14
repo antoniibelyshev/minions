@@ -1,9 +1,17 @@
 import type { ScopeFilter, Task } from './types.js';
 
-/** Statuses that satisfy a dependency. */
+/** Statuses that satisfy a dependency by default (local integration narrows this to `done`: config/delivery.ts dependencyDoneStatuses). */
 export const COMPLETED_STATUSES: ReadonlySet<Task['status']> = new Set(['done', 'delivered']);
 
 export const AUTHORIZED_LABEL = 'minions:authorized';
+
+/**
+ * Small-task lane (task-97): with engineer capacity 2 or more and a runnable engineer stage of a task labelled
+ * `small`, `work next` lists at most maxEngineers-1 engineer stages of other tasks (running ones included), so a
+ * small follow-up always gets the last engineer slot. Small tasks themselves are not capped by the lane.
+ */
+export const SMALL_LABEL = 'small';
+export const isSmall = (task: Pick<Task, 'labels'>): boolean => task.labels.includes(SMALL_LABEL);
 
 export interface ReadyContext {
   /** Task ids holding an active lease. */
@@ -17,6 +25,8 @@ export interface ReadyContext {
    * such a dependency excludes the task.
    */
   lookup: (id: string) => Task | undefined;
+  /** Statuses that satisfy a dependency (default COMPLETED_STATUSES; config/delivery.ts dependencyDoneStatuses). */
+  completed?: ReadonlySet<Task['status']>;
 }
 
 export type ExclusionReason = 'paused' | 'status' | 'unauthorized' | 'scope' | 'leased' | 'dependency';
@@ -30,7 +40,7 @@ export function notReadyReason(task: Task, ctx: ReadyContext): ExclusionReason |
   if (ctx.leased.has(task.id)) return 'leased';
   for (const dep of task.dependencies) {
     const d = ctx.lookup(dep);
-    if (!d || !COMPLETED_STATUSES.has(d.status)) return 'dependency';
+    if (!d || !(ctx.completed ?? COMPLETED_STATUSES).has(d.status)) return 'dependency';
   }
   return null;
 }

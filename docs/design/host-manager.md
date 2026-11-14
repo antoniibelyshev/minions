@@ -2,7 +2,11 @@
 
 Status: **agreed** (task-53; phases 1 to 5 built, see [Phases](#phases)). Folds in task-44 (live settings). The owner answered the
 open questions on 2026-10-26 (see [Owner decisions](#owner-decisions)). The build tasks are listed under
-[Phases](#phases) and are filed as task-53.2 to task-53.8.
+[Phases](#phases) and are filed as task-53.2 to task-53.8. Task-65 proposes a natural-language front-end, which revises
+decision 1: see [host-manager-assistant.md](host-manager-assistant.md) (proposed, waiting for the owner).
+
+The manager is also the proposed watchdog of the routine pass in [unattended-delivery.md](unattended-delivery.md)
+(task-68.1). It runs `minions sync --routine` when the coordinator's own clock is stale.
 
 ## Goal
 
@@ -23,6 +27,9 @@ the owner confirms that change**. Nothing applies on its own.
    model. Every apply path it uses already exists and is tested. The manager adds only routing, confirmation and a
    journal. A child process also means that a CLI the manager just reinstalled runs in a fresh process (the
    "no self-continuation" rule in [bootstrap.md, Upgrade from the container](bootstrap.md#upgrade-from-the-container)).
+   *Revision proposed in task-65:* the apply path stays deterministic and model-free, but the chat front-end may
+   use Claude. Claude explains settings and turns plain text into one typed owner command, which takes the same
+   plan and Confirm path. See [host-manager-assistant.md](host-manager-assistant.md#revision-of-decision-1).
 2. **One manager per host, one manager bot per host.** It serves every registered project, and the owner picks the
    project with `/project <name>`, or by tapping a request that already names it. One bot per project would double
    the bots and the pairing work for no gain in isolation: all projects already share one host user and one
@@ -32,9 +39,12 @@ the owner confirms that change**. Nothing applies on its own.
    where it runs ([bootstrap.md, Host-signed publication approvals](bootstrap.md#host-signed-publication-approvals))
    and like `config roles propose` ([roles-and-workflows.md](roles-and-workflows.md) D2). No new container command
    is needed.
-4. **Security-relevant settings are host-owned.** A container request for one of them is refused when it is
-   recorded, and refused again by the manager. Only the owner changes them, from the host (see
-   [Host-owned settings](#host-owned-settings)).
+4. **Security-relevant settings are host-owned.** The container may request them like any other setting (owner
+   decision, 2026-10-29: the coordinator must be able to propose permissions, profiles and resources itself), but the
+   plan marks them, a loosening one is confirmed twice, and they are never applied without the owner's confirmation
+   (see [Host-owned settings](#host-owned-settings)). Secrets are never requested.
+   `coordinator.permissionMode bypassPermissions` and `coordinator.sandbox false` are accepted only in
+   `config.local.json`, never in the committable project config.
 5. **Every change is confirmed and bound to its exact content.** A confirmation covers one request digest, the config
    revision it was computed against, and an expiry. If anything changed in between, the owner is asked again.
 6. **The terminal stays the baseline.** Everything the manager does stays available as the same host command. When
@@ -93,23 +103,58 @@ the existing delegate mechanism (`src/host/delegate.ts`). Each exec has a timeou
 anything over either is dropped and reported as a project error, since the output is untrusted. It gets no new mount and no host-visible file under
 `/state`. A file queue on a host bind mount was rejected: it would be the first host path the container can write.
 
-**From the owner (manager chat).** The manager accepts a fixed set of commands and ignores everything else (it replies
-with the help text):
+**From the owner (manager chat).** The manager accepts a fixed set of commands. Without the optional assistant it
+answers everything else with the help text; with it, plain text (no leading `/`) goes to the assistant (see
+[Natural-language assistant](#natural-language-assistant-task-65) and the full design in
+[host-manager-assistant.md](host-manager-assistant.md)), which falls back to the help text:
 
 | Command | Does |
 | - | - |
 | `/status` | Per project: running, coordinator, active leases, restart-required (task-3.4), pending requests |
 | `/requests` | Pending requests, each with Confirm / Reject buttons |
-| `/set <key> <value>` | Same model as `minions settings set` (validation, layer, loosening text), then the confirmation |
+| `/settings [query]` | Read-only list (task-65.1): key, value, source, when a change takes effect, host-owned mark; a group name or key substring narrows it; secrets show set / unset |
+| `/set <key> <value>` | Same model as `minions settings set` (validation, layer, loosening text); applied at once unless it loosens, then the confirmation. An unknown key gets the closest keys; a value already in effect gets an explanation (value, source, other choices) and no request |
 | `/sync` | Outer repo sync (see [Change kinds](#change-kinds)) |
-| `/upgrade` | `minions upgrade` with a dry-run plan as the confirmation text |
+| `/upgrade` | `minions upgrade` after its dry run (never with `--rebuild-cli`, so it builds no CLI on the host): applied at once |
 | `/restart` | Graceful coordinator restart (refused while workers are active: then **Restart when idle** and **Drain now** are offered) |
-| `/undo <id>` | Proposes the inverse of an applied config change (confirmed like any change) |
+| `/undo <id>` | The inverse of an applied config change: applied at once unless it loosens, then the confirmation |
 | `/rebuild_cli` | Dev only (owner decision Q3): `minions upgrade --rebuild-cli` with the commit range, diffstat and sensitive paths in the plan; not registered on normal installs |
-| `/project <name>` | Picks the project for the commands above when several are registered |
+| `/project <name>` | Picks the project for the commands above when several are registered (also clears the assistant's history) |
+| `/assistant [on\|off\|status]` | The natural-language assistant (task-65.4): switch it on or off (writes `assistant.json`), or show it: model, calls today and the daily limit, the last error. Never calls the model |
 
-An owner command goes through the same confirmation as a coordinator proposal. Typing `/set` is not consent to the
-diff the manager computes from it.
+An owner command the owner types builds the same plan as a coordinator proposal. Since task-78, a typed command whose
+plan loosens nothing and builds or installs no CLI on the host applies at once (see
+[Owner-typed commands](#owner-typed-commands-task-78)); every other one goes through the same confirmation as a
+coordinator proposal, because typing `/set` is not consent to a loosening the manager computes from it.
+
+### Natural-language assistant (task-65)
+
+Decision 1 is revised for the chat front-end only (task-65 design, owner poll #task-53-claude): the apply path stays
+deterministic and model-free. Built in task-65.1 to task-65.4 (`src/host/manager-assistant*.ts`):
+
+- **Routing.** Only plain text from the paired owner goes to the assistant; a message that starts with `/` is parsed
+  as a command and never reaches it. Forwarded messages and other senders are dropped as before.
+- **One call per message, off the poll loop.** `claude -p` with no tools, an empty MCP config, permission mode
+  default, bypass disabled, a fresh `CLAUDE_CONFIG_DIR` and an empty cwd under `<MINIONS_HOME>/manager/assistant/`
+  (removed after the call), the input on stdin, a 60 s timeout that kills the whole process group, a 64 KiB output cap,
+  and `--restricted` (or `--setting-sources user` where the CLI lacks it). The transport does not wait for it: taps,
+  polls and commands go on, and one message is answered at a time (another one meanwhile gets the fallback).
+- **Order and trust.** The reply comes first, always labelled `Assistant:`, plain text, cut to 1,500 characters. A
+  valid proposal (`config-set`, `restart`, `upgrade`, `sync` or `undo`; never `approve` or `rebuild-cli`) then
+  goes through `ManagerCommands.propose` with `via: 'assistant'`: the host builds and journals the plan like a typed
+  command, and the offer message says "Proposed by the assistant from your message". `via` is in the plan (so it is
+  digested) and in the journaled request; typed commands and container requests have no `via`, so their digests are
+  unchanged. Confirm, the double tap for loosening plans, expiry, revision and digest checks are unchanged.
+- **Conversation state** is in memory only: the last 6 exchanges and at most 8 KiB, cleared after 30 minutes without a
+  message, on `/project`, on `/assistant off` and on a manager restart.
+- **Limits.** `assistant.json` holds `enabled`, `model` and `dailyLimit` (50 by default).
+  `assistant-usage.json` (0600, manager only) holds the calls of the UTC day and the last error; `minions status`,
+  doctor (`manager.assistant`), the chat `/status` and `/assistant status` show them. Over the limit the reason is
+  given once a day and later messages get the command list.
+- **Failure and fallback.** Switched off, not set up, no token, no or an unsuitable `claude`, the daily limit, a
+  timeout, a non-zero exit, output over the cap, output that is not the expected JSON, or an auth error: one reply
+  `Assistant unavailable (<reason>). Commands:` and the help text. Nothing is retried. An invalid proposal next to a
+  valid reply shows the reply and "the assistant's proposal was invalid; nothing was planned".
 
 ## Confirmation model
 
@@ -117,7 +162,8 @@ diff the manager computes from it.
    [Settings classification](#settings-classification-task-44)), what it loosens, what will be interrupted (a coordinator
    restart; active-lease counts are shown to the owner but kept out of the digest, as they change every poll), and the steps for an upgrade (`upgrade --dry-run --json`).
 2. `digest = sha256(canonical plan JSON)`. The manager stores `{requestId, digest, configRevision, nonce, expiresAt}`
-   in its host journal (`<MINIONS_HOME>/manager/journal.jsonl`, 0600) and sends the plan with inline buttons
+   in its host journal (`<MINIONS_HOME>/manager/journal.jsonl`, 0600; from 1 MiB on, a write compacts it: open and in-flight requests and the
+   applied config changes /undo can name stay, only the closed requests past the newest 100 go; an applied or rejected container request leaves a one-line tombstone, so a runtime row still marked proposed is never offered again, task-90) and sends the plan with inline buttons
    `Confirm` / `Reject`. The `callback_data` is `c:<requestId>:<nonce>` (a 128-bit random nonce, within the
    64-byte limit).
 3. On a tap, the manager checks every point and refuses if any fails: the sender is the paired owner id, in the
@@ -136,8 +182,40 @@ restart does not replay old callbacks.
 the digest covers. It never re-reads the container's request row at apply time, since a forged or edited row could
 differ from what the owner saw. The container's row is only a trigger, and its status is updated afterwards.
 
-Nothing applies without step 3. That includes tightening changes, rejects of stale requests (they are only marked
-expired) and restarts. Read-only commands (`/status`, `/requests`) need no confirmation.
+Nothing from the container applies without step 3. That includes tightening changes, rejects of stale requests (they
+are only marked expired) and restarts. Read-only commands (`/status`, `/requests`) need no confirmation. The one
+exception is a safe command the owner types (next section).
+
+### Owner-typed commands (task-78)
+
+The owner asked not to confirm what they just typed ("I see no point in approving the restart when I just called
+/restart"). The rule: when the paired owner types a change command in the private chat, and its plan
+
+- loosens nothing (`loosens` is null),
+- is of a kind on the allow list (`DIRECT_KINDS` in `src/host/change-requests.ts`: `config-set`, `restart`, `sync`,
+  `undo`, `upgrade`), and is not a queued restart mode,
+- and builds or installs no CLI on the host (an upgrade only without `--from-container` and `--rebuild-cli`; without
+  that flag `minions upgrade` never builds the CLI),
+
+the manager applies it at once (`appliesWithoutConfirm`). That covers `/restart`, `/sync`, `/upgrade` and a
+tightening or neutral `/set` or `/undo`. `/approve` (it always loosens), a loosening `/set` or `/undo` and
+`/rebuild_cli` keep the offer and the double tap. Container requests always need Confirm, and so do the plans the
+manager offers on the owner's behalf (Restart when idle, Drain now, Roll back CLI): they were not typed.
+
+What stays the same:
+
+- Only a message that passes `isOwnerUpdate` (paired user, paired private chat, not a bot) and is not forwarded
+  counts. Taps and the container's rows never reach this path.
+- The plan is built, digested and journaled like any other. The offer carries `typed` (the key
+  `telegram:<botId>:<chatId>:<messageId>`) and `direct: true`, and its `confirmed` entry is written in the same
+  append, under the journal lock, in the one manager process. Its nonce is spent before anything could show it.
+  Then the usual `applying` and outcome entries follow, and the owner gets the usual "Applying…" and outcome
+  messages. A refused `/restart` still offers Restart when idle and Drain now.
+- **Replay.** The persisted `getUpdates` offset keeps a restart from replaying old messages. On top of that, the
+  journal holds at most one offer per message key: a redelivered update (same bot, chat and message id) is answered
+  "already handled" and nothing is planned or applied again. A crash after the `confirmed` entry is reported as
+  interrupted at the next start, like any confirmed apply, and never resumed.
+- Plain text only: no message uses markup.
 
 **Loosening and code-execution changes ask twice.** A plan that loosens policy (any non-null `loosens`), or that
 builds and installs a CLI on the host, gets a second message that names the risk in one line ("agents may push
@@ -163,7 +241,7 @@ coordinator's prompt text catches up at its next restart, which the manager ment
 **restart**: baked into the generated prompt, the plugin or the coordinator launch arguments, so the graceful
 coordinator restart applies it. **recreate**: compose, the image or mounts, so `minions upgrade` applies it (the
 container is recreated, volumes kept). **fixed**: identity or derived; change it with `minions setup`, not here.
-**H** marks host-owned keys: the container can never propose them.
+**H** marks host-owned keys: the container may request them, and only the owner's confirmation applies them.
 
 | Key | Class | Reason |
 | - | - | - |
@@ -183,7 +261,7 @@ container is recreated, volumes kept). **fixed**: identity or derived; change it
 | `communication.channel` | restart, **H** | Coordinator `--channels`. It decides who can steer the coordinator |
 | `capabilities.*`, `sensitivePaths`, `architecture`, `intake.startReady` | restart, **H** | Policy and approvals (prompt plus runtime gates) |
 | `delivery.*`, `verification.testerRequired`, `reviewerRequired`, `ciAuthority` | restart, **H** | What reaches GitHub, and with which checks |
-| `coordinator.permissionMode`, `disallowedTools`, `bundledSkills`, legacy `permissionMode` | restart, **H** | Coordinator permissions |
+| `coordinator.permissionMode`, `sandbox`, `disallowedTools`, `bundledSkills`, legacy `permissionMode` | restart, **H** | Coordinator permissions (bypassPermissions and sandbox false: local config only) |
 | `roles`, `workflows`, `harnesses` | restart, **H** | Tools, edit scopes and process harnesses. Roles keep their own propose/apply path (`config roles`) |
 | `container.cpus`, `memoryMiB`, `pidsLimit`, `tmpSizeMiB` | recreate | Compose resource limits |
 | `container.network`, `publishPorts`, `mountHostRepository`, `mountDockerSocket` | recreate, **H** | Isolation of the container |
@@ -549,8 +627,9 @@ task-53.5.3 and are reused unchanged. Decisions made here:
   starts already, the owner's pause stays: only the drain is cleared, with `minions resume --drain` right after
   the restart ran (whatever it answered). A runtime that is stopped at the idle poll cannot be resumed: the
   request closes as failed and the outcome names the pause left in place and the command that clears it.
-- **CLI backup** (`src/host/cli-backup.ts`). `applyCli` packs the packed global install with
-  `npm pack <install dir> --ignore-scripts` (none of its scripts run) right before `npm install -g`, into
+- **CLI backup** (`src/host/cli-backup.ts`). `applyCli` archives the packed global install directory
+  as it is (a gzipped tar under `package/`; no npm, none of its scripts run: `npm pack <dir>` would run `prepare`
+  even with `--ignore-scripts`) right before `npm install -g`, into
   `<MINIONS_HOME>/manager/cli-backup/minions-<version>-<UTC stamp>.tgz` (0600, directory 0700, last 2). A backup
   that fails stops the reinstall, nothing installed. A linked checkout is rebuilt in place and has no backup. The
   backup is made by `minions upgrade` itself, so a terminal upgrade keeps one too.
@@ -627,6 +706,13 @@ Answered by the owner on 2026-10-26 (Telegram msg 250). They replace the open qu
 3. **CLI rebuild from container commits.** A dev-only feature. It is available only when the host CLI runs from a
    minions source checkout and the managed project is minions. Normal installs do not register, advertise or accept
    the request. Where it exists, it keeps the plan (commit range, diffstat, sensitive paths) and the double tap.
+   *Unchanged by the dev self-update (task-99):* [coordinator-self-update.md](coordinator-self-update.md) adds a
+   host-side script, `scripts/dev/self-update.mjs`, that applies the coordinator's `upgrade --from-container`
+   requests without a tap. It does so only for the minions project developing itself, and only while the owner runs
+   it on the host. It is not shipped (`scripts/` is not in the npm package). For installed minions nothing changes:
+   the container only proposes, `/rebuild_cli` exists only on dev installs and still asks twice, `--rebuild-cli`
+   stays an explicit flag, and the "no self-continuation" rule holds. The script confirms nothing through the journal
+   and takes no token or nonce from the container.
 4. **How the manager runs.** A user service (launchd or systemd --user) installed by `setup`.
 5. **Approvals from the manager chat.** `/approve <task> <sha>` is part of phase 4. It is bound to the head SHA,
    needs the double tap, and the signing key stays on the host (the manager runs the host's `work approve`). Landed in

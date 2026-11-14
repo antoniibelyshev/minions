@@ -1,35 +1,35 @@
-// CLI backup and roll back (docs/design/host-manager.md, "Failure and rollback", CLI reinstall; task-53.7).
+// CLI backup (task-53.7).
 //
-// - Before `minions upgrade` replaces a packed global install with `npm install -g`, the current install is packed
-//   (`npm pack <install dir> --ignore-scripts`, so none of its scripts run) into
+// - Before `minions upgrade` replaces a packed global install with `npm install -g`, the current install directory is
+//   archived as it is (a gzipped tar with every entry under `package/`, the layout `npm install -g <tgz>` reads) into
 //   <MINIONS_HOME>/manager/cli-backup/minions-<version>-<UTC stamp>.tgz (0600, directory 0700). The last 2 are kept.
+//   No npm runs for the backup: `npm pack <dir>` runs the package's `prepare` script for a directory even with
+//   --ignore-scripts (npm 10.9: pacote's directory fetcher always prepares), and scripts/prepare.mjs is not shipped,
+//   so that always failed. The archive keeps every file byte for byte (also the build fingerprint inputs); only
+//   regular files and directories go in (symlinks and a top-level node_modules are left out, as npm pack does).
 //   A backup that cannot be made stops the reinstall: nothing is installed then.
-// - After an upgrade that rebuilt or reinstalled the CLI, the host manager checks the new CLI with `minions --version`
-//   and `minions --json status` in fresh processes. If either fails it offers "Roll back CLI": an owner request of
-//   kind cli-rollback whose plan names the newest backup and its sha256. Only the owner's Confirm runs
-//   `npm install -g <backup>` (refused if the file changed since the plan), and the check runs once more.
-// - Nothing here runs a second strategy on its own: a failed rollback is reported, never retried.
-import { lstat, mkdtemp, readdir, rm } from 'node:fs/promises';
+// - Rolling back is `npm install -g <backup>` (scripts/dev/self-update.mjs does it after a failed health check).
+import { createWriteStream } from 'node:fs';
+import { lstat, mkdtemp, readdir, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import { createGzip } from 'node:zlib';
 import { displayText } from '../core/control-chars.js';
 import { MinionsError } from '../core/errors.js';
-import { run, type RunResult } from '../core/exec.js';
-import { copyRegularFileNoFollow, ensureRealDir, sha256File } from '../core/fsutil.js';
+import { copyRegularFileNoFollow, ensureRealDir } from '../core/fsutil.js';
 import { managerDir } from '../core/paths.js';
-import type { Runner } from './docker.js';
 
 export const CLI_BACKUP_KEEP = 2;
 export const cliBackupDir = () => join(managerDir(), 'cli-backup');
 /** minions-<version>-<YYYYMMDDTHHMMSSmmmZ>.tgz: the only names the backup directory is read for. */
 export const CLI_BACKUP_NAME = /^minions-([0-9A-Za-z][0-9A-Za-z.+-]{0,63})-(\d{8}T\d{9}Z)\.tgz$/;
 const SAFE_VERSION = /^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/;
-const NPM_TIMEOUT_MS = 1_800_000;
 
 export interface CliBackup { name: string; file: string; version: string; stamp: string }
 
 const stampOf = (d: Date) => d.toISOString().replace(/[-:.]/g, '');
-const tail = (r: RunResult) => displayText((r.stderr || r.stdout).trim().split('\n').slice(-3).join(' ')).slice(0, 300);
 
 /** The backups, oldest first (by the stamp in the name). Files with other names are ignored. */
 export async function listCliBackups(): Promise<CliBackup[]> {
@@ -42,87 +42,101 @@ export async function listCliBackups(): Promise<CliBackup[]> {
   return out.sort((a, b) => (a.stamp < b.stamp ? -1 : a.stamp > b.stamp ? 1 : a.name.localeCompare(b.name)));
 }
 
-/** The backup with this name, as a regular file in the backup directory (never a symlink); null when there is none. */
-export async function findCliBackup(name: string): Promise<CliBackup | null> {
-  const m = CLI_BACKUP_NAME.exec(name);
-  if (!m) return null;
-  const file = join(cliBackupDir(), name);
-  try {
-    const st = await lstat(file);
-    if (!st.isFile()) return null;
-  } catch { return null; }
-  return { name, file, version: m[1]!, stamp: m[2]! };
-}
-
 async function prune(): Promise<void> {
   const all = await listCliBackups();
   for (const b of all.slice(0, Math.max(0, all.length - CLI_BACKUP_KEEP))) await rm(b.file, { force: true });
 }
 
+const zeros = (n: number) => Buffer.alloc(n);
+const pad = (size: number) => zeros((512 - (size % 512)) % 512);
+type TarType = '0' | '5' | 'x';
+
+/** One 512-byte ustar header; `name` must fit the 100-byte field (tarEntry adds a pax path record otherwise). */
+function tarHeader(name: string, o: { size: number; mode: number; mtimeMs: number; type: TarType }): Buffer {
+  const h = zeros(512);
+  const oct = (v: number, at: number, len: number) => { h.write(v.toString(8).padStart(len - 1, '0'), at, len - 1, 'ascii'); };
+  h.write(name, 0, 100, 'utf8');
+  oct(o.mode & 0o7777, 100, 8);
+  oct(0, 108, 8); // uid
+  oct(0, 116, 8); // gid
+  oct(o.size, 124, 12);
+  oct(Math.max(0, Math.floor(o.mtimeMs / 1000)), 136, 12);
+  h.fill(0x20, 148, 156); // the checksum counts as spaces while it is summed
+  h.write(o.type, 156, 1, 'ascii');
+  h.write('ustar\0', 257, 6, 'ascii');
+  h.write('00', 263, 2, 'ascii');
+  let sum = 0;
+  for (const b of h) sum += b;
+  h.write(`${sum.toString(8).padStart(6, '0')}\0 `, 148, 8, 'ascii');
+  return h;
+}
+
+/** The blocks of one member: a pax `path` record first when the name does not fit the 100-byte field. */
+function tarEntry(name: string, o: { size: number; mode: number; mtimeMs: number; type: '0' | '5' }): Buffer[] {
+  const out: Buffer[] = [];
+  if (Buffer.byteLength(name) >= 100) {
+    const body = (n: number) => `${n} path=${name}\n`;
+    let len = Buffer.byteLength(body(0));
+    while (Buffer.byteLength(body(len)) !== len) len = Buffer.byteLength(body(len));
+    const rec = Buffer.from(body(len));
+    out.push(tarHeader('PaxHeader', { size: rec.length, mode: 0o644, mtimeMs: o.mtimeMs, type: 'x' }), rec, pad(rec.length));
+    name = Buffer.from(name).subarray(0, 99).toString('latin1');
+  }
+  out.push(tarHeader(name, o));
+  return out;
+}
+
+/** The tar stream of `root` under `package/`: directories and regular files in sorted order, then the end blocks. */
+async function* tarOf(root: string, skipped: string[]): AsyncGenerator<Buffer> {
+  async function* walk(dir: string, rel: string): AsyncGenerator<Buffer> {
+    for (const n of (await readdir(dir)).sort()) {
+      const relName = rel ? `${rel}/${n}` : n;
+      if (!rel && n === 'node_modules') { skipped.push(relName); continue; }
+      const abs = join(dir, n);
+      const st = await lstat(abs);
+      if (st.isDirectory()) {
+        yield* tarEntry(`package/${relName}/`, { size: 0, mode: st.mode, mtimeMs: st.mtimeMs, type: '5' });
+        yield* walk(abs, relName);
+      } else if (st.isFile()) {
+        const data = await readFile(abs);
+        yield* tarEntry(`package/${relName}`, { size: data.length, mode: st.mode, mtimeMs: st.mtimeMs, type: '0' });
+        yield data;
+        yield pad(data.length);
+      } else skipped.push(relName);
+    }
+  }
+  const st = await lstat(root);
+  yield* tarEntry('package/', { size: 0, mode: st.mode, mtimeMs: st.mtimeMs, type: '5' });
+  yield* walk(root, '');
+  yield zeros(1024);
+}
+
 /**
- * Packs the global install at `installDir` (`npm pack <dir> --ignore-scripts` in a temp directory) and keeps the
- * tarball in the backup directory (last 2). Throws when no tarball comes out: the caller must not install then.
+ * Archives the global install at `installDir` (a gzipped tar under `package/`, written in a temp directory; no npm
+ * and none of the package's scripts run) and keeps it in the backup directory (last 2). Throws when the directory is
+ * not a package or the archive cannot be written: the caller must not install then.
  */
-export async function backupInstalledCli(installDir: string, version: string | null, o: { runner?: Runner; env?: NodeJS.ProcessEnv; now?: Date; log?: (m: string) => void } = {}): Promise<CliBackup> {
-  const runner = o.runner ?? run;
+export async function backupInstalledCli(installDir: string, version: string | null, o: { now?: Date; log?: (m: string) => void } = {}): Promise<CliBackup> {
   const tmp = await mkdtemp(join(tmpdir(), 'minions-cli-backup-'));
   try {
-    o.log?.(`cli: backing up the current CLI (npm pack ${installDir})`);
-    const r = await runner('npm', ['pack', installDir, '--pack-destination', tmp, '--ignore-scripts'], { cwd: tmp, env: o.env, allowFailure: true, timeoutMs: NPM_TIMEOUT_MS });
-    if (r.code !== 0) throw new MinionsError('INTERNAL', `npm pack of the current CLI failed: ${tail(r)}`);
-    const tgz = (await readdir(tmp)).filter((n) => n.endsWith('.tgz'));
-    if (tgz.length !== 1) throw new MinionsError('INTERNAL', `npm pack of the current CLI produced ${tgz.length} tarballs, expected 1.`);
+    o.log?.(`cli: backing up the current CLI (archiving ${installDir})`);
+    const root = await lstat(installDir).catch(() => null);
+    if (!root?.isDirectory()) throw new MinionsError('INTERNAL', `the current CLI at ${displayText(installDir)} is not a directory.`);
+    const pkg = await lstat(join(installDir, 'package.json')).catch(() => null);
+    if (!pkg?.isFile()) throw new MinionsError('INTERNAL', `the current CLI at ${displayText(installDir)} has no package.json.`);
+    const tgz = join(tmp, 'backup.tgz');
+    const skipped: string[] = [];
+    try {
+      await pipeline(Readable.from(tarOf(installDir, skipped)), createGzip(), createWriteStream(tgz, { mode: 0o600 }));
+    } catch (e) { throw new MinionsError('INTERNAL', `archiving the current CLI failed: ${displayText((e as Error).message).slice(0, 300)}`); }
+    if (skipped.length) o.log?.(`cli: left out of the backup (node_modules, or not a regular file or directory): ${skipped.slice(0, 5).map((n) => displayText(n)).join(', ')}${skipped.length > 5 ? ', ...' : ''}`);
     const dir = cliBackupDir();
     await ensureRealDir(dir, 0o700);
     const v = version && SAFE_VERSION.test(version) ? version : 'unknown';
     const name = `minions-${v}-${stampOf(o.now ?? new Date())}.tgz`;
-    await copyRegularFileNoFollow(join(tmp, tgz[0]!), join(dir, name), 0o600);
+    await copyRegularFileNoFollow(tgz, join(dir, name), 0o600);
     await prune();
     o.log?.(`cli: kept the current CLI as ${join(dir, name)}`);
     return { name, file: join(dir, name), version: v, stamp: CLI_BACKUP_NAME.exec(name)![2]! };
   } finally { await rm(tmp, { recursive: true, force: true }); }
-}
-
-export interface CliHealth { ok: boolean; detail: string }
-
-/**
- * Checks the host CLI in fresh processes: `minions --version` (exit 0, a version line) and `minions --json status`
- * (an ok envelope). `cli(argv)` runs the host CLI with exactly these arguments.
- */
-export async function checkCliHealth(cli: (argv: string[]) => Promise<RunResult>): Promise<CliHealth> {
-  const problems: string[] = [];
-  let version = '';
-  try {
-    const v = await cli(['--version']);
-    version = v.stdout.trim().split('\n').at(-1)?.trim() ?? '';
-    if (v.code !== 0 || !/^\d+\.\d+\.\d+/.test(version)) problems.push(`\`minions --version\` failed (exit ${v.code})${tail(v) ? `: ${tail(v)}` : ''}`);
-  } catch (e) { problems.push(`\`minions --version\` failed: ${displayText((e as Error).message).slice(0, 300)}`); }
-  try {
-    const s = await cli(['--json', 'status']);
-    let env: { ok?: unknown; error?: { message?: unknown } } | null = null;
-    try { env = JSON.parse(s.stdout.trim().split('\n').filter(Boolean).at(-1) ?? ''); } catch { env = null; }
-    if (!env || env.ok !== true) {
-      problems.push(`\`minions status\` failed (exit ${s.code})${env?.error?.message ? `: ${displayText(String(env.error.message)).slice(0, 300)}` : tail(s) ? `: ${tail(s)}` : ''}`);
-    }
-  } catch (e) { problems.push(`\`minions status\` failed: ${displayText((e as Error).message).slice(0, 300)}`); }
-  return problems.length ? { ok: false, detail: problems.join('; ') } : { ok: true, detail: `minions ${displayText(version)} answers --version and status` };
-}
-
-/**
- * Reinstalls a backup: refused (nothing installed) unless the file still has `expectSha256`. Then
- * `npm install -g --no-audit --no-fund <backup>` from the backup directory.
- */
-export async function installCliBackup(name: string, expectSha256: string, o: { runner?: Runner; log?: (m: string) => void } = {}): Promise<string> {
-  const b = await findCliBackup(name);
-  if (!b) throw new MinionsError('PRECONDITION', `The CLI backup ${displayText(name)} is gone; nothing was installed.`);
-  const sha = await sha256File(b.file);
-  if (sha !== expectSha256) {
-    throw new MinionsError('CONFLICT', `The CLI backup ${b.name} changed since the plan was shown (sha256 ${sha.slice(0, 12)}, expected ${expectSha256.slice(0, 12)}); nothing was installed.`, undefined, { refusal: 'backup' });
-  }
-  const env: NodeJS.ProcessEnv = { ...process.env };
-  delete env.MINIONS_BUILD_KIND;
-  o.log?.(`cli: npm install -g ${b.file}`);
-  const r = await (o.runner ?? run)('npm', ['install', '-g', '--no-audit', '--no-fund', b.file], { cwd: cliBackupDir(), env, allowFailure: true, timeoutMs: NPM_TIMEOUT_MS });
-  if (r.code !== 0) throw new MinionsError('INTERNAL', `npm install -g of the backup failed: ${tail(r)}`);
-  return `reinstalled minions ${b.version} from ${b.file}`;
 }

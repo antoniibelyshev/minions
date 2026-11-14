@@ -2,7 +2,6 @@
 // populated database, dedup across connections, backoff boundaries and pending ordering, best-effort
 // `work cancel` never deleting worktrees or branches, controls not firing on ordinary sentences, and
 // credential masking of stored send errors.
-import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
@@ -11,8 +10,7 @@ import {
   type NotificationTransport, type OutboxItem,
 } from '../../src/runtime/outbox.js';
 import { cancelWork, formatCancel, matchControl } from '../../src/runtime/controls.js';
-import { git } from '../../src/runtime/worktree.js';
-import { makeEnv, tmp } from './fixtures.js';
+import { makeUnitEnv, tmp } from './fixtures.js';
 
 const dbPath = () => join(tmp('minions-outbox-edge-'), 'state', 'minions.db');
 
@@ -157,29 +155,10 @@ describe('controls do not fire on ordinary sentences', () => {
   });
 });
 
+// The claim-and-release half (worktree and branch kept) needs a real repository: see controls.test.ts (integration).
 describe('minions work cancel never deletes worktrees or branches', () => {
-  it('keeps the worktree directory and branch after releasing; unknown and idle ids are reported, not errors', async () => {
-    const env = makeEnv();
-    env.backlog.add({ id: 'task-1', title: 'One' });
-    const brief = await env.sched.claim('task-1', 'engineer');
-    expect(existsSync(brief.worktree)).toBe(true);
-
-    const r = await cancelWork({ db: env.db, release: (id, why) => env.sched.release(id, why), backlog: env.backlog }, { taskIds: ['TASK-1', 'task-404'] }, 'owner cancelled');
-    expect(r.released.map((x) => x.leaseId)).toEqual([brief.leaseId]);
-    expect(r.idle).toEqual(['task-404']);
-    expect(existsSync(brief.worktree)).toBe(true);
-    expect((await git(env.layout.repo, ['rev-parse', '--verify', '--quiet', `refs/heads/${brief.branch}`], true)).code).toBe(0);
-    expect(formatCancel(r)).toContain('worktrees kept');
-
-    // Repeating the cancel is a harmless no-op.
-    const again = await cancelWork({ db: env.db, release: (id, why) => env.sched.release(id, why), backlog: env.backlog }, { taskIds: ['task-1'] }, 'again');
-    expect(again).toEqual({ released: [], failed: [], blocked: [], blockFailed: [], idle: ['task-1'] });
-    expect(formatCancel(again)).toBe('no active leases released\nno active lease: task-1');
-    expect(existsSync(brief.worktree)).toBe(true);
-  });
-
   it('--all with no active leases releases nothing and reports no idle ids', async () => {
-    const env = makeEnv();
+    const env = makeUnitEnv();
     const r = await cancelWork({ db: env.db, release: async () => { throw new Error('must not be called'); }, backlog: env.backlog }, { taskIds: [], all: true }, 'x');
     expect(r).toEqual({ released: [], failed: [], blocked: [], blockFailed: [], idle: [] });
   });

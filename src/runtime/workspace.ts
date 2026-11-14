@@ -3,7 +3,6 @@ import type { MinionsConfig } from '../config/schema.js';
 import { MinionsError } from '../core/errors.js';
 import { ensureDir, exists } from '../core/fsutil.js';
 import { openDb } from './db.js';
-import { configureOrigin, type OriginResult } from './github.js';
 import type { RuntimePaths } from './paths.js';
 import { BRANCH_PREFIX, git, workspaceLayout, type WorkspaceLayout } from './worktree.js';
 
@@ -11,8 +10,6 @@ const validBranch = (b: string) => /^[A-Za-z0-9._/-]+$/.test(b) && !b.startsWith
 
 export interface ImportResult {
   head: string; base: string; imported: boolean; baseFastForwarded: boolean; repo: string; hostRefs: string[];
-  /** Present only when a GitHub token file is mounted (readable or not); absent = unchanged v0.1 behaviour. */
-  origin?: OriginResult;
 }
 
 /**
@@ -20,11 +17,8 @@ export interface ImportResult {
  * Existing repo: fetch into refs/remotes/host/*; the local base branch is only fast-forwarded (so new
  * agent branches start from the refreshed base) and never rewritten — a diverged base is left alone.
  * `imported` is true when the repo was cloned, false when an existing clone was refreshed.
- * `baseFrom: 'origin'` (GitHub delivery): the host refs are still fetched, but the local base is never
- * moved to the host's base: origin/<base> is the single source of truth and every claim fast-forwards
- * the base from it (./base-sync.ts).
  */
-export async function importWorkspace(bundlePath: string, opts: { base: string; remoteUrl?: string; config: Pick<MinionsConfig, 'git'>; layout?: WorkspaceLayout; tokenFile?: string; baseFrom?: 'host' | 'origin' }): Promise<ImportResult> {
+export async function importWorkspace(bundlePath: string, opts: { base: string; config: Pick<MinionsConfig, 'git'>; layout?: WorkspaceLayout }): Promise<ImportResult> {
   const layout = opts.layout ?? workspaceLayout();
   const bundle = resolvePath(bundlePath);
   if (!validBranch(opts.base)) throw new MinionsError('PRECONDITION', `Invalid base branch name "${opts.base}".`);
@@ -45,17 +39,14 @@ export async function importWorkspace(bundlePath: string, opts: { base: string; 
     const inside = await git(repo, ['rev-parse', '--is-inside-work-tree'], true);
     if (inside.code !== 0) throw new MinionsError('PRECONDITION', `${repo} exists but is not a git repository.`, 'Inspect the workspace volume manually.');
     await git(repo, ['fetch', '--no-tags', bundle, '+refs/heads/*:refs/remotes/host/*']);
-    if (opts.baseFrom !== 'origin') baseFastForwarded = await fastForwardBase(repo, opts.base);
+    baseFastForwarded = await fastForwardBase(repo, opts.base);
   }
   const id = opts.config.git.identity;
   await git(repo, ['config', 'user.name', id.name]);
   await git(repo, ['config', 'user.email', id.email]);
-  // Without a mounted GitHub token the URL is recorded verbatim and never fetched (unchanged v0.1
-  // behaviour); with one, origin becomes the https URL backed by the credential helper.
-  const origin = await configureOrigin(repo, { remoteUrl: opts.remoteUrl, base: opts.base, tokenFile: opts.tokenFile });
   const head = (await git(repo, ['rev-parse', 'HEAD'])).stdout.trim();
   const hostRefs = (await git(repo, ['for-each-ref', '--format=%(refname)', 'refs/remotes/host/'])).stdout.split('\n').filter(Boolean);
-  return { head, base: opts.base, imported, baseFastForwarded, repo, hostRefs, ...(origin ? { origin } : {}) };
+  return { head, base: opts.base, imported, baseFastForwarded, repo, hostRefs };
 }
 
 /** Fast-forwards the local base branch to refs/remotes/host/<base> when that is a pure fast-forward. */
@@ -85,6 +76,25 @@ export async function exportWorkspace(outPath: string, opts: { base: string; lay
   await ensureDir(dirname(path));
   await git(repo, ['bundle', 'create', path, ...refs]);
   return { path, refs };
+}
+
+/** A delivered or landed task and its agent branch, for `minions pull` (docs/design/autonomy.md Decision 13). */
+export interface TaskBranch { taskId: string; branch: string; status: 'delivered' | 'done' }
+
+/**
+ * The delivered/done tasks whose agent branch is among the exported refs: each task's latest lease branch (DB) and its
+ * backlog status. `statusOf` returning null (unknown task) skips it.
+ */
+export async function deliveredTaskBranches(leases: readonly { task_id: string; branch: string | null; started_at: string }[], exported: readonly string[], statusOf: (taskId: string) => Promise<string | null>): Promise<TaskBranch[]> {
+  const latest = new Map<string, string>();
+  for (const l of [...leases].sort((a, b) => a.started_at.localeCompare(b.started_at))) if (l.branch) latest.set(l.task_id, l.branch);
+  const out: TaskBranch[] = [];
+  for (const [taskId, branch] of latest) {
+    if (!exported.includes(`refs/heads/${branch}`)) continue;
+    const status = await statusOf(taskId).catch(() => null);
+    if (status === 'delivered' || status === 'done') out.push({ taskId, branch, status });
+  }
+  return out.sort((a, b) => a.taskId.localeCompare(b.taskId, undefined, { numeric: true }));
 }
 
 /** Idempotent: creates the /state layout, the runtime DB and the Backlog.md config. */

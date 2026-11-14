@@ -38,7 +38,7 @@ const nullable = (t: 'string' | 'boolean' | 'integer') => ({ type: [t, 'null'] }
 /**
  * The WorkerResult as a strict-mode JSON Schema for `codex exec --output-schema`, per contract variant. A subset
  * of WorkerResultSchema: findings are plain strings, no `usage` (the runner records usage from the JSONL events),
- * and only a gate has `verdict` / `needsQa`. Length and SHA rules stay with validateResult at record time.
+ * and only a gate has `verdict`. Length and SHA rules stay with validateResult at record time.
  */
 export function codexOutputSchema(contract: RoleContract): Record<string, unknown> {
   const check = {
@@ -62,13 +62,12 @@ export function codexOutputSchema(contract: RoleContract): Record<string, unknow
   };
   if (contract === 'gate') {
     properties.verdict = { type: ['string', 'null'], enum: ['approve', 'request-changes', null] };
-    properties.needsQa = nullable('boolean');
   }
   return { type: 'object', additionalProperties: false, properties, required: Object.keys(properties) };
 }
 
 /** Optional WorkerResult fields that strict mode forces to be present: a null there means "absent". */
-const OPTIONAL_TOP = ['verdict', 'needsQa', 'usage'] as const;
+const OPTIONAL_TOP = ['verdict', 'usage'] as const;
 const OPTIONAL_CHECK = ['details', 'source'] as const;
 
 /**
@@ -157,8 +156,9 @@ export function codexPrompt(input: LaunchInput): string {
     `Your checkout: ${input.checkout}. Brief: ${input.briefFile}. Result file: ${input.resultFile}.`,
     'Nobody answers questions or approves actions during this run. Do not use the network except for the model.',
     ...(guide ? [guide] : []),
-    'On Codex your final message is your result: make it exactly one WorkerResult JSON object (it is checked against',
-    'a JSON schema; use null for optional fields that do not apply). The runner stores it; you need not write the result file.',
+    'On Codex your final message is your result: make it your WorkerResult as a single JSON object (it is checked against',
+    'a JSON schema; use null for optional fields that do not apply). Writing the same object to $MINIONS_RESULT_FILE is',
+    'optional; a result file wins over the final message, so write it only with the complete result.',
     '',
     input.instructions,
   ].join('\n');

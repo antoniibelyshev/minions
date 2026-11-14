@@ -37,7 +37,7 @@ describe('coordinator startup trim: tools', () => {
   });
 
   it('passes the default list as one --disallowedTools value before --settings', async () => {
-    const { args } = await buildClaudeCommand(defaults(), paths(), { telegram: true, startupPrompt: 'go' });
+    const { args } = await buildClaudeCommand(defaults(), paths(), { telegram: true, channelServer: { command: 'minions', launchId: 'l', tokenFile: '/t', stateDir: '/s' }, startupPrompt: 'go' });
     expect(valueOf(args, '--disallowedTools')!.split(',')).toEqual([...COORDINATOR_DISALLOWED_TOOLS]);
     expect(args.indexOf('--disallowedTools')).toBeLessThan(args.indexOf('--settings'));
     expect(args.slice(-2)).toEqual(['--', 'go']);
@@ -87,7 +87,7 @@ describe('coordinator startup trim: settings', () => {
 
 describe('coordinator startup trim: argv and merge with contextReset', () => {
   it('passes --disallowedTools exactly once, as one shell-safe argument', async () => {
-    const { args } = await buildClaudeCommand(defaults(), paths(), { telegram: true, startupPrompt: 'go' });
+    const { args } = await buildClaudeCommand(defaults(), paths(), { telegram: true, channelServer: { command: 'minions', launchId: 'l', tokenFile: '/t', stateDir: '/s' }, startupPrompt: 'go' });
     expect(args.filter((a) => a === '--disallowedTools')).toHaveLength(1);
     expect(valueOf(args, '--disallowedTools')).toMatch(/^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$/);
   });

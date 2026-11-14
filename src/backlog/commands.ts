@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import type { Command } from 'commander';
+import { dependencyDoneStatuses } from '../config/delivery.js';
 import { validateConfig } from '../config/resolve.js';
 import { workflowNames } from '../config/workflows.js';
 import type { MinionsConfig } from '../config/schema.js';
@@ -8,10 +9,13 @@ import { MinionsError } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { emit } from '../core/output.js';
 import { containerPaths } from '../core/paths.js';
-import { TASK_STATUSES, type ProvenanceFallback } from './backlogmd.js';
+import { TASK_STATUSES } from './backlogmd.js';
 import { MemoryIdempotencyStore, openBacklog } from './factory.js';
 import { assertIntakeOpen } from './intake.js';
 import type { BacklogAdapter, IdempotencyStore, Provenance, ScopeFilter, Task, TaskStatus } from './types.js';
+import { withControl } from '../runtime/control.js';
+import { runtimePaths } from '../runtime/paths.js';
+import { GOAL_STATUSES, goalsView, readGoalsState, readGoalsText, runtimeGoalsPath, writeGoalsState, type GoalStatus, type GoalsView } from '../runtime/goals.js';
 
 // ---------------------------------------------------------------- hooks set by the runtime
 
@@ -19,7 +23,6 @@ export interface ReadyHookState { leased: Set<string>; paused: boolean }
 let readyContext: () => ReadyHookState | Promise<ReadyHookState> = () => ({ leased: new Set(), paused: false });
 let idempotencyStore: IdempotencyStore = new MemoryIdempotencyStore();
 let intakePaused: () => boolean | Promise<boolean> = () => false;
-let provenanceFallback: ProvenanceFallback | undefined;
 
 /** Runtime installs this at startup: active-lease task ids and paused_starts from the DB. */
 export function setReadyContext(fn: () => ReadyHookState | Promise<ReadyHookState>): void { readyContext = fn; }
@@ -27,19 +30,18 @@ export function setReadyContext(fn: () => ReadyHookState | Promise<ReadyHookStat
 export function setIdempotencyStore(store: IdempotencyStore): void { idempotencyStore = store; }
 /** Runtime installs this at startup: paused_intake from the DB (`backlog create` refuses new intake while set). */
 export function setIntakePausedContext(fn: () => boolean | Promise<boolean>): void { intakePaused = fn; }
-/** Runtime installs this at startup: intake-tracked tasks without a usable meta provenance read as external-requirement. */
-export function setProvenanceFallback(fn: ProvenanceFallback | undefined): void { provenanceFallback = fn; }
+
 
 // ---------------------------------------------------------------- config + adapter
 
-/** Reads the effective config: env MINIONS_CONFIG, default /opt/minions/config/config.json. */
+/** Reads the effective config: env MINIONS_CONFIG, default /opt/minions/config/config.json, plus the control overlay. */
 export async function loadRuntimeConfig(path = process.env.MINIONS_CONFIG || containerPaths().configJson): Promise<MinionsConfig> {
-  return validateConfig(await readJson(path), path);
+  return withControl(validateConfig(await readJson(path), path), runtimePaths().state);
 }
 
 async function open(): Promise<{ cfg: MinionsConfig; backlog: BacklogAdapter }> {
   const cfg = await loadRuntimeConfig();
-  return { cfg, backlog: openBacklog(cfg, { idempotency: idempotencyStore, provenanceFallback }) };
+  return { cfg, backlog: openBacklog(cfg, { idempotency: idempotencyStore }) };
 }
 
 export const scopeOf = (cfg: MinionsConfig): ScopeFilter => ({
@@ -63,6 +65,7 @@ function oneOf<T extends string>(name: string, v: string | undefined, allowed: r
 }
 
 const collect = (v: string, prev: string[] = []) => [...prev, v];
+const OWNER_APPROVED_HELP = 'no-op, accepted for compatibility (there are no auto-promotion caps any more)';
 
 /**
  * --workflow: a named workflow from config (docs/design/roles-and-workflows.md D5). Only configured names
@@ -94,7 +97,24 @@ function detail(t: Task): string {
     `branch: ${t.branch ?? '-'}  provenance: ${t.provenance}  workflow: ${t.workflow ?? 'default'}`, `version: ${t.version}`];
   if (t.description) out.push('', t.description);
   if (t.acceptanceCriteria.length) out.push('', ...t.acceptanceCriteria.map((a, i) => `[${a.done ? 'x' : ' '}] #${i + 1} ${a.text}`));
+  if (t.notes) out.push('', 'notes:', t.notes);
   return out.join('\n');
+}
+
+/** The goals view for `backlog goals`: the runtime's goals copy, the marks, and the backlog for the retrospective check. */
+async function loadGoals(tasks?: Task[] | null): Promise<GoalsView & { path: string }> {
+  const paths = runtimePaths();
+  const path = runtimeGoalsPath(paths.configJson);
+  const text = readGoalsText(path);
+  return { path, ...goalsView(text, readGoalsState(paths.state), tasks ?? (text === null ? null : await (await open()).backlog.listTasks())) };
+}
+
+function humanGoalsList(v: GoalsView): string {
+  if (!v.present) return 'No goals file (the owner writes goals.md next to the project config; `minions start` copies it in).';
+  const out = v.goals.map((g) => `${g.id.padEnd(24)} ${g.status.padEnd(7)}${g.mark ? ' (marked)' : '         '} ${g.title}${g.measure ? `\n${' '.repeat(34)}measure: ${g.measure}` : ''}`);
+  if (v.exhausted) out.push(`planning found nothing worthwhile left at ${v.exhausted.at}: ${v.exhausted.reason}`);
+  if (v.retro) out.push(`retrospective: ${v.retro.due ? 'due' : 'not due'} (${v.retro.doneSince} task(s) done${v.retro.goalsDoneSince ? `, ${v.retro.goalsDoneSince} goal(s) done` : ''} since ${v.retro.last?.at ?? 'the start'})`);
+  return out.join('\n') || '(no goals)';
 }
 
 // ---------------------------------------------------------------- compact listing
@@ -102,7 +122,7 @@ function detail(t: Task): string {
 /** Fields `--compact` keeps for `backlog list|ready` (coordinator reads without full descriptions). */
 export const COMPACT_FIELDS = ['id', 'title', 'status', 'priority', 'dependencies'] as const;
 export const TASK_FIELDS: readonly (keyof Task)[] = ['id', 'locator', 'title', 'description', 'acceptanceCriteria', 'status', 'priority',
-  'dependencies', 'parent', 'externalLinks', 'labels', 'authorized', 'branch', 'commits', 'prUrl', 'provenance', 'version', 'milestone', 'workflow'];
+  'dependencies', 'parent', 'externalLinks', 'labels', 'authorized', 'branch', 'commits', 'provenance', 'version', 'milestone', 'workflow'];
 
 /** Resolves `--fields a,b` / `--compact` into a field list (undefined = full tasks). Unknown fields are an error. */
 export function selectFields(o: { fields?: string; compact?: boolean }): (keyof Task)[] | undefined {
@@ -142,7 +162,7 @@ export function register(program: Command): void {
       const fields = selectFields(opts);
       const { cfg, backlog } = await open();
       const ctx = await readyContext();
-      const tasks = ctx.paused ? [] : await backlog.listReady(limit, ctx.leased, scopeOf(cfg));
+      const tasks = ctx.paused ? [] : await backlog.listReady(limit, ctx.leased, scopeOf(cfg), dependencyDoneStatuses(cfg));
       emit({ paused: ctx.paused, tasks: projectTasks(tasks, fields) }, { json: globalOpts(cmd).json, human: (d) => (d.paused ? 'Starts are paused.\n' : '') + lines(tasks) });
     }));
 
@@ -157,7 +177,7 @@ export function register(program: Command): void {
       emit({ tasks: projectTasks(tasks, fields) }, { json: globalOpts(cmd).json, human: () => lines(tasks) });
     }));
 
-  bl.command('show <id>').description('Show one task')
+  bl.command('show <id>').description('Show one task, with its notes (the most recent ~8 KB)')
     .action(action(async (id: string, _opts: unknown, cmd: Command) => {
       requireMode('runtime');
       const { backlog } = await open();
@@ -176,6 +196,7 @@ export function register(program: Command): void {
     .option('--status <status>', 'initial status (default idea)')
     .option('--provenance <p>', PROVENANCES.join(' | '))
     .option('--workflow <name>', 'named workflow from config (default: the default workflow)')
+    .option('--owner-approved', OWNER_APPROVED_HELP)
     .requiredOption('--key <idempotencyKey>', 'idempotency key; repeating it returns the existing task')
     .action(action(async (o: { title: string; description?: string; descriptionFile?: string; ac?: string[]; priority?: string;
       dep?: string[]; parent?: string; label?: string[]; status?: string; provenance?: string; workflow?: string; key: string }, cmd: Command) => {
@@ -189,7 +210,8 @@ export function register(program: Command): void {
       };
       assertIntakeOpen(input, await intakePaused());
       const { cfg, backlog } = await open();
-      const r = await backlog.createTask({ ...input, ...(o.workflow !== undefined ? { workflow: checkWorkflowName(cfg, o.workflow) } : {}) });
+      const workflow = o.workflow !== undefined ? { workflow: checkWorkflowName(cfg, o.workflow) } : {};
+      const r = await backlog.createTask({ ...input, ...workflow });
       emit(r, { json: globalOpts(cmd).json, human: (d) => `${d.created ? 'Created' : 'Exists'} ${d.task.id}: ${d.task.title}` });
     }));
 
@@ -202,6 +224,7 @@ export function register(program: Command): void {
     .option('--description-file <file>', 'replace the description from a file ("-" = stdin)')
     .option('--branch <branch>', 'record the task branch')
     .option('--workflow <name>', 'assign a named workflow from config (only between stages)')
+    .option('--owner-approved', OWNER_APPROVED_HELP)
     .action(action(async (id: string, o: { expectedVersion: string; status?: string; title?: string; priority?: string;
       label?: string[]; descriptionFile?: string; branch?: string; workflow?: string }, cmd: Command) => {
       requireMode('runtime');
@@ -235,6 +258,48 @@ export function register(program: Command): void {
       const { backlog } = await open();
       await backlog.addNote(id, text);
       emit({ id, noted: true }, { json: globalOpts(cmd).json, human: () => `Noted ${id}` });
+    }));
+
+  // Standing goals (docs/design/autonomy.md Decision 16): the owner writes them, the coordinator marks them.
+  const goals = bl.command('goals').description('The owner\'s standing goals (goals.md next to the project config, copied in by the host) with your marks, and whether a retrospective is due')
+    .action(action(async (_opts: unknown, cmd: Command) => {
+      requireMode('runtime');
+      const v = await loadGoals();
+      emit(v, { json: globalOpts(cmd).json, human: humanGoalsList });
+    }));
+  goals.command('set <id> <status>').description(`Mark a goal ${GOAL_STATUSES.join(' | ')} (the owner's own Status line wins once they change it)`)
+    .requiredOption('--reason <text>', 'why (e.g. the measurement that meets the goal)')
+    .action(action(async (id: string, status: string, o: { reason: string }, cmd: Command) => {
+      requireMode('runtime');
+      const st = oneOf<GoalStatus>('status', status, GOAL_STATUSES)!;
+      const v = await loadGoals();
+      const g = v.goals.find((x) => x.id === id);
+      if (!g) throw new MinionsError('NOT_FOUND', `No goal "${id}"${v.present ? '' : ' (no goals file)'}.`, `Goals: ${v.goals.map((x) => x.id).join(', ') || 'none'}.`);
+      const state = readGoalsState(runtimePaths().state);
+      const at = new Date().toISOString();
+      if (st === g.fileStatus) delete state.marks[id]; else state.marks[id] = { status: st, fileStatus: g.fileStatus, at, reason: o.reason.slice(0, 500) };
+      state.log.push({ at, what: `set ${st}`, id, reason: o.reason.slice(0, 500) });
+      await writeGoalsState(runtimePaths().state, state);
+      emit({ id, status: st, fileStatus: g.fileStatus }, { json: globalOpts(cmd).json, human: () => `Goal ${id}: ${st}${st !== g.fileStatus ? ` (the goals file says ${g.fileStatus}; tell the owner)` : ''}` });
+    }));
+  goals.command('record <what>').description('Record `idle` (planning found nothing worthwhile left: no planning wake until the goals change) or `retro` (a retrospective ran)')
+    .requiredOption('--reason <text>', 'idle: why nothing is left; retro: a one-line summary')
+    .action(action(async (what: string, o: { reason: string }, cmd: Command) => {
+      requireMode('runtime');
+      const kind = oneOf('record', what, ['idle', 'retro'] as const)!;
+      const { backlog } = await open();
+      const tasks = kind === 'retro' ? await backlog.listTasks() : null;
+      const v = await loadGoals(tasks);
+      const state = readGoalsState(runtimePaths().state);
+      const at = new Date().toISOString();
+      const reason = o.reason.slice(0, 500);
+      if (kind === 'idle') {
+        if (!v.hash) throw new MinionsError('PRECONDITION', 'There is no goals file: nothing to plan for.', 'The owner adds goals.md next to the project config and runs `minions start`.');
+        state.exhausted = { hash: v.hash, at, reason };
+      } else state.retro = { at, done: tasks!.filter((t) => t.status === 'done').length, summary: reason };
+      state.log.push({ at, what: `record ${kind}`, reason });
+      await writeGoalsState(runtimePaths().state, state);
+      emit({ recorded: kind, at }, { json: globalOpts(cmd).json, human: () => (kind === 'idle' ? 'Recorded: nothing worthwhile left; no planning wake until the goals change.' : 'Recorded the retrospective.') });
     }));
 
   bl.command('export').description('Export all tasks as JSON')

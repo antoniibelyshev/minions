@@ -14,6 +14,7 @@ import { readRunRecord } from '../../src/runtime/runner/record.js';
 import { runLease, type RunnerDeps } from '../../src/runtime/runner/run.js';
 import { Scheduler, type TaskBrief } from '../../src/runtime/scheduler.js';
 import { commitFile, gitSync, makeDefaultEnv, type Env } from './fixtures.js';
+import { HAS_PROCFS } from '../helpers.js';
 
 const SCRIPT = resolve(__dirname, '..', 'fixtures', 'fake-harness.mjs');
 const CODEX = { models: { default: 'gpt-6.1-sol', allowed: ['gpt-6.1-sol'] }, timeoutMinutes: 5 };
@@ -46,6 +47,10 @@ async function claim(r: Rig, id = 'task-1'): Promise<TaskBrief> {
 const headOf = (r: Rig, branch: string) => gitSync(r.layout.repo, 'rev-parse', `refs/heads/${branch}`);
 const submitted = (r: Rig, b: TaskBrief) => JSON.parse(readFileSync(submissionPath(r.paths, b.leaseId), 'utf8')) as { status: string; findings: string[]; headSha: string };
 const alive = (pid: number) => { try { process.kill(pid, 0); return !/\) Z /.test(readFileSync(`/proc/${pid}/stat`, 'utf8')); } catch { return false; } };
+/** Alive after a deadline: the processes under test never exit by themselves, so polling only removes a fixed-sleep race (task-93). */
+const aliveAfterKill = async (pid: number) => { for (const until = Date.now() + 10_000; alive(pid) && Date.now() < until;) await sleep(25); return alive(pid); };
+/** Resolves once the file exists (or after a 20 s deadline). */
+const waitForFile = async (path: string) => { for (const until = Date.now() + 20_000; !existsSync(path) && Date.now() < until;) await sleep(25); };
 
 /** Every file below `dir` (no symlink following). */
 function filesUnder(dir: string): string[] {
@@ -78,7 +83,7 @@ function nothingFetched(x: Awaited<ReturnType<typeof attacked>>, pattern: RegExp
   expect(gitSync(x.b.worktree, 'rev-parse', 'HEAD')).toBe(x.b.expectedHead);
 }
 
-describe('tester: the whole .git tree is checked, not only hooks', () => {
+describe.skipIf(!HAS_PROCFS)('tester: the whole .git tree is checked, not only hooks', () => {
   it('a symlinked objects fan-out directory into a "state" dir', async () => {
     const x = await attacked(({ stateDir }) => `echo a > a.txt && git add a.txt && git commit -qm a && ln -s ${stateDir} .git/objects/zz`);
     nothingFetched(x, /symlink in the git dir: .*objects\/zz/);
@@ -97,7 +102,7 @@ describe('tester: the whole .git tree is checked, not only hooks', () => {
   });
 });
 
-describe('tester: forged history never fetches', () => {
+describe.skipIf(!HAS_PROCFS)('tester: forged history never fetches', () => {
   it('a replace ref (git replace --graft) faking the claim head as parent of an orphan commit', async () => {
     const x = await attacked('T=$(git write-tree) && C=$(git commit-tree $T -m orphan) && git replace --graft $C $CLAIM && git update-ref refs/heads/$BRANCH $C');
     nothingFetched(x, /not a fast-forward/);
@@ -126,7 +131,7 @@ describe('tester: forged history never fetches', () => {
   });
 });
 
-describe('tester: no secrets in argv', () => {
+describe.skipIf(!HAS_PROCFS)('tester: no secrets in argv', () => {
   it('neither the worker nor any runner git call carries the secret in argv; it lands in no state, scratch or git file', async () => {
     const r = rig();
     const b = await claim(r);
@@ -169,18 +174,20 @@ describe('tester: no secrets in argv', () => {
   });
 });
 
-describe('tester: stopping leaves no process behind', () => {
+describe.skipIf(!HAS_PROCFS)('tester: stopping leaves no process behind', { timeout: 30_000 }, () => {
   it('timeout: a worker ignoring SIGTERM and its (same-group) grandchild are both gone', async () => {
     const r = rig();
     const b = await claim(r);
     const workerPid = join(r.root, 'worker.pid');
     const gcPid = join(r.root, 'gc.pid');
     const steps = [{ op: 'ignoreTerm' }, { op: 'pidfile', path: workerPid }, { op: 'grandchild', pidFile: gcPid }, { op: 'sleep', ms: 30_000 }];
-    const out = await runLease(b.leaseId, r.deps({ steps }, { timing: { timeoutMs: 700, pollMs: 50, killGraceMs: 300, drainGraceMs: 100 } }));
+    // The harness must install ignoreTerm and start the grandchild before the stop: from spawn, a short limit
+    // lost that race to a node start on a loaded machine (task-93), so the limit starts once the grandchild
+    // wrote its pid file (the timeoutStart seam).
+    const out = await runLease(b.leaseId, r.deps({ steps }, { timing: { timeoutMs: 300, timeoutStart: waitForFile(gcPid), pollMs: 50, killGraceMs: 300, drainGraceMs: 100 } }));
     expect(out).toMatchObject({ status: 'partial', exit: { stopped: 'timeout' } });
-    await sleep(100);
-    expect(alive(Number(readFileSync(workerPid, 'utf8')))).toBe(false);
-    expect(alive(Number(readFileSync(gcPid, 'utf8')))).toBe(false);
+    expect(await aliveAfterKill(Number(readFileSync(workerPid, 'utf8')))).toBe(false);
+    expect(await aliveAfterKill(Number(readFileSync(gcPid, 'utf8')))).toBe(false);
   });
 
   it('cancel by release: the worker and its grandchild are gone and the record is done', async () => {
@@ -193,9 +200,8 @@ describe('tester: stopping leaves no process behind', () => {
     await r.sched.release(b.leaseId, 'owner cancel');
     const out = await p;
     expect(out).toMatchObject({ submitted: false, exit: { stopped: 'lease-ended' } });
-    await sleep(100);
-    expect(alive(Number(readFileSync(workerPid, 'utf8')))).toBe(false);
-    expect(alive(Number(readFileSync(gcPid, 'utf8')))).toBe(false);
+    expect(await aliveAfterKill(Number(readFileSync(workerPid, 'utf8')))).toBe(false);
+    expect(await aliveAfterKill(Number(readFileSync(gcPid, 'utf8')))).toBe(false);
     expect((await readRunRecord(r.paths.state, b.leaseId))?.phase).toBe('done');
   });
 
@@ -212,7 +218,7 @@ describe('tester: stopping leaves no process behind', () => {
   });
 });
 
-describe('tester: the shared side', () => {
+describe.skipIf(!HAS_PROCFS)('tester: the shared side', () => {
   it('the lease branch moved in the shared repository during the run: nothing is fetched and the other commit stays', async () => {
     const r = rig();
     const b = await claim(r);
@@ -262,7 +268,7 @@ describe('tester: the shared side', () => {
   });
 });
 
-describe('tester: hard links in the git dirs the runner rewrites', () => {
+describe.skipIf(!HAS_PROCFS)('tester: hard links in the git dirs the runner rewrites', () => {
   // Regression (task-14.4 QA): a hard link passes lstat as a regular file. The runner refuses nlink > 1 in the clone
   // .git walk and on the lease git files, and writeNoFollow (repo.ts) replaces files by rename, so it never writes
   // through a link even if a check is missed. Under L1 the link into /state is also denied (Landlock REFER).
@@ -291,7 +297,7 @@ describe('tester: hard links in the git dirs the runner rewrites', () => {
   });
 });
 
-describe('engineer: hard-link refusal and link-safe rewrites (task-14.4 repair)', () => {
+describe.skipIf(!HAS_PROCFS)('engineer: hard-link refusal and link-safe rewrites (task-14.4 repair)', () => {
   it('reports a hard link anywhere in the clone .git tree as a violation and fetches nothing', async () => {
     const r = rig();
     const b = await claim(r);

@@ -9,6 +9,8 @@ import {
   billingOf, budgetNotice, currentBudget, parseBudget, parseTokens, recordLeaseUsage, setBudget, spendReport, usdPerMTok,
 } from '../../src/runtime/spend.js';
 import { commitFile, makeEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const errOf = async (p: Promise<unknown>) => {
   try { await p; } catch (e) { return e as MinionsError; }
@@ -240,10 +242,10 @@ describe('owner budget', () => {
     expect(status.spend?.percent).toBe(115);
     expect(humanStatus(status)).toMatch(/budget: .* - new starts refused/);
 
-    // The stop hook lets the coordinator stop instead of looping on refused claims.
+    // The stop hook lets the coordinator stop (no decision is held).
     const stop = await stopHook({}, () => ({ db: env.db, backlog: env.backlog, config: env.config }));
     expect(stop.stdout).toBeUndefined();
-    expect(env.db.guard().last_reason).toBe('budget');
+    expect(env.db.guard().last_reason).toBe('no-holds');
 
     // Raising the budget lets work start again; the new budget counts from when it was set.
     await spendCommand({ budget: '1M tokens', by: 'owner' }, { db: env.db, config: env.config });

@@ -1,8 +1,8 @@
 import { existsSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { APPROVAL_PUBLIC_KEY_NAME } from '../core/approval.js';
-import { containerPaths } from '../core/paths.js';
+import { CLAUDE_HEADLESS_TOKEN_FILE, containerPaths } from '../core/paths.js';
 
 /**
  * Literal container paths for the approval verifier. Deliberately not derived from containerPaths()
@@ -57,6 +57,8 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
   const workspace = env.MINIONS_WORKSPACE || c.workspace;
   const secretsDir = env.MINIONS_SECRETS_DIR || c.secretsDir;
   const pluginDir = env.MINIONS_PLUGIN_DIR || c.pluginDir;
+  // Host runtime: <MINIONS_HOME>/projects/<id> (the channel server's state dir and shim live under it).
+  const hostProjectDir = env.MINIONS_RUNTIME === 'host' && env.MINIONS_PROJECT_DIR && isAbsolute(env.MINIONS_PROJECT_DIR) ? env.MINIONS_PROJECT_DIR : null;
   // Scratch root: the container's TMPDIR on the cache volume. A redirected state dir (host runtime,
   // tests) keeps it inside that state dir (<state>/cache/tmp), never in the container path.
   const tmp = env.MINIONS_SCRATCH_DIR || (env.MINIONS_STATE_DIR ? join(state, 'cache', 'tmp') : c.scratch);
@@ -86,16 +88,21 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
     repo: join(workspace, 'repo'),
     worktrees: join(workspace, 'worktrees'),
     review: join(workspace, 'review'),
+    /** The local integrator's persistent detached worktree (never /workspace/repo; src/runtime/integrator.ts). */
+    integration: join(workspace, 'integration'),
+    /** The dispatcher's detached verification worktree (the verify step and the periodic run; src/runtime/verify-step.ts). */
+    verify: join(workspace, 'verify'),
     configJson: env.MINIONS_CONFIG || c.configJson,
     /** Public key verifying host-signed publication approvals (see approvalPublicKeyPath; never env-redirectable in the container). */
     approvalPublicKey: approvalPublicKeyPath(env, opts.inContainer ?? inMinionsContainer()),
     pluginDir,
     secretsDir,
     telegramTokenFile: join(secretsDir, 'telegram-bot-token'),
-    githubTokenFile: join(secretsDir, 'github-token'),
     apiKeyFile: join(secretsDir, 'anthropic-api-key'),
+    /** Headless Claude token (login method) for `minions coordinator live-run` (src/runtime/headless.ts). */
+    claudeHeadlessTokenFile: join(secretsDir, CLAUDE_HEADLESS_TOKEN_FILE),
     tmuxSocket: env.MINIONS_TMUX_SOCKET || null,
-    /** The official plugin's state dir (same resolution as the plugin: TELEGRAM_STATE_DIR, else CLAUDE_CONFIG_DIR/channels/telegram). */
+    /** The channel server's state dir (TELEGRAM_STATE_DIR, else CLAUDE_CONFIG_DIR/channels/telegram; the host runtime: its own dir). */
     /**
      * User-scope Claude Code settings the coordinator's claude reads (CLAUDE_CONFIG_DIR/settings.json).
      * runCoordinator turns the Telegram plugin off here (task-51: only the coordinator launch enables it).
@@ -103,7 +110,15 @@ export function runtimePaths(env: NodeJS.ProcessEnv = process.env, opts: { inCon
      * that state dir, so a test never edits the real ~/.claude/settings.json.
      */
     claudeUserSettings: join(env.CLAUDE_CONFIG_DIR || (env.MINIONS_STATE_DIR ? join(state, 'claude') : env.MINIONS_RUNTIME === 'host' ? join(homedir(), '.claude') : c.claudeHome), 'settings.json'),
-    telegramStateDir: env.TELEGRAM_STATE_DIR || join(env.CLAUDE_CONFIG_DIR || (env.MINIONS_RUNTIME === 'host' ? join(homedir(), '.claude') : c.claudeHome), 'channels', 'telegram'),
+    /**
+     * Host runtime (task-6): the minions channel server's own per-project dir, <project>/host/claude/channels/telegram,
+     * never the owner's ~/.claude (their own plugin's access.json and bot.pid). It is under the minions data root, so
+     * sandboxed commands can neither read nor write it (hostSettings).
+     */
+    telegramStateDir: env.TELEGRAM_STATE_DIR || (hostProjectDir ? join(hostProjectDir, 'host', 'claude', 'channels', 'telegram')
+      : join(env.CLAUDE_CONFIG_DIR || (env.MINIONS_RUNTIME === 'host' ? join(homedir(), '.claude') : c.claudeHome), 'channels', 'telegram')),
+    /** Host runtime: the `minions` shim that starts the channel server (null elsewhere). */
+    minionsShim: hostProjectDir ? join(hostProjectDir, 'host', 'bin', 'minions') : null,
     /** Written by `minions coordinator run`: what the running coordinator was launched with (no secrets). */
     coordinatorLaunch: join(state, 'coordinator-launch.json'),
     /** Written by `minions coordinator run` when it exits (code, signal, error; no secrets). Read by a detached start. */

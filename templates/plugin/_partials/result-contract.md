@@ -1,14 +1,14 @@
 ## Result (output)
 
-Submit your WorkerResult as a single JSON object on stdin, from inside your worktree:
+Submit your WorkerResult as a single JSON object on stdin, from inside your worktree (your Bash cwd resets between calls, so start with `cd <worktree> && `):
 
 ```bash
-minions work submit <leaseId> --role {{workerRole}} --json <<'RESULT'
+cd <worktree> && minions work submit <leaseId> --role {{workerRole}} --json <<'RESULT'
 { ...WorkerResult JSON... }
 RESULT
 ```
 
-Then end with **one short line** (no JSON), e.g. `submitted <leaseId>: complete - <summary>`. The coordinator records the submitted file without reading it. If the coordinator relays validation errors, fix exactly those fields, submit again, and end with one line again. Only if `minions work submit` itself fails, make your final message exactly one fenced `json` block with the WorkerResult instead.
+Then end with **one short line** (no JSON), e.g. `submitted <leaseId>: complete - <summary>`. minions records the submitted file without anyone reading it. If you are sent validation errors (the one correction), fix exactly those fields, submit again, and end with one line again. Only if `minions work submit` itself fails, make your final message exactly one fenced `json` block with the WorkerResult instead.
 
 The WorkerResult:
 
@@ -20,7 +20,7 @@ The WorkerResult:
   "headSha": "<full 40-char SHA from `git rev-parse HEAD` in your worktree>",
   "modifiedPaths": ["src/example.ts"],
   "checks": [
-    { "command": "npm test", "outcome": "pass", "details": "42 tests" }
+    { "command": "npm run test:unit", "outcome": "pass", "details": "42 tests" }
   ],
   "acceptanceEvidence": [
     { "criterion": "<acceptance criterion text as given>", "evidence": "<what shows it is met: test name, file:line, command output>" }

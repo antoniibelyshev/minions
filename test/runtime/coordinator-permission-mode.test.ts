@@ -62,12 +62,12 @@ function pluginPaths() {
 }
 
 describe('coordinator permission mode: config', () => {
-  it('defaults to auto; coordinator.permissionMode "acceptEdits" opts out; bypass is rejected by the schema', () => {
+  it('defaults to auto; coordinator.permissionMode "acceptEdits" opts out; bypassPermissions is valid, dontAsk is not', () => {
     expect(configuredPermissionMode(defaults())).toBe('auto');
     expect(configuredPermissionMode(withCoord('acceptEdits'))).toBe('acceptEdits');
     expect(configuredPermissionMode(withCoord('auto'))).toBe('auto');
     expect(validateConfig(withCoord('acceptEdits')).coordinator).toEqual({ permissionMode: 'acceptEdits' });
-    expect(() => validateConfig({ ...defaults(), coordinator: { permissionMode: 'bypassPermissions' } })).toThrow(/coordinator\.permissionMode/);
+    expect(validateConfig({ ...defaults(), coordinator: { permissionMode: 'bypassPermissions' } }).coordinator?.permissionMode).toBe('bypassPermissions');
     expect(() => validateConfig({ ...defaults(), coordinator: { permissionMode: 'dontAsk' } })).toThrow();
     expect(() => validateConfig({ ...defaults(), coordinator: { other: 1 } })).toThrow();
   });
@@ -82,16 +82,16 @@ describe('coordinator permission mode: config', () => {
   it('legacy top-level permissionMode "acceptEdits" is reported as ignored by --probe/doctor (decision reason)', () => {
     const note = /legacy permissionMode "acceptEdits" is ignored; set coordinator\.permissionMode "acceptEdits" to opt out/;
     const legacy = withCoord(undefined, 'acceptEdits');
-    expect(decidePermissionMode(legacy, { hostRuntime: false, modes: ['acceptEdits', 'auto'] })).toMatchObject({ mode: 'auto', reason: expect.stringMatching(note) });
-    expect(decidePermissionMode(legacy, { hostRuntime: false, modes: ['acceptEdits'] })).toMatchObject({ mode: 'acceptEdits', fallback: true, reason: expect.stringMatching(note) });
-    expect(decidePermissionMode(withCoord('acceptEdits', 'acceptEdits'), { hostRuntime: false }).reason).not.toMatch(note);
-    expect(decidePermissionMode(withCoord(undefined, 'default'), { hostRuntime: false }).reason).not.toMatch(note);
-    expect(decidePermissionMode(defaults(), { hostRuntime: false }).reason).not.toMatch(note);
+    expect(decidePermissionMode(legacy, { modes: ['acceptEdits', 'auto'] })).toMatchObject({ mode: 'auto', reason: expect.stringMatching(note) });
+    expect(decidePermissionMode(legacy, { modes: ['acceptEdits'] })).toMatchObject({ mode: 'acceptEdits', fallback: true, reason: expect.stringMatching(note) });
+    expect(decidePermissionMode(withCoord('acceptEdits', 'acceptEdits'), {}).reason).not.toMatch(note);
+    expect(decidePermissionMode(withCoord(undefined, 'default'), {}).reason).not.toMatch(note);
+    expect(decidePermissionMode(defaults(), {}).reason).not.toMatch(note);
   });
 
-  it('never allows bypassPermissions from either key', () => {
-    expect(() => decidePermissionMode({ permissionMode: 'bypassPermissions' as never }, { hostRuntime: false })).toThrow(/never allowed/);
-    expect(() => decidePermissionMode({ coordinator: { permissionMode: 'bypassPermissions' as never } }, { hostRuntime: false })).toThrow(/never allowed/);
+  it('bypassPermissions is a valid owner choice; only config.local.json may select it', () => {
+    expect(decidePermissionMode({ coordinator: { permissionMode: 'bypassPermissions' } })).toMatchObject({ mode: 'bypassPermissions', fallback: false });
+    expect(validateConfig(withCoord('bypassPermissions' as never)).coordinator?.permissionMode).toBe('bypassPermissions');
   });
 });
 
@@ -109,15 +109,16 @@ describe('coordinator permission mode: Claude Code support', () => {
     expect(await claudePermissionModes(async () => { throw new Error('boom'); })).toBeNull();
   });
 
-  it('falls back to acceptEdits with a clear reason when auto is unavailable; host runtime stays default', () => {
-    expect(decidePermissionMode(defaults(), { hostRuntime: false, modes: ['acceptEdits', 'auto'] })).toMatchObject({ mode: 'auto', fallback: false });
-    const old = decidePermissionMode(defaults(), { hostRuntime: false, modes: ['acceptEdits', 'default', 'plan'] });
+  it('falls back to acceptEdits with a clear reason when auto is unavailable', () => {
+    expect(decidePermissionMode(defaults(), { modes: ['acceptEdits', 'auto'] })).toMatchObject({ mode: 'auto', fallback: false });
+    const old = decidePermissionMode(defaults(), { modes: ['acceptEdits', 'default', 'plan'] });
     expect(old).toMatchObject({ configured: 'auto', mode: 'acceptEdits', fallback: true });
     expect(old.reason).toMatch(/does not offer --permission-mode auto \(choices: acceptEdits, default, plan\); falling back to permission mode acceptEdits/);
-    expect(decidePermissionMode(defaults(), { hostRuntime: false, modes: null })).toMatchObject({ mode: 'acceptEdits', fallback: true, reason: expect.stringMatching(/could not read/) });
+    expect(decidePermissionMode(defaults(), { modes: null })).toMatchObject({ mode: 'acceptEdits', fallback: true, reason: expect.stringMatching(/could not read/) });
     // An explicit acceptEdits opt-out is not a fallback.
-    expect(decidePermissionMode(withCoord('acceptEdits'), { hostRuntime: false, modes: null })).toMatchObject({ mode: 'acceptEdits', fallback: false });
-    expect(decidePermissionMode(defaults(), { hostRuntime: true, modes: ['auto'] })).toMatchObject({ mode: 'default', fallback: false });
+    expect(decidePermissionMode(withCoord('acceptEdits'), { modes: null })).toMatchObject({ mode: 'acceptEdits', fallback: false });
+    // Legacy "default" with neither name listed: fail closed, never auto or acceptEdits.
+    expect(() => decidePermissionMode(withCoord(undefined, 'default'), { modes: ['auto'] })).toThrow(/neither --permission-mode default nor manual/);
   });
 
   it('--probe reports auto when supported and falls back to acceptEdits (not an error) when not', async () => {
@@ -132,7 +133,7 @@ describe('coordinator permission mode: Claude Code support', () => {
 });
 
 describe('coordinator permission mode: launch argv and settings', () => {
-  it('launches in auto by default; deny/ask rules and disableBypassPermissionsMode are identical in every mode', async () => {
+  it('launches in auto by default; deny rules and disableBypassPermissionsMode are identical in every mode but bypassPermissions', async () => {
     const { env } = pluginPaths();
     const paths = runtimePaths(env);
     const auto = await buildClaudeCommand(defaults(), paths, { permissionModes: ['acceptEdits', 'auto'] });
@@ -146,11 +147,14 @@ describe('coordinator permission mode: launch argv and settings', () => {
     const perms = (c: typeof auto) => JSON.parse(c.args[c.args.indexOf('--settings') + 1]!).permissions;
     const a = perms(auto);
     expect(a.deny).toEqual(expect.arrayContaining(['Bash(git push *)', 'Bash(git push)', 'Bash(git * push *)', 'Bash(gh pr merge *)', 'Bash(gh pr merge)', 'Bash(gh * pr merge *)']));
-    expect(a.ask).toEqual(expect.arrayContaining(['Bash(minions work approve *)', 'Bash(minions * work approve *)', 'Bash(minions approve *)', 'Bash(minions * approve *)']));
+    expect(a.deny).toEqual(expect.arrayContaining(['Bash(minions work approve *)', 'Bash(minions * work approve *)', 'Bash(minions approve *)', 'Bash(minions * approve *)']));
     expect(a.disableBypassPermissionsMode).toBe('disable');
     for (const c of [edits, fallback, unchecked]) expect(perms(c)).toEqual(a);
     expect(coordinatorSettings(withCoord('acceptEdits')).permissions).toEqual(coordinatorSettings(defaults()).permissions);
     for (const c of [auto, edits, fallback]) expect(c.args.join(' ')).not.toMatch(/bypassPermissions|dangerously|dontAsk/);
+    const bypass = await buildClaudeCommand(withCoord('bypassPermissions' as never), paths);
+    expect(modeOf(bypass.args)).toBe('bypassPermissions');
+    expect(perms(bypass)).toEqual({ ...a, disableBypassPermissionsMode: undefined });
   });
 
   it('the exec wrapper checks Claude Code for auto, logs the fallback, and skips the check when acceptEdits is configured', async () => {

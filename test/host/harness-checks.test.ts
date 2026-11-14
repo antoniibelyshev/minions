@@ -1,6 +1,7 @@
 // task-14.3: `harness.*` checks in `minions status --check` / `doctor` (docs/design/agent-runtimes.md D7):
 // helper absent, present but failing, and passing, plus the runDoctor wiring. All fakes: no Docker.
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fs-git.js')).withFsGit(await orig()));
 import type { RunOptions, RunResult } from '../../src/core/exec.js';
 import type { WorkProbeReport } from '../../src/runtime/sandbox/probe.js';
 import type { SelfTestReport } from '../../src/runtime/sandbox/selftest.js';
@@ -121,7 +122,7 @@ const ok = (data: WorkProbeReport): RunResult => ({ code: 0, stdout: JSON.string
 describe('runDoctor (doctor and status --check): harness.* checks', () => {
   it('Claude-only config: no harness.* checks and the probe is never run', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     const calls: string[] = [];
     const r = await runDoctor({ cwd: repo, probe: dockerUp, runner: container(ok(report()), calls) });
     expect(r.checks.filter((c) => c.name.startsWith('harness.'))).toEqual([]);
@@ -130,7 +131,7 @@ describe('runDoctor (doctor and status --check): harness.* checks', () => {
 
   it('process harness configured: runs `minions work probe --json` in the container; passing, failing and absent helper', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     injected.harnesses = { default: 'claude', codex: {} };
     injected.roles = { engineer: { harness: 'codex' } };
     const calls: string[] = [];
@@ -152,7 +153,7 @@ describe('runDoctor (doctor and status --check): harness.* checks', () => {
 
   it('container not running: harness.<id> is listed as skipped', async () => {
     const repo = makeRepo(env.root);
-    await runInit({ path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
+    await runInit({ mode: 'independent', path: repo, yes: true, visibility: 'private', dockerProbe: dockerUp });
     injected.harnesses = { default: 'codex', codex: {} };
     const calls: string[] = [];
     const r = await runDoctor({ cwd: repo, probe: dockerUp, runner: container(null, calls, false) });
