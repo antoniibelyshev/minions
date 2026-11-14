@@ -1,4 +1,4 @@
-import { resolve as resolvePath } from 'node:path';
+import { join, resolve as resolvePath } from 'node:path';
 import { createInterface } from 'node:readline/promises';
 import { Option, type Command } from 'commander';
 import { MODES, type Mode } from '../config/schema.js';
@@ -7,7 +7,8 @@ import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helper
 import { MinionsError } from '../core/errors.js';
 import { emit } from '../core/output.js';
 import { CONTAINER, projectPaths } from '../core/paths.js';
-import { PRE_RESTORE_KEEP, STATE_BACKUP_DIRS, STATE_BACKUP_FILES } from '../runtime/state-backup.js';
+import { DB_NAME, PRE_RESTORE_KEEP, STATE_BACKUP_DIRS, STATE_BACKUP_FILES } from '../runtime/state-backup.js';
+import { orphanStopLines, stopStateDirOrphans } from './helper-orphans.js';
 import { formatRecord, recordUpgradeRequest, withRequestDb } from '../runtime/change-requests.js';
 import { registerAuth } from './auth-cli.js';
 import { authOf, isKeyAuth, refreshKey, startRefreshTimer } from './auth.js';
@@ -193,6 +194,8 @@ async function ensureHost(json: boolean, opts: { provision?: boolean; cwd?: stri
 
 async function startHost(json: boolean, o: { attach: boolean }): Promise<void> {
   const { project, config, host } = await ensureHost(json, { provision: true });
+  // Helpers left over from a state restore keep looping on a replaced DB: stop them before the coordinator starts.
+  for (const line of orphanStopLines(await stopStateDirOrphans(host.paths.state, join(host.paths.state, DB_NAME)))) say(json, line);
   let imported: unknown = null;
   if (!(await hostRepoPresent(host))) {
     say(json, `Cloning committed history of ${project.baseBranch} into the host runtime workspace (${host.paths.workspace})…`);
