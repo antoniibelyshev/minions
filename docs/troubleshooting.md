@@ -237,6 +237,15 @@ integration gate (and QA sweeps) run the integration tier or the full suite. Nob
 base branch for a baseline. `minions work record` refuses a `complete` engineer result that reports a
 failing check, a skipped verification command, or no passing test run.
 
+The integration tier is kept small (task-137): on 2026-11-14 it was 60 files, 736 tests and 147 s of summed
+test time, down from 162 files, 3246 tests and 736 s on 2026-10-30. What stays there runs real processes
+end to end: the Docker image and container, the built CLI and its git-URL install, the real Backlog.md CLI,
+host setup, upgrade and the host runtime's processes, the coordinator lock and permission mode, the
+worker runner and the local integration gate over real git, the sandbox and harness runners, coordinator
+sessions and the supervisor, the hook shell entry points, the Telegram channel launch, and the dev
+self-update script. `test/tiers.test.ts` caps the list at 65 entries: write a new test as a unit test on
+the in-memory git fakes (`test/host/fs-git.ts`, `test/runtime/fake-git.ts`) unless it needs a real process.
+
 ## Still stuck
 
 - `minions status --check --json` and `minions status --json` give the full picture for a bug report

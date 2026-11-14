@@ -18,6 +18,12 @@ describe('test tiers', () => {
     for (const f of ALL) expect(INTEGRATION_TESTS.filter((e) => matches(e, f)).length, f).toBeLessThanOrEqual(1);
   });
 
+  it('the integration tier stays small (task-137.2.8)', () => {
+    // 2026-11-14: 61 entries (60 files, 736 tests, 147 s summed), down from 162 files / 3246 tests / 736 s on
+    // 2026-10-30. Raising the cap is a decision: prefer a unit test on a fake (test/host/fs-git.ts, test/runtime/fake-git.ts).
+    expect(INTEGRATION_TESTS.length).toBeLessThanOrEqual(65);
+  });
+
   it('this file is in the unit tier, and the unit tier refuses subprocesses', async () => {
     expect(INTEGRATION_TESTS.some((e) => matches(e, 'test/tiers.test.ts'))).toBe(false);
     const g = globalThis as Record<symbol, unknown>;
