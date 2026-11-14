@@ -64,7 +64,7 @@ function fakeGit(args: string[], cwd?: string): RunResult {
   if (a === 'rev-parse --show-toplevel') return cwd === w.repo ? res(`${w.repo}\n`) : res('', 128, 'fatal: not a git repository');
   if (a === 'rev-parse --path-format=absolute --git-common-dir') return res(`${join(w.repo, '.git')}\n`);
   if (a === 'symbolic-ref --short -q HEAD') return res(`${w.branch}\n`);
-  if (a === 'status --porcelain') return res(w.dirty.join('\n'));
+  if (a === 'status --porcelain --untracked-files=no') return res(w.dirty.filter((l) => !l.startsWith('??')).join('\n'));
   if (a === 'rev-parse --verify -q refs/heads/main') return res(`${head()}\n`);
   if (a === 'rev-parse HEAD') { const h = cwd ? w.worktrees.get(cwd) : undefined; return h ? res(`${h}\n`) : res('', 128, 'fatal: not a git repository'); }
   if (args[0] === 'log' || args[0] === 'diff') {
@@ -312,7 +312,7 @@ describe('self-update start refusals', () => {
     ['no project is registered for the checkout', () => { json(join(w.home, 'registry.json'), { version: 1, projects: {} }); }, /no minions project is registered for/],
     ['delivery is not local', () => { w.config = { ok: true, data: { delivery: { mode: 'pull-request' } } }; }, /delivery mode is "pull-request", not local/],
     ['the runtime is neither Docker nor host', () => { editProject({ runtime: 'k8s' }); }, /runtime is "k8s", not docker or host/],
-    ['the checkout is dirty', () => { w.dirty = ['?? stray.txt']; }, /uncommitted or untracked changes/],
+    ['the checkout is dirty', () => { w.dirty = [' M README.md']; }, /uncommitted changes to tracked files/],
     ['the checkout is not on the base branch', () => { w.branch = 'feature'; }, /on branch feature, not the base branch main/],
   ];
   it.each(cases)('refuses when %s', async (_name, mutate, message) => {
@@ -327,11 +327,19 @@ describe('self-update start refusals', () => {
   });
 
   it('lists every failed condition, not only the first', async () => {
-    w.dirty = ['?? stray.txt'];
+    w.dirty = [' M README.md'];
     w.branch = 'feature';
     const r = await runScript('--once');
     expect(r.code).toBe(2);
-    expect(r.err).toMatch(/on branch feature(.|\n)*uncommitted or untracked changes/);
+    expect(r.err).toMatch(/on branch feature(.|\n)*uncommitted changes to tracked files/);
+  });
+
+  it('untracked files in the checkout are not a refusal', async () => {
+    setRequests([request('cr_aaaaaaaa')]);
+    w.dirty = ['?? stray.txt'];
+    const r = await runScript('--once');
+    expect(r.code, r.err).toBe(0);
+    expect(r.out).toContain('took request cr_aaaaaaaa');
   });
 
   it('rejects unknown arguments with the usage', async () => {

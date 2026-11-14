@@ -89,7 +89,7 @@ Rules that stay the same, and must be stated as such in host-manager.md and boot
 **Refusals at start.** The script refuses to start unless all of these hold: the project repo is a minions checkout
 (`isMinionsCheckout(repoPath)`) **and** the installed CLI kind is `packed` (the `reinstall` action in `checkCli`; not
 `devRebuildAvailable`, which is false for a packed install and is what `/rebuild_cli` uses), delivery is `local`, the runtime is Docker, the install is
-**packed** (so a backup is possible, see Decision 1), and the host checkout is on the base branch with a clean tree. Only one
+**packed** (so a backup is possible, see Decision 1), and the host checkout is on the base branch with no uncommitted changes to tracked files (untracked files are fine). Only one
 instance runs at a time, held by the lock `<MINIONS_HOME>/dev-self-update/lock`.
 
 ### Trigger
