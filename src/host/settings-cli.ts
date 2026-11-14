@@ -3,7 +3,9 @@
 // right layer, regeneration of the derived files, and the graceful coordinator restart
 // (`minions coordinator restart --recover` in the runtime, the same call `minions upgrade` makes; it is
 // refused while worker leases are active, so running workers are never interrupted).
-// `settings requests [--all]` lists the upgrade requests recorded in the runtime (src/runtime/change-requests.ts).
+// `settings requests [--all]` lists the upgrade and publish requests recorded in the runtime (src/runtime/change-requests.ts);
+// `settings requests publish` records a publish request in the runtime and, on the host, publishes one after a terminal
+// confirmation; the hidden `settings requests serve` is the host publisher (docs/design/autonomy.md Decision 17).
 import type { Command } from 'commander';
 import { projectOverlayText } from './control-overlay.js';
 import { action, globalOpts, requireMode, runtimeMode } from '../core/cli-helpers.js';
@@ -11,7 +13,14 @@ import type { RunResult } from '../core/exec.js';
 import { displayText } from '../core/control-chars.js';
 import { MinionsError } from '../core/errors.js';
 import { emit } from '../core/output.js';
-import { formatRequestLine, formatRequests, listChangeRequests, markChangeRequest, withRequestDb, type ChangeRequestView } from '../runtime/change-requests.js';
+import {
+  FULL_SHA, NO_REMOTE_HINT, NO_REMOTE_MESSAGE, formatRecord, formatRequestLine, formatRequests, listChangeRequests, markChangeRequest, recordPublishRequest,
+  runtimeProjectFacts, withRequestDb, type ChangeRequestView, type RecordResult,
+} from '../runtime/change-requests.js';
+import { runtimePaths } from '../runtime/paths.js';
+import { git, headOf } from '../runtime/worktree.js';
+import { publishFromTerminal, runPublisher, type TerminalPublish } from './publisher.js';
+import { readlineIO } from './wizard.js';
 import { revisionConflict } from './config-write.js';
 import { Compose } from './docker.js';
 import { loadProjectJson, type ProjectJson } from './project.js';
@@ -251,7 +260,7 @@ export function registerSettings(program: Command, io: SettingsCliIO): Command {
  */
 function registerRequests(settings: Command, runtime: SettingsRuntime): void {
   const requests = settings.command('requests')
-    .description('List the upgrade requests recorded in the runtime (`minions upgrade` run there): open ones, or every status with --all')
+    .description('List the upgrade and publish requests recorded in the runtime: open ones, or every status with --all')
     .option('--all', 'include applied, rejected and expired requests')
     .action(action(async (o: { all?: boolean }, c: Command) => {
       const { json } = globalOpts(c);
@@ -264,8 +273,33 @@ function registerRequests(settings: Command, runtime: SettingsRuntime): void {
       const list = await hostRequests(project, runtime, !!o.all);
       emit({ projectId: project.projectId, requests: list }, { json, human: () => formatRequests(list) });
     }));
+  requests.command('publish [requestId]')
+    .description('Runtime: propose publishing the base branch (records a publish request the owner approves in Telegram). Host: publish an open request <requestId> after a confirmation here')
+    .option('--summary <text>', 'runtime: what the publish contains, in one or two sentences (shown to the owner, quoted)')
+    .option('--sha <sha>', 'runtime: the full base-branch commit to publish (default: the base branch head)')
+    .option('--task <id>', 'runtime: a task the publish lands (repeatable, or comma-separated)', (v: string, acc: string[]) => [...acc, v], [] as string[])
+    .option('--dry-run', 'runtime: validate and show the request; record nothing. Host: show the checks; push nothing')
+    .action(action(async (requestId: string | undefined, o: { summary?: string; sha?: string; task: string[] }, c: Command) => {
+      const { json, dryRun } = globalOpts(c);
+      if (runtimeMode() !== 'host') {
+        if (requestId) throw new MinionsError('PRECONDITION', 'In the runtime `settings requests publish` records a new request; it takes no request id.', 'Run `minions settings requests publish --summary <text> [--task <id>]... --json`.');
+        const r = await recordPublishFromRuntime({ summary: o.summary, sha: o.sha, tasks: o.task, dryRun });
+        emit(r, { json, human: formatRecord });
+        return;
+      }
+      if (!requestId) throw new MinionsError('PRECONDITION', 'Name the publish request to publish: `minions settings requests publish <requestId>`.', 'List them with `minions settings requests`.');
+      if (o.summary !== undefined || o.sha !== undefined || o.task.length) throw new MinionsError('PRECONDITION', '--summary, --sha and --task are for recording a request in the runtime; on the host the request already says what to publish.');
+      const r = await publishFromTerminal(await currentProject(), requestId, { confirm: json ? async () => null : confirmTerminal, dryRun });
+      emit(r, { json, human: formatTerminalPublish });
+    }));
+  requests.command('serve', { hidden: true })
+    .description('Host only: run the host publisher for every registered project (the publisher service runs this)')
+    .action(action(async () => {
+      requireMode('host');
+      process.exitCode = await runPublisher();
+    }));
   requests.command('mark <requestId>', { hidden: true })
-    .description('Runtime only, called by the host: record the host\'s outcome of an upgrade request')
+    .description('Runtime only, called by the host: record the host\'s outcome of an upgrade or publish request')
     .requiredOption('--status <status>', 'confirmed | applied | failed | rejected | expired')
     .option('--detail <text>', 'what happened')
     .action(action(async (id: string, o: { status: string; detail?: string }, c: Command) => {
@@ -274,6 +308,44 @@ function registerRequests(settings: Command, runtime: SettingsRuntime): void {
       emit(v, { json: globalOpts(c).json, human: formatRequestLine });
     }));
 }
+
+/**
+ * `settings requests publish` in the runtime: the base and remote from the runtime's project.json, the commit from the
+ * workspace (default: the base head; a given --sha must be on the base), then recordPublishRequest.
+ */
+export async function recordPublishFromRuntime(o: { summary?: string; sha?: string; tasks: string[]; dryRun?: boolean }): Promise<RecordResult> {
+  const facts = runtimeProjectFacts();
+  if (!facts.remoteUrl) throw new MinionsError('PRECONDITION', NO_REMOTE_MESSAGE, NO_REMOTE_HINT);
+  if (!facts.baseBranch) throw new MinionsError('PRECONDITION', 'The runtime does not know its base branch (project.json is missing).', 'Ask the owner to rerun `minions start` on the host.');
+  const repo = runtimePaths().repo;
+  const base = facts.baseBranch;
+  let sha = o.sha?.trim().toLowerCase();
+  if (!sha) {
+    sha = (await headOf(repo, base)) ?? undefined;
+    if (!sha) throw new MinionsError('PRECONDITION', `The workspace has no ${base} branch to publish.`);
+  } else {
+    if (!FULL_SHA.test(sha)) throw new MinionsError('PRECONDITION', `--sha must be a full 40-character commit SHA (got "${displayText(sha).slice(0, 60)}").`);
+    if ((await git(repo, ['merge-base', '--is-ancestor', sha, `refs/heads/${base}`], true)).code !== 0) {
+      throw new MinionsError('PRECONDITION', `${sha.slice(0, 12)} is not on ${base}: only commits of the base branch are published.`, `Omit --sha to publish the ${base} head.`);
+    }
+  }
+  return withRequestDb((db) => recordPublishRequest(db, { base, sha: sha!, tasks: o.tasks, summary: o.summary, remoteUrl: facts.remoteUrl, dryRun: o.dryRun }));
+}
+
+function formatTerminalPublish(r: TerminalPublish): string {
+  if (!r.result) return `dry run: ${r.plan.commits} commit(s) to ${r.plan.base} at ${r.plan.sha.slice(0, 12)} pass the checks (${r.mode}); nothing was pushed.`;
+  return [
+    r.result.mode === 'direct' ? `Published ${r.plan.sha} to origin/${r.plan.base}.` : `Pushed ${r.result.ref.replace(/^refs\/heads\//, '')}; pull request: ${r.result.prUrl ?? '(no URL reported)'}`,
+    ...(r.checkout ? [`Your checkout: ${r.checkout}`] : []),
+    `Request ${r.request.id} marked applied.`,
+  ].join('\n');
+}
+
+const confirmTerminal = async (q: string): Promise<boolean | null> => {
+  if (!process.stdin.isTTY) return null;
+  const io = readlineIO();
+  try { return /^y(es)?$/i.test((await io.ask(q, 'n')).trim()); } finally { io.close?.(); }
+};
 
 /** The runtime's requests through `minions settings requests --json` in it (the row is untrusted, shown stripped). */
 async function hostRequests(project: ProjectJson, runtime: SettingsRuntime, all: boolean): Promise<ChangeRequestView[]> {

@@ -28,6 +28,8 @@ export interface FfFacts {
   /** Whether `from` is an ancestor of `to`, and the reverse. */
   canFastForward: boolean;
   contains: boolean;
+  /** How `to` is named in the reasons (default `minions/<base>`; the publisher names the published commit). */
+  target?: string;
 }
 
 export type FfAction = 'fast-forward' | 'up-to-date' | 'skipped';
@@ -37,7 +39,7 @@ const short = (sha: string | null) => sha?.slice(0, 12) ?? '(none)';
 
 /** Whether to fast-forward the base, and why (or why not). Pure. */
 export function ffDecision(f: FfFacts): FfDecision {
-  const target = `minions/${f.base}`;
+  const target = f.target ?? `minions/${f.base}`;
   if (!f.to) return { action: 'skipped', reason: `the agents have no ${f.base} branch (${target} missing)` };
   if (!f.from) return { action: 'skipped', reason: `no local ${f.base} branch` };
   if (f.from === f.to) return { action: 'up-to-date', reason: `${f.base} is at ${target} (${short(f.to)})` };
@@ -83,17 +85,20 @@ export async function untrackedInTheWay(git: (args: string[]) => Promise<RunResu
 
 export interface FfResult extends FfDecision { base: string; from: string | null; to: string | null; applied: boolean }
 
-/** Reads the facts in `repo`, decides, and runs `git merge --ff-only` when it fast-forwards. */
-export async function fastForwardBase(repo: string, base: string, runner: Runner = run): Promise<FfResult> {
+/**
+ * Reads the facts in `repo`, decides, and runs `git merge --ff-only` when it fast-forwards. `to`: the commit to move
+ * to (default refs/remotes/minions/<base>, what `minions pull` fetched); `target` names it in the reasons.
+ */
+export async function fastForwardBase(repo: string, base: string, runner: Runner = run, o: { to?: string; target?: string } = {}): Promise<FfResult> {
   const git = (args: string[]) => runner('git', [...HOST_GIT, ...args], { cwd: repo, allowFailure: true, timeoutMs: 120_000 });
   const sha = async (ref: string) => { const r = await git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]); return r.code === 0 ? r.stdout.trim() : null; };
   const ancestor = async (a: string, b: string) => (await git(['merge-base', '--is-ancestor', a, b])).code === 0;
   const from = await sha(`refs/heads/${base}`);
-  const to = await sha(`refs/remotes/minions/${base}`);
+  const to = await sha(o.to ?? `refs/remotes/minions/${base}`);
   const head = await git(['symbolic-ref', '--quiet', '--short', 'HEAD']);
   const status = await git(TRACKED_STATUS);
   const facts: FfFacts = {
-    base, from, to, current: head.code === 0 ? head.stdout.trim() : null,
+    base, from, to, ...(o.target ? { target: o.target } : {}), current: head.code === 0 ? head.stdout.trim() : null,
     // An unreadable status counts as dirty: never move a tree we could not check.
     dirty: status.code === 0 ? status.stdout.split('\n').filter(Boolean).length : 1,
     canFastForward: !!from && !!to && from !== to && await ancestor(from, to),

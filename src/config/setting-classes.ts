@@ -42,6 +42,7 @@ export const KEY_CLASSES: readonly KeyClass[] = [
   ...entries(['routine'], 'live', false, 'read by each routine pass (`minions sync --routine`) and the wrapper clock'),
   ...entries(['routine.enabled'], 'live', true, 'lets the runtime start coordinator sessions on its own (wakes, crash starts: model spend)'),
   ...entries(['routine.planWhenIdle'], 'live', true, 'lets the runtime wake the coordinator to plan new work toward the goals on its own (model spend)'),
+  ...entries(['publish'], 'live', true, 'read by the host publisher at each publish (docs/design/autonomy.md Decision 17); owner-only, the control overlay refuses it'),
   ...entries(['budgets'], 'live', true, 'spend caps the scheduler checks per claim; only the owner changes them (/budget in Telegram, or the host config), never the coordinator'),
   ...entries(['coordinator.sessions.max'], 'live', false, 'cap read by the session supervisor before it opens a session'),
   ...entries(['coordinator.sessions.threads', 'coordinator.sessions.threadIdleMinutes'], 'live', false, 'read by `coordinator route` and the session pass on each call'),

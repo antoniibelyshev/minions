@@ -315,6 +315,17 @@ export const MinionsConfigSchema = z.object({
      */
     integrationTimeoutMinutes: z.number().int().min(1).optional(),
   }).strict(),
+  /**
+   * Publishing (docs/design/autonomy.md Decision 17): the host publisher pushes the agents' base to origin after the
+   * owner approves a publish request in Telegram. Owner-only: the host reads it from the project and local config,
+   * never from the coordinator's control overlay (which refuses `publish.*`).
+   */
+  publish: z.object({
+    /** direct (default): push the approved commit to origin/<base>; pull-request: push a branch and open a PR with `gh`. */
+    mode: z.enum(['direct', 'pull-request']).optional(),
+    /** Absolute path of a repo-scoped SSH deploy key on the host (default: the owner's own git credentials). */
+    deployKey: z.string().min(1).max(1000).refine((p) => p.startsWith('/'), 'must be an absolute path').optional(),
+  }).strict().optional(),
   verification: z.object({
     /**
      * The fast tier (docs/design/autonomy.md Decision 12): unit tests, typecheck, lint. The dispatcher runs them on

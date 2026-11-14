@@ -221,6 +221,8 @@ export function hostSettings(h: HostHardening): { sandbox: Record<string, unknow
   if (root) deny.push(`Read(${ruleAbs(root)}/*.json)`, `Edit(${ruleAbs(root)}/*.json)`);
   // Host-only state (CLI backups; files the removed host manager left): the directory rule is also a sandbox write deny.
   if (root) readEdit(`${ruleAbs(root)}/manager`);
+  // The host publisher's state (docs/design/autonomy.md Decision 17): pending approvals and its bot's offset.
+  if (root) readEdit(`${ruleAbs(root)}/publisher`);
   deny.push(`Read(${ruleAbs(h.projectDir)}/credentials.json)`,
     `Edit(${ruleAbs(h.projectDir)}/*.json)`, `Edit(${ruleAbs(h.projectDir)}/*.yaml)`, `Edit(${secretsAbs}/**)`);
   for (const d of ['runtime', 'plugin', 'logs', 'exports', 'config-history', 'host/bin', 'host/logs', 'host/transfer']) deny.push(`Edit(${ruleAbs(h.projectDir)}/${d}/**)`);

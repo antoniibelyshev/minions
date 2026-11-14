@@ -24,6 +24,25 @@ export const credentialStoreFile = (projectId: string, name: string) => join(cre
 export const projectDir = (projectId: string) => join(hostRoot(), 'projects', projectId);
 /** Host-only, never mounted: the CLI backups `minions upgrade` keeps (src/host/cli-backup.ts). */
 export const managerDir = () => join(hostRoot(), 'manager');
+/**
+ * Host-only, never mounted, under the host runtime's sandbox read deny: the host publisher (docs/design/autonomy.md
+ * Decision 17): its bot token reference, pending approval prompts, Telegram offset, heartbeat and service record.
+ * The token itself is in the credential store (`<root>/credentials/publisher/` for the file backend).
+ */
+export const publisherDir = () => join(hostRoot(), 'publisher');
+export function publisherPaths() {
+  const dir = publisherDir();
+  return {
+    dir,
+    credentialJson: join(dir, 'credential.json'),
+    stateJson: join(dir, 'state.json'),
+    heartbeatJson: join(dir, 'heartbeat.json'),
+    serviceJson: join(dir, 'service.json'),
+    offsetJson: join(dir, 'telegram-offset.json'),
+    logFile: join(dir, 'publisher.log'),
+    lock: join(dir, 'lock'),
+  };
+}
 
 /**
  * File name of the headless Claude token in the secrets dir: a `claude setup-token` OAuth token (or an Anthropic API

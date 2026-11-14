@@ -55,7 +55,8 @@ export interface ApprovalRow { id: number; task_id: string; scope: string; head_
  */
 export const CHANGE_REQUEST_STATUSES = ['proposed', 'confirmed', 'applied', 'failed', 'rejected', 'expired'] as const;
 export type ChangeRequestStatus = (typeof CHANGE_REQUEST_STATUSES)[number];
-export const CHANGE_REQUEST_KINDS = ['upgrade'] as const;
+/** `upgrade` (`minions upgrade` in the runtime) and `publish` (`settings requests publish`, docs/design/autonomy.md Decision 17). */
+export const CHANGE_REQUEST_KINDS = ['upgrade', 'publish'] as const;
 export type ChangeRequestKind = (typeof CHANGE_REQUEST_KINDS)[number];
 export interface ChangeRequestRow {
   id: string; kind: ChangeRequestKind; payload: string; reason: string | null; created_at: string;
@@ -623,7 +624,7 @@ export class RuntimeDb {
       taskId, workflow, JSON.stringify(stages), position, nowIso());
   }
 
-  // Change requests (upgrade requests)
+  // Change requests (upgrade and publish requests)
   changeRequest(id: string): ChangeRequestRow | undefined { return this.get<ChangeRequestRow>('SELECT * FROM change_requests WHERE id = ?', id); }
   /** Open requests (proposed, confirmed, failed: the owner may retry or reject a failed one); all: every status. Oldest first. */
   changeRequests(opts: { all?: boolean } = {}): ChangeRequestRow[] {
