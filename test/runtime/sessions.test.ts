@@ -252,7 +252,8 @@ describe('hook commands never exec from a noexec /tmp (U1)', () => {
     writeFileSync(paths.claudeHeadlessTokenFile, OAUTH, { mode: 0o600 });
     const ok = await buildSessionCommand(defaults(), 'general', deps('login'));
     expect(ok.env.TMPDIR).toBe(paths.tmp);
-    expect((await buildSessionCommand(defaults(), 'general', deps('login', { env: { ...env, TMPDIR: join(root, 'scratch', 'x') } }))).env.TMPDIR).toBe(join(root, 'scratch', 'x'));
+    // A TMPDIR off /tmp is kept (not checkable when the test root itself is under /tmp, as in Linux CI).
+    if (!/^\/tmp(\/|$)/.test(root)) expect((await buildSessionCommand(defaults(), 'general', deps('login', { env: { ...env, TMPDIR: join(root, 'scratch', 'x') } }))).env.TMPDIR).toBe(join(root, 'scratch', 'x'));
     writeFileSync(join(paths.pluginDir, 'hooks', 'hooks.json'), JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: '/tmp/probe/stop.sh' }] }] } }));
     expect((await failure(buildSessionCommand(defaults(), 'general', deps('login')))).code).toBe('POLICY_DENIED');
   });

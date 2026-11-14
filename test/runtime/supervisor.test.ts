@@ -176,9 +176,10 @@ describe('session processes (fake claude)', { timeout: 30_000 }, () => {
     expect(await dead(startEv.pid!)).toBe(true);
     expect(existsSync(sessionRunRecordPath(s.state, key))).toBe(false);
     expect(s.db.supervisorLock()).toBeNull();
-    // Stopped by the supervisor between turns: no crash, and no notice (its next message resumes it).
+    // Stopped by the supervisor between turns: no crash. A task session still gets the resume notice (its leases are
+    // recovered on resume; supervisor.ts onExit), queued for its next start.
     expect(getSession(s.db, key)).toMatchObject({ status: 'open', resumes: 0 });
-    expect(pendingInbox(s.db, key)).toEqual([]);
+    expect(pendingInbox(s.db, key)).toEqual([expect.objectContaining({ source: 'supervisor', text: expect.stringMatching(/stopped \(the supervisor stopped\) and is now resumed/) })]);
   });
 
   it('a session process that crashes is resumed with --resume <id>; a completed turn resets the count', async () => {
@@ -428,7 +429,8 @@ describe('a session started through buildSessionCommand', { timeout: 30_000 }, (
     await until('message', () => events(s.log).some((e) => e.text === 'hello')).catch((e: Error) => { throw new Error(`${e.message}\n${sup.lines.join('\n')}`); });
     const ev = events(s.log).find((e) => e.ev === 'start')!;
     expect(ev.env).toMatchObject({ MINIONS_SESSION: key, CLAUDE_CONFIG_DIR: sessionConfigDir(paths, key), telegram: [], secrets: [] });
-    expect(ev.env!.TMPDIR).not.toMatch(/^\/tmp(\/|$)/);
+    // Off /tmp, unless the whole test root is there (Linux CI's tmpdir): then the scratch root is under /tmp too.
+    if (!/^\/tmp(\/|$)/.test(root)) expect(ev.env!.TMPDIR).not.toMatch(/^\/tmp(\/|$)/);
     expect(ev.argv).toEqual(expect.arrayContaining(['-p', '--input-format', 'stream-json', '--output-format', 'stream-json', '--strict-mcp-config']));
     expect(ev.argv).not.toContain('--channels');
     expect(ev.argv!.join(' ')).not.toContain(TG);
