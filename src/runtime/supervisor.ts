@@ -43,6 +43,7 @@ import { mkdir, open, readdir, readFile, rm } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import type { Writable } from 'node:stream';
 import type { MinionsConfig } from '../config/schema.js';
+import type { StaleConfigGuard } from './helper-staleness.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite } from '../core/fsutil.js';
 import { redact } from '../core/output.js';
@@ -333,6 +334,8 @@ export interface SupervisorDeps {
   reap?: Omit<ReapOptions, 'proc'>;
   /** Task sessions (phase 7); without it the supervisor opens no task session (as in phase 5). */
   tasks?: SupervisorTaskDeps;
+  /** Exit (`stale`) when the config stops loading because the code or config moved on (src/runtime/helper-staleness.ts). */
+  stale?: StaleConfigGuard;
 }
 
 export interface SupervisorTaskDeps {
@@ -342,7 +345,8 @@ export interface SupervisorTaskDeps {
   recover: (key: string) => Promise<RecoverOutcome>;
 }
 
-export type SupervisorExit = 'disabled' | 'conflict' | 'stopped' | 'lock-lost';
+/** stale: the config no longer loads after an upgrade (helper-staleness.ts); the wrapper starts the installed build. */
+export type SupervisorExit = 'disabled' | 'conflict' | 'stopped' | 'lock-lost' | 'stale';
 export interface SupervisorReport { exit: SupervisorExit; holder: SupervisorLock | null; reaped: ReapResult[]; reapErrors: { key: string; error: string }[]; starts: number; closed: number }
 
 type EndReason = 'close' | 'drain' | 'disabled' | 'shutdown' | 'idle';
@@ -385,6 +389,7 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
   const db = d.db;
   const report: SupervisorReport = { exit: 'stopped', holder: null, reaped: [], reapErrors: [], starts: 0, closed: 0 };
   let cfg = await d.config();
+  d.stale?.valid(cfg);
   if (!sessionsSettings(cfg).enabled) return { ...report, exit: 'disabled' };
 
   const self = await procIdentity(process.pid, proc);
@@ -601,7 +606,13 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
       if (db.replacedOnDisk()) { exit = 'lock-lost'; stopping = 'shutdown'; log('minions supervisor: the runtime database file was replaced (state restore?); stopping'); break; }
       if (Date.now() - configAt >= t.configMs) {
         configAt = Date.now();
-        try { cfg = await d.config(); } catch (e) { log(`minions supervisor: config unreadable, keeping the last one (${(e as Error).message})`); }
+        let why: string | null = null;
+        try { cfg = await d.config(); d.stale?.valid(cfg); } catch (e) {
+          why = d.stale?.invalid(e) ?? null;
+          if (!why) log(`minions supervisor: config unreadable, keeping the last one (${(e as Error).message})`);
+        }
+        // Sessions stop as on SIGTERM (resumed with a notice by the next supervisor); the lock is released below.
+        if (why) { exit = 'stale'; stopping = 'shutdown'; log(`minions supervisor: ${why}; exiting so the coordinator wrapper starts the installed build`); break; }
         if (!sessionsSettings(cfg).enabled) { exit = 'disabled'; stopping = 'disabled'; log('minions supervisor: coordinator.sessions.enabled is off; ending the sessions'); break; }
       }
       if (Date.now() - passAt >= t.openMs) {

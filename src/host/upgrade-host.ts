@@ -11,12 +11,20 @@
 //   `--from-container`; never from the agent workspace itself.
 // - The shim step regenerates the minions shim (prepareHostRuntime) for the CLI that runs the step: after a
 //   reinstall that is the newly installed CLI (the upgrade is handed off to it), so agents run the new CLI next.
+// - The helpers (hostHelperControl): the supervisor_lock / dispatcher_lock holders of the project's runtime DB, read
+//   read-only from the host. A holder counts only while its pid, start time, boot id and command line match the lock
+//   (supervisorAlive / dispatcherAlive); it is stopped with stopHelperProcess (SIGTERM re-checked against that identity,
+//   then a bounded wait), as a forced state restore stops them. A stale lock or a reused pid is never signalled.
 import { dirname, join } from 'node:path';
 import { hostRuntimePaths } from '../core/paths.js';
 import type { ProjectJson } from './project.js';
 import { agentWritableDirs, agentWritableHit, defaultShimTarget, prepareHostRuntime, type HostRuntime, type ShimTarget } from './runtime.js';
 import { detectInstalled, type InstalledCli } from './upgrade-source.js';
-import type { HostUpgradeTarget } from './upgrade.js';
+import type { HostHelperControl, HostUpgradeTarget, LiveHelper } from './upgrade.js';
+import { readProcessLocks, type ProcessLockKey, type SupervisorLock } from '../runtime/db.js';
+import { dispatcherAlive } from '../runtime/dispatcher.js';
+import { DB_NAME, stopHelperProcess } from '../runtime/state-backup.js';
+import { supervisorAlive } from '../runtime/supervisor.js';
 
 export { agentWritableDirs };
 
@@ -35,7 +43,39 @@ export function unsafeCliReason(o: { cliPaths: string[]; installed?: Pick<Instal
   return null;
 }
 
+/** How long the upgrade waits for a SIGTERM'd helper (the supervisor interrupts its sessions: up to ~20 s, plus margin). */
+export const UPGRADE_HELPER_STOP_TIMEOUT_MS = 60_000;
+
+export interface HelperControlDeps {
+  /** The lock rows (default readProcessLocks, read-only; null when unreadable). */
+  locks?: (db: string) => Record<ProcessLockKey, SupervisorLock | null> | null;
+  /** Identity check of a lock holder (default supervisorAlive / dispatcherAlive). */
+  alive?: (key: ProcessLockKey, l: SupervisorLock) => boolean;
+  kill?: (pid: number, sig: NodeJS.Signals) => void;
+  timeoutMs?: number;
+  pollMs?: number;
+}
+
+const HELPER_KEYS: [LiveHelper['kind'], ProcessLockKey][] = [['supervisor', 'supervisor_lock'], ['dispatcher', 'dispatcher_lock']];
+const keyOf = (kind: LiveHelper['kind']): ProcessLockKey => (kind === 'supervisor' ? 'supervisor_lock' : 'dispatcher_lock');
+const defaultAlive = (key: ProcessLockKey, l: SupervisorLock): boolean => (key === 'dispatcher_lock' ? dispatcherAlive(l) : supervisorAlive(l));
+
+/** The supervisor and dispatcher of the runtime DB `db` (the host runtime's <state>/minions.db). */
+export function hostHelperControl(db: string, o: HelperControlDeps = {}): HostHelperControl {
+  const alive = o.alive ?? defaultAlive;
+  return {
+    live: () => {
+      const locks = (o.locks ?? readProcessLocks)(db);
+      if (!locks) return null;
+      return HELPER_KEYS.flatMap(([kind, key]) => { const l = locks[key]; return l && alive(key, l) ? [{ kind, lock: l }] : []; });
+    },
+    stop: (h) => stopHelperProcess(keyOf(h.kind), h.lock, { alive, ...(o.kill ? { kill: o.kill } : {}), timeoutMs: o.timeoutMs ?? UPGRADE_HELPER_STOP_TIMEOUT_MS, ...(o.pollMs ? { pollMs: o.pollMs } : {}) }),
+  };
+}
+
 export interface HostTargetOptions {
+  /** The helper control (default: hostHelperControl on the project's runtime DB). */
+  helpers?: HostHelperControl;
   /** The CLI the shims point at (default: the running CLI). */
   target?: ShimTarget;
   /** The global install (default: detectInstalled). */
@@ -60,5 +100,6 @@ export function hostUpgradeTarget(project: ProjectJson, host: HostRuntime, o: Ho
       await (o.prepare ?? ((p, x) => prepareHostRuntime(p, x)))(project, { target });
       return `${join(hp.bin, 'minions')} -> ${target.cli}`;
     },
+    helpers: o.helpers ?? hostHelperControl(join(hp.state, DB_NAME)),
   };
 }

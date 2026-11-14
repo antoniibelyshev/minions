@@ -292,7 +292,10 @@ reset barrier.
   their record, or stops them and resumes. The router alone keeps Telegram working meanwhile.
 - **Drain or upgrade.** The supervisor opens nothing new and delivers no inbox messages except drain notices. Running
   sessions follow the drain hook (their workers write `wip:` and submit `partial`). Then the sessions end, and the
-  router goes last.
+  router goes last. On the host runtime the upgrade then stops the supervisor itself (identity-checked SIGTERM,
+  before the drain is cleared; a session still running gets the resume notice), so the restarted wrapper starts it
+  on the new build ([host-runtime.md](host-runtime.md#upgrade-and-self-update-without-a-container)). A supervisor
+  whose config stops loading after the CLI or the config revision changed exits (`stale`) for the same reason.
 - **Budget hit.** Claims are refused (unchanged). Open sessions finish their running stage, and the supervisor opens
   no new task sessions. The general session still answers the owner.
 

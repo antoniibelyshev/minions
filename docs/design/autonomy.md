@@ -308,8 +308,10 @@ them.
   no DB row, so it claims nothing and leaves notifications and topics to the primary coordinator.
 - **`minions pull` replaces `minions export`** (kept as `pull --no-ff-main`). Task refs come from the runtime (latest
   lease branch, backlog status delivered or done) because a branch slug does not encode the task id reliably. The base
-  only moves by `merge --ff-only` in a clean checkout that has it checked out; everything else is reported, since
-  moving a branch the user is not on, or a dirty tree, is the user's call.
+  only moves by `merge --ff-only` in a checkout that has it checked out and no tracked changes; everything else is
+  reported, since moving a branch the user is not on, or a dirty tree, is the user's call. Untracked files (a shared
+  install's own `.minions/`) do not block, as they do not block git, unless the incoming range adds a path one of them
+  occupies: then nothing moves and the path is named.
 
 ## Decision 14. Tools in the container (owner, 2026-10-31)
 

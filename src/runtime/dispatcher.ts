@@ -27,6 +27,7 @@
 import { readFile, rm, readdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import type { MinionsConfig } from '../config/schema.js';
+import type { StaleConfigGuard } from './helper-staleness.js';
 import { MinionsError } from '../core/errors.js';
 import { atomicWrite, ensureDir } from '../core/fsutil.js';
 import { recordDecision } from './advance.js';
@@ -523,8 +524,11 @@ export interface RunDispatcherDeps extends DispatcherDeps {
   tickMs?: number;
   /** Test seam: resolves after `ms` or when aborted. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
+  /** Exit (`stale`) when the config stops loading because the code or config moved on (src/runtime/helper-staleness.ts). */
+  stale?: StaleConfigGuard;
 }
-export type DispatcherExit = 'conflict' | 'stopped' | 'lock-lost';
+/** stale: the config no longer loads after an upgrade (helper-staleness.ts); the wrapper starts the installed build. */
+export type DispatcherExit = 'conflict' | 'stopped' | 'lock-lost' | 'stale';
 
 const abortableSleep = (ms: number, signal?: AbortSignal) => new Promise<void>((resolve) => {
   if (signal?.aborted) return resolve();
@@ -559,18 +563,23 @@ export async function runDispatcher(d: RunDispatcherDeps): Promise<{ exit: Dispa
       // A state restore swapped the DB file: this connection still reads the old one and would hold its lock forever.
       if (d.db.replacedOnDisk()) { exit = 'lock-lost'; log('minions dispatcher: the runtime database file was replaced (state restore?); stopping'); break; }
       let tick = d.tickMs ?? DEFAULT_TICK_SECONDS * 1000;
+      let why: string | null = null;
       try {
-        const cfg = await d.config();
+        let cfg: MinionsConfig;
+        try { cfg = await d.config(); d.stale?.valid(cfg); } catch (e) { why = d.stale?.invalid(e) ?? null; throw e; }
         tick = d.tickMs ?? dispatchSettings(cfg).tickMs;
         const r = await disp.pass();
         passes++;
         if (r.started.length) log(`minions dispatcher: started ${r.started.map((x) => `${x.taskId} ${x.role}`).join(', ')}`);
-      } catch (e) { log(`minions dispatcher: pass failed: ${(e as Error).message.slice(0, 300)}`); }
+      } catch (e) {
+        if (why) { exit = 'stale'; log(`minions dispatcher: ${why}; exiting so the coordinator wrapper starts the installed build`); break; }
+        log(`minions dispatcher: pass failed: ${(e as Error).message.slice(0, 300)}`);
+      }
       await sleep(tick, d.signal);
     }
-    // Stopped (an upgrade, a restart): running workers keep going in their own process groups; the next dispatcher
-    // adopts them. Lock lost: wait for the exits already being recorded.
-    if (!d.signal?.aborted) await disp.settled();
+    // Stopped (an upgrade, a restart, or stale code): running workers keep going in their own process groups; the
+    // next dispatcher adopts them. Lock lost: wait for the exits already being recorded.
+    if (!d.signal?.aborted && exit === 'lock-lost') await disp.settled();
   } finally {
     d.db.releaseSupervisorLock(lock, 'dispatcher_lock');
     log(`minions dispatcher: ${exit}`);

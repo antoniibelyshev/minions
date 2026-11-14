@@ -304,7 +304,36 @@ packed reinstall with its CLI backup, `src/host/upgrade-source.ts`). Then:
 2. snapshot the newly installed CLI into `host/cli/<fp>` (D6);
 3. regenerate the derived files (plugin, runtime config, shims pointing at the new snapshot);
 4. `workspace setup` (DB migrations) through the new shim;
-5. resume starts, then `coordinator restart --recover` on the dedicated tmux server.
+5. stop the detached session supervisor and dispatcher (step `helpers`, below);
+6. resume starts, then `coordinator restart --recover` on the dedicated tmux server;
+7. check that the stopped helpers are back under a new pid (step `helpers-check`, bounded wait).
+
+**The detached helpers (as built, fix/upgrade-restarts-helpers).** `coordinator supervise` and `work dispatch` are
+detached from the wrapper and survive its restart, still running the code they were started with and holding
+`supervisor_lock` / `dispatcher_lock`, so the new wrapper's watches start nothing. An old helper may also reject the
+regenerated runtime config (a new key such as `budgets.dailyTokens` is an "unknown field" to it): the dispatcher then
+failed every pass and the supervisor kept its last config, and the team stalled until the owner killed both by hand.
+Now:
+
+- **`helpers` (upgrade step).** After the shim and workspace steps and before the resume, the upgrade reads both
+  locks from the runtime DB (read-only) and stops each live holder: SIGTERM only while the pid, start time, boot id
+  and command line still match the lock (`supervisorAlive` / `dispatcherAlive`, `stopHelperProcess`, as a forced
+  state restore does), then a bounded wait (60 s). A stale lock or a reused pid is never signalled. The drain is still
+  in effect at that point, so coordinator sessions have already ended their turn; a session still running stops as on
+  any supervisor SIGTERM and the next supervisor resumes it with a notice. The dispatcher leaves running workers in
+  their process groups for the next dispatcher to adopt (none run after the drain). Any respawn, by the old wrapper's
+  watch before the restart or by the new one after it, goes through the regenerated shim, so it runs the installed
+  build. Nothing running (or an unreadable DB) skips the step; a helper that does not exit fails it (the upgrade
+  still finishes, `ok: false`) with the exact `ps` and `kill` commands.
+- **`helpers-check`.** After the coordinator restart, waits up to 60 s for each stopped helper to hold its lock again
+  under a new pid, else says that the wrapper's watch starts it (the dispatcher within 20 s, the supervisor within
+  60 s and only with `coordinator.sessions.enabled`). Never a failure.
+- **Backstop in the helpers (`src/runtime/helper-staleness.ts`).** When the runtime config fails to load and either
+  the CLI bundle the helper runs changed on disk since it started (a reinstall or rebuild) or the file's
+  `configRevision` differs from the last revision the helper loaded, the helper logs why and exits (`stale`),
+  releasing its lock, and the wrapper starts it again on the installed build. A config that never loaded with
+  unchanged code keeps the old behaviour (log and retry), since a restart would run the same code on the same file.
+- **Docker** needs neither: the upgrade recreates the container, which ends every process of the old one.
 
 Nothing else restarts. The tmux server, the workspace and the state stay. `restart-required.ts` gets a host branch:
 the installed CLI fingerprint differs from the snapshot the shim runs (`upgrade` required), or the launch fingerprint

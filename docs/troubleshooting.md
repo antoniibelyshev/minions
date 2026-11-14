@@ -136,6 +136,9 @@ kill <pid> <pid>                             # SIGTERM: they stop their sessions
 ```
 
 The lock holders keep running; the coordinator starts a helper again by itself when its lock is missing or stale.
+After an upgrade you do not need to do this: `minions upgrade` stops the lock holders itself (host runtime), and a
+helper whose config stops loading after the CLI or the config revision changed exits by itself (its log says
+`exiting so the coordinator wrapper starts the installed build`).
 
 ## A lease is stuck
 
@@ -202,7 +205,11 @@ minions resume --drain          # clear a drain request left behind
 The upgrade never removes volumes or re-clones the workspace. A failure before the container is
 recreated leaves the old container running and resumes starts. If the CLI itself must be rebuilt, the
 upgrade prints the exact command (or rerun with `--rebuild-cli` in a minions checkout you reviewed).
-Host runtime: upgrades are `minions down && minions start` after installing the new CLI. If the state
+Host runtime: `minions upgrade` regenerates the shims instead of recreating a container, and stops the detached
+session supervisor and dispatcher before the coordinator restart, so they come back on the new build; there is no
+need to kill them by hand. Its `helpers` step names a helper that did not exit, with the exact `ps` and `kill`
+commands; `helpers-check` says whether they are back (else the coordinator's watch starts them within a minute;
+check with `minions status`). If the state
 is damaged after an upgrade, restore the backup you took before it (`minions import --state <file>`),
 then `minions settings restart`.
 

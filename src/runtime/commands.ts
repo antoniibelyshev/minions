@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises';
+import { staleConfigGuard } from './helper-staleness.js';
 import { spawn as nodeSpawn } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { Option, type Command } from 'commander';
@@ -942,6 +943,7 @@ export function register(program: Command): void {
       const r = await runDispatcher({
         db: d, paths, signal: stop.signal,
         config: () => loadRuntimeConfig(),
+        stale: staleConfigGuard({ configPath: paths.configJson }),
         scheduler: async (cfg) => new Scheduler({ config: cfg, db: d, backlog: await getBacklog(), layout: workspaceLayout(), handoff: paths, runs: { state: paths.state, reap: (leaseId) => reapRun(leaseId, reapDeps()) } }),
         launch: launchWorker(d, { paths, log }),
         taskStatus: async (_s, taskId) => (await (await getBacklog()).getTask(taskId)).status,
@@ -1224,6 +1226,7 @@ export function register(program: Command): void {
         }),
         log: (line) => process.stderr.write(`${new Date().toISOString()} ${line}\n`),
         tasks: supervisorTaskDeps(),
+        stale: staleConfigGuard({ configPath: paths.configJson }),
       });
       emit(r, { json: globalOpts(cmd).json, human: (x: SupervisorReport) => x.exit === 'conflict'
         ? `session supervisor: already running (pid ${x.holder?.pid ?? '?'})`
