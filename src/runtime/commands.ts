@@ -14,6 +14,7 @@ import { closeSync, existsSync, mkdirSync, openSync } from 'node:fs';
 import { EXIT_CODES, MinionsError, type ErrorCode } from '../core/errors.js';
 import { readJson } from '../core/fsutil.js';
 import { emit, redact, reportError } from '../core/output.js';
+import { orphanStopLines, stopStateDirOrphans } from '../host/helper-orphans.js';
 import { approveOnHost } from '../host/approvals.js';
 import { delegateToRuntime } from '../host/delegate.js';
 import { applyDoctorExit, formatDoctor, runDoctor } from '../host/doctor.js';
@@ -944,6 +945,7 @@ export function register(program: Command): void {
         db: d, paths, signal: stop.signal,
         config: () => loadRuntimeConfig(),
         stale: staleConfigGuard({ configPath: paths.configJson }),
+        stopOrphans: async () => orphanStopLines(await stopStateDirOrphans(paths.state, paths.db, ['dispatcher'])),
         scheduler: async (cfg) => new Scheduler({ config: cfg, db: d, backlog: await getBacklog(), layout: workspaceLayout(), handoff: paths, runs: { state: paths.state, reap: (leaseId) => reapRun(leaseId, reapDeps()) } }),
         launch: launchWorker(d, { paths, log }),
         taskStatus: async (_s, taskId) => (await (await getBacklog()).getTask(taskId)).status,
@@ -1227,6 +1229,7 @@ export function register(program: Command): void {
         log: (line) => process.stderr.write(`${new Date().toISOString()} ${line}\n`),
         tasks: supervisorTaskDeps(),
         stale: staleConfigGuard({ configPath: paths.configJson }),
+        stopOrphans: async () => orphanStopLines(await stopStateDirOrphans(paths.state, paths.db, ['supervisor'])),
       });
       emit(r, { json: globalOpts(cmd).json, human: (x: SupervisorReport) => x.exit === 'conflict'
         ? `session supervisor: already running (pid ${x.holder?.pid ?? '?'})`

@@ -336,6 +336,8 @@ export interface SupervisorDeps {
   tasks?: SupervisorTaskDeps;
   /** Exit (`stale`) when the config stops loading because the code or config moved on (src/runtime/helper-staleness.ts). */
   stale?: StaleConfigGuard;
+  /** Stops orphaned supervisors of this state dir once the lock is taken (src/host/helper-orphans.ts); its log lines. */
+  stopOrphans?: () => Promise<string[]>;
 }
 
 export interface SupervisorTaskDeps {
@@ -398,6 +400,7 @@ export async function runSupervisor(d: SupervisorDeps): Promise<SupervisorReport
   if (!lock) return { ...report, exit: 'conflict', holder: db.supervisorLock() };
   report.holder = lock;
   log(`minions supervisor: started (pid ${process.pid})`);
+  d.stopOrphans?.().then((lines) => { for (const l of lines) log(`minions supervisor: ${l}`); }, (e) => log(`minions supervisor: orphan check failed: ${(e as Error).message}`));
 
   const live = new Map<string, Live>();
   let stopping: EndReason | null = null;

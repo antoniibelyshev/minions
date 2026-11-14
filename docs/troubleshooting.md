@@ -127,7 +127,13 @@ still sees itself as the lock holder there. Current versions refuse the restore 
 them with `--force`), and both exit by themselves once they notice the database file was replaced. Older
 versions, or a helper started between the stop and the swap, can leave such a pair running. Doctor lists
 each process whose working directory is this project's state dir but which does not hold its lock in the
-current database, with the command to stop it; it never stops anything itself:
+current database, with the command to stop it; it never stops anything itself.
+
+They are stopped automatically: `minions start` (host runtime) stops both kinds, and a supervisor or dispatcher
+stops orphans of its own kind right after it takes its lock (its log says `stopped orphaned ...`). A process
+counts as an orphan only when it is still the same non-holder (pid, start time, working directory) after five
+seconds, so a helper that is just starting is left alone. It gets SIGTERM; one that does not exit within 20 s is
+reported with its `kill` command. To stop them by hand:
 
 ```sh
 minions doctor                               # helpers.orphans: the pids and the exact kill command

@@ -526,6 +526,8 @@ export interface RunDispatcherDeps extends DispatcherDeps {
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Exit (`stale`) when the config stops loading because the code or config moved on (src/runtime/helper-staleness.ts). */
   stale?: StaleConfigGuard;
+  /** Stops orphaned dispatchers of this state dir once the lock is taken (src/host/helper-orphans.ts); its log lines. */
+  stopOrphans?: () => Promise<string[]>;
 }
 /** stale: the config no longer loads after an upgrade (helper-staleness.ts); the wrapper starts the installed build. */
 export type DispatcherExit = 'conflict' | 'stopped' | 'lock-lost' | 'stale';
@@ -552,6 +554,7 @@ export async function runDispatcher(d: RunDispatcherDeps): Promise<{ exit: Dispa
   let passes = 0;
   let exit: DispatcherExit = 'stopped';
   log(`minions dispatcher: started (pid ${process.pid})`);
+  d.stopOrphans?.().then((lines) => { for (const l of lines) log(`minions dispatcher: ${l}`); }, (e) => log(`minions dispatcher: orphan check failed: ${(e as Error).message}`));
   try {
     const rec = await disp.recover();
     if (rec.recorded.length || rec.released.length || rec.adopted.length) {
