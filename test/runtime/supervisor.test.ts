@@ -14,6 +14,7 @@ import { runtimePaths } from '../../src/runtime/paths.js';
 import { hostIdentity, procIdentity, procStat } from '../../src/runtime/runner/record.js';
 import { enqueueInbox, getSession, openSession, pendingInbox, updateSession } from '../../src/runtime/session-store.js';
 import { buildSessionCommand, sessionConfigDir } from '../../src/runtime/sessions.js';
+import { staleConfigGuard } from '../../src/runtime/helper-staleness.js';
 import {
   createSessionRecord, MAX_SESSION_RESUMES, readSessionRecord, reapSessionRecord, runSupervisor, sessionRunRecordPath, startSupervisorWatch, supervisorAlive,
   supervisorEnv, supervisorLockState, type LockProcessView, type SessionLauncher, type SupervisorDeps, type SupervisorSpawn, type SupervisorTiming,
@@ -139,6 +140,25 @@ describe('supervisor lock: reuse-safe', () => {
     const r = await done;
     expect(r.exit).toBe('lock-lost');
     expect(lines.join('\n')).toMatch(/database file was replaced/);
+  });
+
+  it('exits stale (lock released) when the config stops loading after an upgrade changed its revision; keeps the last config otherwise', async () => {
+    const s = setup();
+    const cfgFile = join(s.root, 'config.json');
+    writeFileSync(cfgFile, JSON.stringify({ configRevision: s.cfg.configRevision }));
+    let broken = false;
+    const lines: string[] = [];
+    const config = async () => { if (broken) throw new Error('Invalid config: budgets.dailyTokens: unknown field'); return s.cfg; };
+    const done = runSupervisor({ db: s.db, state: s.state, config, launch: s.launch, timing: { ...FAST, configMs: 20 }, lockAlive: () => false, log: (l) => lines.push(l),
+      stale: staleConfigGuard({ configPath: cfgFile, started: null }) });
+    // Same revision: an unreadable config keeps the last one (as before).
+    broken = true;
+    await until('kept the last config', () => lines.some((l) => /config unreadable, keeping the last one/.test(l)));
+    writeFileSync(cfgFile, JSON.stringify({ configRevision: s.cfg.configRevision + 1, budgets: { dailyTokens: 1 } }));
+    const r = await done;
+    expect(r.exit).toBe('stale');
+    expect(lines.join('\n')).toMatch(/configRevision \d+\) does not load.*exiting so the coordinator wrapper starts the installed build/);
+    expect(s.db.supervisorLock()).toBeNull();
   });
 
   it('subagents may not run `minions coordinator supervise`', () => {

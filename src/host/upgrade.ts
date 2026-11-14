@@ -34,6 +34,16 @@
 //   CLI (prepareHostRuntime), and it is the point of no return the recreate is for Docker. The preflight refuses a
 //   CLI that lives in (or links into) the agent-writable host runtime dirs: the shims run it outside the sandbox.
 //   The coordinator restart (no --force) is refused while a worker lease is active, so it runs only after the drain.
+// - Host runtime helpers: the detached session supervisor (`coordinator supervise`) and dispatcher (`work dispatch`)
+//   outlive the coordinator restart and keep their old in-memory code (and their locks, so the new wrapper's watches
+//   start nothing; an old helper may also reject the regenerated config). The `helpers` step stops them after the shim
+//   and workspace steps and before the resume: identity-checked SIGTERM (pid, start time, boot id and command line of
+//   the lock holder, never a bare pid), while the drain is still in effect, so coordinator sessions have already ended
+//   their turn; the supervisor stops any session still running as on any SIGTERM, and the next supervisor resumes it
+//   with a notice. Any respawn (the old wrapper's watch, then the restarted wrapper's) goes through the regenerated shim,
+//   so it runs the installed build. Nothing running: skipped, never a failure. After the coordinator restart,
+//   `helpers-check` waits (bounded) for each stopped helper to be back under a new pid, or says when it will start.
+//   Docker needs neither step: the recreate ends every process of the old container.
 import { rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { MinionsError } from '../core/errors.js';
@@ -45,6 +55,7 @@ import { aptImageTag, buildFingerprint, ensureAptImage, ensureImage, imageBuildL
 import { parseEnvelope, type ImportResult } from './transfer.js';
 import type { CliCheck, SourcePhase, SourceStop, SyncResult } from './upgrade-source.js';
 import { isChangeRequestId } from '../runtime/change-requests.js';
+import type { SupervisorLock } from '../runtime/db.js';
 
 export const DEFAULT_UPGRADE_TIMEOUT_SEC = 1800;
 /** --timeout <seconds>: a whole number >= 0 (empty is refused); default DEFAULT_UPGRADE_TIMEOUT_SEC, or 0 with --now. */
@@ -56,10 +67,30 @@ export function upgradeTimeout(raw: string | undefined, now: boolean): number {
 }
 export const UPGRADE_RELEASE_REASON = 'interrupted by minions upgrade --now (container recreated); re-dispatch on recovery';
 
-export type UpgradeStepId = 'sync' | 'cli' | 'preflight' | 'pause' | 'drain' | 'files' | 'image' | 'secrets' | 'recreate' | 'shim' | 'workspace' | 'import' | 'resume' | 'coordinator';
-export const UPGRADE_STEPS: readonly UpgradeStepId[] = ['sync', 'cli', 'preflight', 'pause', 'drain', 'files', 'image', 'secrets', 'recreate', 'shim', 'workspace', 'import', 'resume', 'coordinator'];
-/** The steps of a host-runtime upgrade (no image, container or origin step; `shim` takes the recreate's place). */
-export const HOST_UPGRADE_STEPS: readonly UpgradeStepId[] = ['sync', 'cli', 'preflight', 'pause', 'drain', 'files', 'secrets', 'shim', 'workspace', 'resume', 'coordinator'];
+export type UpgradeStepId = 'sync' | 'cli' | 'preflight' | 'pause' | 'drain' | 'files' | 'image' | 'secrets' | 'recreate' | 'shim' | 'workspace' | 'import' | 'helpers' | 'resume' | 'coordinator' | 'helpers-check';
+export const UPGRADE_STEPS: readonly UpgradeStepId[] = ['sync', 'cli', 'preflight', 'pause', 'drain', 'files', 'image', 'secrets', 'recreate', 'shim', 'workspace', 'import', 'helpers', 'resume', 'coordinator', 'helpers-check'];
+/**
+ * The steps of a host-runtime upgrade (no image, container or origin step; `shim` takes the recreate's place; the
+ * detached helpers are stopped before the resume and checked after the coordinator restart).
+ */
+export const HOST_UPGRADE_STEPS: readonly UpgradeStepId[] = ['sync', 'cli', 'preflight', 'pause', 'drain', 'files', 'secrets', 'shim', 'workspace', 'helpers', 'resume', 'coordinator', 'helpers-check'];
+
+/** A detached runtime helper of the host runtime: the live holder of its lock in the runtime DB. */
+export type HelperKind = 'supervisor' | 'dispatcher';
+export interface LiveHelper { kind: HelperKind; lock: SupervisorLock }
+/** The host runtime's supervisor and dispatcher (src/host/upgrade-host.ts hostHelperControl; faked in tests). */
+export interface HostHelperControl {
+  /** The live lock holders, identity-checked (pid, start time, boot id, command line); null when the DB is unreadable. */
+  live: () => LiveHelper[] | null;
+  /** SIGTERM to the holder only while its identity still matches, then wait for it to exit; true once it is gone. */
+  stop: (h: LiveHelper) => Promise<boolean>;
+}
+const HELPER_LABEL: Record<HelperKind, string> = { supervisor: 'session supervisor', dispatcher: 'dispatcher' };
+/** How often the wrapper's watches look for a missing helper (src/runtime/commands.ts, supervisor.ts). */
+const HELPER_WATCH: Record<HelperKind, string> = { supervisor: 'within 60 s', dispatcher: 'within 20 s' };
+/** How long `helpers-check` waits for the stopped helpers to come back after the coordinator restart. */
+export const DEFAULT_HELPER_WAIT_MS = 60_000;
+const HELPER_POLL_MS = 2_000;
 
 /** What a host-runtime upgrade drives instead of the container (src/host/upgrade-host.ts builds it; faked in tests). */
 export interface HostUpgradeTarget {
@@ -73,6 +104,8 @@ export interface HostUpgradeTarget {
   shimPlan: string;
   /** Regenerates the minions shim for the installed CLI; returns the step detail. */
   regenerate: () => Promise<string>;
+  /** The detached session supervisor and dispatcher (stopped so the wrapper restarts them on the installed build). */
+  helpers: HostHelperControl;
 }
 export type UpgradeStepStatus = 'done' | 'skipped' | 'failed' | 'planned';
 export interface UpgradeStep { id: UpgradeStepId; status: UpgradeStepStatus; detail: string }
@@ -100,6 +133,11 @@ export interface UpgradeResult {
   plugin?: { matches: boolean; detail: string } | null;
   /** Open upgrade requests (proposed or failed) this successful upgrade marked `applied` (absent: none, or not read). */
   requestsApplied?: string[];
+  /**
+   * Host runtime: the helpers the `helpers` step found running and whether each one exited (`stopped`), and after the
+   * coordinator restart the pid each one came back with (`back`; null: not back within the wait).
+   */
+  helpers?: { kind: HelperKind; pid: number; stopped: boolean; back?: number | null }[];
 }
 
 export interface UpgradeOptions {
@@ -131,6 +169,8 @@ export interface UpgradeOptions {
   sleep?: (ms: number) => Promise<void>;
   clock?: () => number;
   pollMs?: number;
+  /** Host runtime: how long `helpers-check` waits for the stopped helpers to come back (default DEFAULT_HELPER_WAIT_MS). */
+  helperWaitMs?: number;
   /** Source phase run first (--from-container sync and the CLI check); see src/host/upgrade-source.ts. */
   source?: () => Promise<SourcePhase<UpgradeResult>>;
   /** SIGINT/SIGTERM handling during the container steps (default: the process signals). */
@@ -197,6 +237,7 @@ const lastLine = (r: { stdout: string; stderr: string }) =>
   (r.stderr || r.stdout).trim().split('\n').filter(Boolean).slice(-1)[0]?.slice(0, 300) ?? 'no output';
 const errMsg = (e: unknown) => (e instanceof Error ? e.message : String(e)).slice(0, 300);
 const leaseLabel = (l: LeaseInfo) => `${l.id} (${l.task_id}, ${l.role})`;
+const helperLabel = (h: LiveHelper) => `${HELPER_LABEL[h.kind]} (pid ${h.lock.pid})`;
 const signalExit = (s: NodeJS.Signals) => (s === 'SIGTERM' ? 143 : 130);
 
 /** `work release` refused because the lease already ended (CONFLICT): it finished on its own after the last poll. */
@@ -300,8 +341,12 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
       p('secrets', 'materialize stored tokens into the project secrets dir');
       p('shim', host.shimPlan);
       p('workspace', 'minions workspace setup (through the shim)');
+      const live = running ? host.helpers.live() : null;
+      const now = live === null ? 'not readable now' : live.length ? `running now: ${live.map(helperLabel).join(', ')}` : 'none running now';
+      p('helpers', `stop the project's session supervisor and dispatcher if they run (${now}): identity-checked SIGTERM while the drain holds, so the coordinator wrapper restarts them on the installed build`);
       if (userPaused) step('resume', 'skipped', 'starts were paused before the upgrade; left paused'); else p('resume', 'resume new starts (minions resume --starts)');
       p('coordinator', 'minions coordinator restart --recover (through the shim; refused while a worker lease is active, so only after the drain)');
+      p('helpers-check', `wait up to ${Math.round((opts.helperWaitMs ?? DEFAULT_HELPER_WAIT_MS) / 1000)}s for the stopped helpers to be back under a new pid (else they start on the wrapper's next watch tick)`);
       return result;
     }
     p('files', 'regenerate compose.yaml, runtime config and plugin from the installed package');
@@ -409,6 +454,30 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
         await checkpoint();
       }
     }
+  };
+
+  /** After the coordinator restart: each stopped helper back under a new pid within the wait, or when it will start. */
+  const helpersCheck = async (ctl: HostHelperControl, stopped: NonNullable<UpgradeResult['helpers']>, restarted: boolean) => {
+    const gone = stopped.filter((h) => h.stopped);
+    if (!gone.length) { step('helpers-check', 'skipped', 'no helper was stopped'); return; }
+    if (!restarted) {
+      step('helpers-check', 'skipped', `the coordinator did not restart; its wrapper starts the ${gone.map((h) => HELPER_LABEL[h.kind]).join(' and ')} when it runs (\`minions start --no-attach\`)`);
+      return;
+    }
+    const backPid = (live: LiveHelper[] | null, h: (typeof gone)[number]) => live?.find((l) => l.kind === h.kind && l.lock.pid !== h.pid)?.lock.pid ?? null;
+    const waitMs = opts.helperWaitMs ?? DEFAULT_HELPER_WAIT_MS;
+    let live: LiveHelper[] | null = null;
+    for (let waited = 0; ; waited += HELPER_POLL_MS) {
+      try { live = ctl.live(); } catch { live = null; }
+      if (gone.every((h) => backPid(live, h) !== null) || waited >= waitMs) break;
+      await sleep(HELPER_POLL_MS);
+    }
+    for (const h of gone) h.back = backPid(live, h);
+    const back = gone.filter((h) => h.back !== null).map((h) => `${HELPER_LABEL[h.kind]} (pid ${h.back})`);
+    const missing = gone.filter((h) => h.back === null);
+    if (!missing.length) { step('helpers-check', 'done', `back on the installed build: ${back.join(', ')}`); return; }
+    const later = missing.map((h) => `the ${HELPER_LABEL[h.kind]} ${HELPER_WATCH[h.kind]}`).join(' and ');
+    step('helpers-check', 'skipped', `${back.length ? `back: ${back.join(', ')}; ` : ''}not running yet after ${Math.round(waitMs / 1000)}s: the coordinator wrapper's watch starts ${later} (the supervisor only with coordinator.sessions.enabled); check with \`minions status\``);
   };
 
   const containerSteps = async (): Promise<UpgradeResult> => {
@@ -551,6 +620,26 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
       for (const w of r.warnings) log(`warning: ${w}`);
       return `${r.baseBranch} refreshed`;
     });
+    // ---- host runtime: stop the detached helpers (they run the old code; the wrapper restarts them on the new) ----
+    const stopped: NonNullable<UpgradeResult['helpers']> = [];
+    if (host) {
+      try {
+        const live = host.helpers.live();
+        if (live === null) step('helpers', 'skipped', 'the runtime DB is not readable; no helper stopped (if a supervisor or dispatcher still runs the old build, `minions doctor` lists it)');
+        else if (!live.length) step('helpers', 'skipped', 'no session supervisor or dispatcher running');
+        else {
+          for (const h of live) stopped.push({ kind: h.kind, pid: h.lock.pid, stopped: await host.helpers.stop(h).catch(() => false) });
+          result.helpers = stopped;
+          const stuck = stopped.filter((h) => !h.stopped);
+          const done = stopped.filter((h) => h.stopped).map((h) => `${HELPER_LABEL[h.kind]} (pid ${h.pid})`);
+          if (stuck.length) {
+            const pids = stuck.map((h) => h.pid).join(' ');
+            step('helpers', 'failed', `${done.length ? `stopped ${done.join(', ')}; ` : ''}${stuck.map((h) => `${HELPER_LABEL[h.kind]} (pid ${h.pid})`).join(', ')} did not exit and keeps running the old build: check \`ps -o pid,lstart,command -p ${stuck.map((h) => h.pid).join(',')}\`, then \`kill ${pids}\``);
+            result.ok = false;
+          } else step('helpers', 'done', `stopped ${done.join(', ')}; the coordinator wrapper restarts them on the installed build`);
+        }
+      } catch (e) { step('helpers', 'failed', errMsg(e)); result.ok = false; }
+    }
     let notOurs = userPaused ? 'starts were paused before the upgrade; left paused' : 'starts were not paused by the upgrade';
     if (deferred) {
       try {
@@ -571,6 +660,7 @@ export async function runUpgrade(opts: UpgradeOptions): Promise<UpgradeResult> {
       result.coordinator = d;
       return `${d.action ?? 'unknown'} (${d.reason ?? ''})`;
     });
+    if (host) await helpersCheck(host.helpers, stopped, steps.some((x) => x.id === 'coordinator' && x.status === 'done'));
     if (result.ok) {
       const applied = await closeOpenRequests(exec, new Date(clock()).toISOString()).catch((e: unknown) => { log(`warning: upgrade requests not marked applied: ${errMsg(e)}`); return []; });
       if (applied.length) { result.requestsApplied = applied; log(`requests: marked ${applied.join(', ')} applied`); }
