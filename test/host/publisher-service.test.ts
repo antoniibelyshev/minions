@@ -119,6 +119,17 @@ describe('publisher token', () => {
     expect(existsSync(file)).toBe(false);
   });
 
+  it('the service process waits (heartbeat says why) without a token, and leaves the lock when it stops', async () => {
+    const { runPublisher } = await import('../../src/host/publisher.js');
+    const { readHeartbeat } = await import('../../src/host/publisher-service.js');
+    const ac = new AbortController();
+    const code = await runPublisher({ signal: ac.signal, log: () => undefined, cliChanged: () => false, sleep: async () => { ac.abort(); } });
+    expect(code).toBe(0);
+    expect(await readHeartbeat()).toMatchObject({ state: 'waiting', detail: expect.stringMatching(/no publisher bot token/), botId: null });
+    expect(existsSync(publisherPaths().lock)).toBe(false);
+    expect(await runPublisher({ log: () => undefined, cliChanged: () => true })).toBe(75);
+  });
+
   it('push credentials as the service sees them', () => {
     expect(isSshUrl('git@github.com:o/r.git')).toBe(true);
     expect(isSshUrl('ssh://git@host/r.git')).toBe(true);
