@@ -3,7 +3,7 @@
 // session) to plan. A fake clock and fake restarts; no subprocess.
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   effectiveGoals, goalsHash, goalsView, humanGoals, parseGoals, readGoalsState, readGoalsText, RETRO_EVERY_DONE, runtimeGoalsPath, writeGoalsState,
   type GoalsState,
@@ -245,7 +245,10 @@ describe('runRoutinePass: planning', () => {
   it('status shows the goal counts and the plan line', async () => {
     const t = planEnv();
     await runRoutinePass(t.deps, { trigger: 'clock' });
-    const s = await collectStatus({ db: t.env.db, config: t.env.config, backlog: async () => t.env.backlog, goals: () => goalsView(GOALS, empty()) });
+    // collectStatus reads the real clock: pin it to the pass's day, or "today" is another day.
+    vi.useFakeTimers({ toFake: ['Date'], now: T0 });
+    let s: Awaited<ReturnType<typeof collectStatus>>;
+    try { s = await collectStatus({ db: t.env.db, config: t.env.config, backlog: async () => t.env.backlog, goals: () => goalsView(GOALS, empty()) }); } finally { vi.useRealTimers(); }
     expect(s.goals).toEqual({ present: true, counts: { open: 2, done: 1, paused: 1 }, exhausted: null });
     const h = humanStatus(s);
     expect(h).toContain('goals: 2 open, 1 done, 1 paused');
