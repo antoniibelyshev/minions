@@ -33,7 +33,8 @@ describe.each(guarded)('tester: $name hook command fails closed ($guard guard)',
   it('blocks (exit 2) when the binary is missing, and the shell error is what was seen', () => {
     const r = runHookCommand(command, null, stdin);
     expect(r.status).toBe(2);
-    expect(r.stderr).toMatch(/minions.*(not found|No such file)/);
+    // GNU timeout and shells name the binary; uutils timeout (Ubuntu's Rust coreutils) does not.
+    expect(r.stderr).toMatch(/minions.*(not found|No such file)|failed to execute process: No such file/);
   });
 
   it('blocks a crash, and the fake really ran (not a failed exec from a noexec TMPDIR)', () => {
