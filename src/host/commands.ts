@@ -27,6 +27,7 @@ import { loadEffectiveConfig, loadProjectJson, type ProjectJson } from './projec
 import { projectForPath } from './registry.js';
 import { composeTarget, exportRepo, exportState, importRepo, importState, inspectStateBackup, type TransferTarget } from './transfer.js';
 import { fastForwardBase } from './pull.js';
+import { registerAuthPublisher } from './publisher-cli.js';
 import { agentWritableDirs, hostUpgradeTarget } from './upgrade-host.js';
 import { HOST_RUNTIME_WARNING, HostRuntime, RUNTIMES, prepareHostRuntime, requireHostTools, runtimeOf, type RuntimeKind } from './runtime.js';
 import { registerRuntime } from './runtime-cli.js';
@@ -809,6 +810,8 @@ export function register(program: Command): void {
             : `It is mounted read-only at ${CONTAINER.codexKeyFile} on the next \`minions start\`.`,
       ].join('\n') });
     }));
+
+  registerAuthPublisher(auth, { readSecret, readStdin: readStdinSecret, say });
 
   registerRuntime(program, { confirm, ask: askLine });
   registerMode(program);

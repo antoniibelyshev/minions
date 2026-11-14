@@ -22,6 +22,7 @@ export const INTEGRATION_TESTS: readonly string[] = [
   'test/host/host-hardening-29.test.ts',
   'test/host/init-fixture.test.ts',
   'test/host/install-git.test.ts',
+  'test/host/publish-git.test.ts',
   'test/host/pull-git.test.ts',
   'test/host/repo-bootstrap.test.ts',
   'test/host/runtime-processes.test.ts',

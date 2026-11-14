@@ -169,6 +169,23 @@ function deliveryGuidance(cfg: MinionsConfig): string {
   ].join('\n');
 }
 
+/**
+ * Publishing (docs/design/autonomy.md Decision 17): when the agents move the base (not supervised), the coordinator
+ * proposes publishing a meaningful batch; the host publisher asks the owner and pushes. Supervised: the owner
+ * integrates and publishes, so nothing is proposed.
+ */
+function publishGuidance(cfg: MinionsConfig): string {
+  const base = code(cfg.git.baseBranch);
+  if (cfg.mode === 'supervised') return 'Publishing to the git remote is the owner\'s: never propose a publish request and never push.';
+  const how = cfg.publish?.mode === 'pull-request' ? 'as a pull request' : `straight to ${base}`;
+  return [
+    `**Publishing** to the git remote: you never push. After a meaningful batch has landed on ${base} (a goal met, about five tasks \`done\` since the last publish request, or a fix the owner is waiting for), propose it once: \`minions settings requests publish --summary "<what the owner gets, one or two sentences>" --task <id> --task <id> --json\` (the ${base} head; \`--sha <full sha>\` for an earlier commit of ${base}). It only records a request. The host publisher shows the owner the commit count, the tasks and your summary (quoted as yours) through its own Telegram bot, which you cannot reach, and pushes exactly that commit (${how}) after the owner taps Publish.`,
+    '',
+    '- Propose only verified, landed work; one open request at a time (a newer one supersedes the older); never while draining; after "Not now", wait for the next batch.',
+    '- Follow it with `minions settings requests --all --json`: `applied` = published (the detail says where); `rejected` = not published, with the reason (a secret or large-file finding: file a task that removes it from the range, never work around the scan; "no git remote": publishing is unavailable in this project, stop proposing); `failed` = the push failed: tell the owner. Say "published" only for an `applied` request.',
+  ].join('\n');
+}
+
 /** deliveryGuidance with local integration on: the runtime integrates; the coordinator reports and repairs. */
 function localIntegrationGuidance(cfg: MinionsConfig): string {
   const b = cfg.git.baseBranch;
@@ -555,7 +572,7 @@ function baseVars(cfg: MinionsConfig, runtime: PluginRuntime = 'docker'): Record
     workflowGuidance: workflowGuidance(cfg),
     processHarnessGuidance: processHarnessGuidance(cfg),
     workflowNames: inlineList(workflowNames(cfg).filter((n) => n !== DEFAULT_WORKFLOW), 'none configured yet'),
-    deliveryGuidance: deliveryGuidance(cfg),
+    deliveryGuidance: `${deliveryGuidance(cfg)}\n\n${publishGuidance(cfg)}`,
     baseBranch: cfg.git.baseBranch,
     architectureGuidance: architectureGuidance(cfg),
     verificationCommandsInline: inlineList(cfg.verification.commands, 'none configured (find and run the project\'s own checks)'),

@@ -24,6 +24,7 @@ import { mergeOverlay, projectOverlayText } from './control-overlay.js';
 import type { EffectiveConfig } from '../config/resolve.js';
 import { checkPlugin, pluginMismatch, type PluginCheck } from './install.js';
 import { projectForPath } from './registry.js';
+import { publishingChecks, type PublishCheck } from './publisher-cli.js';
 import { harnessChecks, harnessSkipChecks, parseWorkProbe } from './harness-checks.js';
 import { hostOrphanHelperCheck, listHelperProcesses, type HelperProcess } from './helper-orphans.js';
 import { harnessView } from '../runtime/sandbox/probe.js';
@@ -428,6 +429,8 @@ export async function runDoctor(opts: {
     add('project', 'ok', `${project.projectId} (${project.visibility}, ${project.mode}) at ${project.repoPath}`);
     const auth = authOf(project);
     await hostAuthChecks(project.projectId, auth, add, runtimeOf(project));
+    // Publishing (docs/design/autonomy.md Decision 17): never a FAIL; work stays local without it.
+    for (const c of await publishingChecks(project, { runner }).catch((): PublishCheck[] => [])) checks.push(c);
     const baseUrl = containerEnv(auth).ANTHROPIC_BASE_URL;
     let config: MinionsConfig | undefined;
     let baseEff: EffectiveConfig | null = null;

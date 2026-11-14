@@ -1,7 +1,7 @@
 // `minions setup`: one guided command for the whole host-side setup (decision record:
 // docs/design/bootstrap.md, "Guided setup").
 //
-// Order: init (mode first; Claude auth and git identity only when defaults.json does not answer them) -> Telegram (token + pairing guidance) -> agents (which harness does
+// Order: init (mode first; Claude auth and git identity only when defaults.json does not answer them) -> Telegram (token + pairing guidance) -> publishing (the host publisher bot and service, docs/design/autonomy.md Decision 17) -> agents (which harness does
 // the work; src/host/harness-setup.ts) -> runtime start
 // (container, or the host runtime), repository import, coordinator launch -> attach/pair instructions.
 //
@@ -17,11 +17,15 @@ import { MinionsError } from '../core/errors.js';
 import { readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { projectPaths } from '../core/paths.js';
 import {
-  backendLabel, provisionCodexKey, loadCredentialRefs, provisionTelegramToken, telegramBotGuidance, type CredentialsJson, type Fetch,
+  backendLabel, provisionCodexKey, loadCredentialRefs, loadPublisherCredentialRef, provisionTelegramToken, telegramBotGuidance, type CredentialsJson, type Fetch,
 } from './credentials.js';
 import type { DockerProbe } from './discovery.js';
 import type { Runner } from './docker.js';
 import { harnessStep } from './harness-setup.js';
+import { loadDefaults } from './auth.js';
+import { runDefaultsSet } from './defaults-cli.js';
+import { enablePublishing, publisherBotGuidance, type EnablePublishingResult } from './publisher-cli.js';
+import { installPublisherService, serviceHost, type ServiceResult } from './publisher-service.js';
 import { formatPlan, runInit, type InitResult } from './install.js';
 import { loadEffectiveConfig, loadProjectJson } from './project.js';
 import { findByCommonDir, gitCommonDir, loadRegistry, repoRoot } from './registry.js';
@@ -73,9 +77,21 @@ export interface SetupOptions {
   dockerProbe?: DockerProbe;
   runner?: Runner;
   fetch?: Fetch;
+  /** Publishing (Decision 17): stores the publisher token and installs the service; keeps an installed one current. Faked in tests. */
+  publisher?: SetupPublisher;
 }
 
-export type StepId = 'init' | 'telegram' | 'harness' | 'container' | 'import' | 'coordinator';
+export interface SetupPublisher {
+  enable(token: string, verify: boolean): Promise<EnablePublishingResult>;
+  ensureService(): Promise<ServiceResult>;
+}
+
+const realPublisher = (o: Pick<SetupOptions, 'runner' | 'fetch'>): SetupPublisher => ({
+  enable: (token, verify) => enablePublishing(token, { verify, runner: o.runner, fetch: o.fetch }),
+  ensureService: () => installPublisherService(serviceHost()),
+});
+
+export type StepId = 'init' | 'telegram' | 'publish' | 'harness' | 'container' | 'import' | 'coordinator';
 export type StepStatus = 'done' | 'kept' | 'changed' | 'skipped' | 'failed' | 'deferred' | 'planned';
 export interface SetupStep { id: StepId; status: StepStatus; detail: string; later?: string; lines?: string[] }
 
@@ -269,6 +285,10 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   }
   if (channel !== config.communication.channel) setLocal('communication.channel', channel);
 
+  // ---------------------------------------------------------------- 4. publishing (docs/design/autonomy.md Decision 17)
+  if (interactive) say('\n== Publishing ==');
+  step(await publishStep({ interactive, io, remoteUrl: project.remoteUrl, publisher: opts.publisher ?? realPublisher(opts), inRepo: cmds.inRepo }));
+
   // ---------------------------------------------------------------- 5b. agents (harnesses; agent-runtimes D8)
   if (interactive && !hostRuntime && !opts.configFile) say('\n== Agents ==');
   const h = await harnessStep({
@@ -342,6 +362,44 @@ export async function runSetup(opts: SetupOptions): Promise<SetupResult> {
   };
 }
 
+/**
+ * Publishing: unavailable without a git remote; with a stored publisher token the service is kept installed and current;
+ * otherwise (interactive) offered: the owner's Telegram id when defaults do not have it, then the token of a separate bot.
+ */
+async function publishStep(o: { interactive: boolean; io?: WizardIO; remoteUrl: string | null; publisher: SetupPublisher; inRepo: (c: string) => string }): Promise<SetupStep> {
+  const later = `Run ${o.inRepo('minions auth publisher')} to publish approved work after your OK in Telegram.`;
+  if (!o.remoteUrl) return { id: 'publish', status: 'skipped', detail: `no git remote (origin): publishing is unavailable; approved work stays local (fetch it with ${o.inRepo('minions pull')})`, later: 'Add a remote (`git remote add origin <url>`) and rerun setup.' };
+  const ref = await loadPublisherCredentialRef().catch(() => null);
+  if (ref) {
+    try {
+      const s = await o.publisher.ensureService();
+      return { id: 'publish', status: 'kept', detail: `publisher bot ${ref.botId}; service ${s.action}; approved publishes go to ${o.remoteUrl}`, ...(s.warnings.length ? { lines: s.warnings.map((w) => `warning: ${w}`) } : {}) };
+    } catch (e) {
+      return { id: 'publish', status: 'failed', detail: `publisher bot ${ref.botId} stored, but the service could not be installed: ${errMsg(e, 'service install failed')}`, later };
+    }
+  }
+  if (!o.interactive) return { id: 'publish', status: 'skipped', detail: `not set up: approved work is not pushed to ${o.remoteUrl}`, later };
+  const io = o.io!;
+  if (!await yesNo(io, `Publish approved work to ${o.remoteUrl} after your OK in Telegram (a separate publisher bot asks you; nothing is pushed without a tap)?`, true)) {
+    return { id: 'publish', status: 'skipped', detail: `publishing not set up; push by hand with ${o.inRepo('minions pull && git push')}`, later };
+  }
+  try {
+    const defaults = await loadDefaults();
+    if (!defaults.telegram?.owner) {
+      const id = (await io.ask('Your numeric Telegram user id (only presses from this account count; @userinfobot tells you)', '')).trim();
+      await runDefaultsSet('telegram.owner', id);
+    }
+    for (const l of publisherBotGuidance()) io.info(`  ${l}`);
+    const token = io.secret ? await io.secret('Publisher bot token (input hidden): ') : (() => { throw new MinionsError('PRECONDITION', 'no terminal for a non-echoing prompt'); })();
+    const verify = await yesNo(io, 'Check the token with Telegram now (Bot API getMe; sends it to api.telegram.org)?', false);
+    const r = await o.publisher.enable(token, verify);
+    return { id: 'publish', status: 'done', detail: `publisher bot ${r.token.botId} stored in ${backendLabel(r.token.backend)}; service ${r.service.action}; send /start to the bot from your Telegram account`,
+      ...(r.warnings.length ? { lines: r.warnings.map((w) => `warning: ${w}`) } : {}) };
+  } catch (e) {
+    return { id: 'publish', status: 'failed', detail: `${errMsg(e, 'could not set up publishing')}; nothing is pushed`, later };
+  }
+}
+
 function importStep(r: ImportResult, status: StepStatus): SetupStep {
   return { id: 'import', status, detail: `${r.baseBranch} @ ${r.commit.slice(0, 12)}`, ...(r.warnings.length ? { lines: r.warnings.map((w) => `warning: ${w}`) } : {}) };
 }
@@ -349,6 +407,7 @@ function importStep(r: ImportResult, status: StepStatus): SetupStep {
 function dryRunResult(init: InitResult, steps: SetupStep[], refs: CredentialsJson, rerun: boolean, localPath: string): SetupResult {
   const would = (id: StepId, detail: string) => steps.push({ id, status: 'planned', detail });
   would('telegram', refs.telegram ? `bot ${refs.telegram.botId} stored: would offer keep/change/disable` : 'would ask "Set up Telegram?" (default no); bot token entered without echo');
+  would('publish', 'would keep the publisher service current when a publisher bot is stored, or (with a git remote) offer Telegram-approved publishing');
   would('harness', 'would ask "Which agent should do the work?" (default Claude Code; OpenAI Codex: OpenAI API key without echo, model, and in this version the read-only codex-reviewer stage after the Claude reviewer)');
   would('container', 'would build the image if needed and start the container (idempotent)');
   would('import', 'would import committed history of the base branch unless already imported');
