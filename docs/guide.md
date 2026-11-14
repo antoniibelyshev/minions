@@ -1,6 +1,6 @@
 # minions guide
 
-minions installs a small Claude Code development team into a Git project on your Mac. A **coordinator** takes requests from a terminal or Telegram, keeps an execution backlog, and hands bounded pieces of work to **engineer**, **reviewer**, and (for QA) **tester** workers. It delivers the results as local commits on branches, which you fetch with `minions export`. minions works only locally: it never pushes or talks to GitHub; you push the base branch yourself.
+minions installs a small Claude Code development team into a Git project on your Mac. A **coordinator** takes requests from a terminal or Telegram, keeps an execution backlog, and hands bounded pieces of work to **engineer**, **reviewer**, and (for QA) **tester** workers. It delivers the results as local commits on branches, which you fetch with `minions pull`. Agents never push: the team can propose a publish, and a trusted process on your Mac pushes it after you approve it with one tap in Telegram (see [Publishing](#publishing)); otherwise you push the base branch yourself.
 
 Everything the model controls runs inside one Docker container per project. Your Mac runs only a small, trusted `minions` CLI. (You can explicitly opt into a less safe **host runtime** without Docker; see [Running without Docker](#running-without-docker).) That CLI installs the team, starts and stops the container, provisions the credentials you grant, and handles explicit import and export.
 
@@ -20,6 +20,7 @@ Everything the model controls runs inside one Docker container per project. Your
 - [Task lifecycle](#task-lifecycle)
 - [Custom roles](#custom-roles)
 - [Delivery, review, and merging](#delivery-review-and-merging)
+- [Publishing](#publishing)
 - [Permissions and capabilities](#permissions-and-capabilities)
 - [Sensitive changes](#sensitive-changes)
 - [Configuration](#configuration)
@@ -344,7 +345,7 @@ The coordinator then creates research tasks with `--workflow research`. `minions
 
 ## Delivery, review, and merging
 
-minions works only locally: it never pushes or talks to GitHub; you push the base branch yourself. Workers commit on `agent/<slug>` branches in the runtime's own clone. An approved task that is not merged yet is reported as **delivered**; once it lands on the container's local base branch it is **done**. Who merges depends on `delivery.merge` and the mode (see [Coordinator defaults](#coordinator-defaults)).
+Agents never push or talk to GitHub: the base reaches your remote when you push it, or through [Publishing](#publishing) after your one-tap approval. Workers commit on `agent/<slug>` branches in the runtime's own clone. An approved task that is not merged yet is reported as **delivered**; once it lands on the container's local base branch it is **done**. Who merges depends on `delivery.merge` and the mode (see [Coordinator defaults](#coordinator-defaults)).
 
 | `delivery.merge` | Behavior |
 | - | - |
@@ -357,11 +358,44 @@ minions works only locally: it never pushes or talks to GitHub; you push the bas
 
 1. `minions export` fetches the container's branches into `refs/remotes/minions/*` (`agent/*`, and the integrated base as `minions/<base>`); your local branches are untouched. Review with `git log <base>..minions/<base>`.
 2. Fast-forward your base to it: `git merge --ff-only minions/<base>` with the base checked out, or `minions upgrade --sync-only`, which exports and fast-forwards in one step and refuses tracked changes or a divergence (it never merges, resets or force-updates). Untracked files, such as a shared install's own `.minions/`, do not block `minions pull` or `--sync-only`, unless the incoming range adds a path one of them occupies: then nothing moves and the path is named. In a minions checkout, `minions upgrade --from-container` does the same before it upgrades the container.
-3. Push it yourself: `git push origin <base>`. If your remote requires pull requests, push a branch instead (`git push origin minions/<base>:refs/heads/<name>`) and open the pull request from it.
+3. Push it yourself: `git push origin <base>`. If your remote requires pull requests, push a branch instead (`git push origin minions/<base>:refs/heads/<name>`) and open the pull request from it. Or let [Publishing](#publishing) do steps 1 to 3 after your OK in Telegram.
 
 The gate runs the full suite while workers run theirs, and the container's process limit counts threads; see [The verification gate fails under load](troubleshooting.md#the-verification-gate-fails-under-load) if it fails with timeouts or `EAGAIN`.
 
 **Evidence is tied to commits.** Test results, the review verdict, and local checks are recorded against a head SHA and a config revision. A new commit invalidates stale evidence.
+
+## Publishing
+
+The agents never push. When a meaningful batch has landed on the base (a goal met, about five tasks done, or a fix you are waiting for), the coordinator **proposes** a publish: a request for the base branch at one exact commit, with its summary and the tasks it lands. A trusted process on your Mac, the **publisher**, asks you in Telegram through a bot of its own:
+
+> Publish 4 commits (tasks task-12, task-13) to main at 3f2a9c1?  [Publish] [Not now]
+
+The message also shows the project, the remote, how it will be published, the full commit SHA, the newest commit subjects and the coordinator's summary (quoted as the coordinator's words). The commit count, base and SHA are computed by the publisher from git, never taken from the request. One tap on **Publish** pushes exactly that commit; **Not now** drops the request (the coordinator asks again with the next batch). You can also send `/publish <project>` to the bot at any time to be asked about the agents' current base, and `/publish` lists the projects.
+
+**Set it up once per Mac** (it serves every registered project): `minions setup` offers it when the project has a git remote, or run `minions auth publisher`:
+
+1. Create a second bot with [BotFather](https://t.me/BotFather) (`/newbot`); never reuse a coordinator bot. Optionally `/setjoingroups` -> Disable.
+2. `minions defaults set telegram.owner <your numeric Telegram user id>` if you have not (`@userinfobot` tells you the id). Only presses from that account count.
+3. `minions auth publisher` stores the token (hidden prompt or `--stdin`; Keychain, Secret Service or a 0600 file) and installs the publisher service: a launchd agent on macOS, a systemd user unit on Linux. Then send `/start` to the new bot so it can message you.
+
+`minions status --check` reports the `publish*` checks: the remote, the token, the owner id, the service, and whether the running service can authenticate a push.
+
+**What happens on Publish.** The publisher fetches the agents' branches into your repository (as `minions pull` does, never touching your branches), checks that the commit is on the agents' base and fast-forwards `origin/<base>` (fetched just before), and scans the outgoing range: file names that usually hold secrets (`.env`, `*.pem`, `id_rsa`, ...), added lines shaped like private keys or API tokens, and files of 5 MiB or more. Any finding refuses the publish and is reported to you by path and kind, never by value; the coordinator sees the refusal and fixes it in a task. Then it runs `git push origin <sha>:refs/heads/<base>` with your own git credentials (never forced: if someone pushed meanwhile, the remote refuses it and nothing is lost). Your working tree is not touched, except that a checkout on the base branch with no tracked changes is fast-forwarded too (untracked files never block it).
+
+| `publish.mode` | What an approved publish does |
+| - | - |
+| `direct` (default) | Push the approved commit to `origin/<base>` (fast-forward only) |
+| `pull-request` | Push it as `minions/publish-<sha>` and open a pull request against the base with `gh` (install the GitHub CLI and run `gh auth login` on the host); the base and your checkout are left alone |
+
+Set it with `minions settings set publish.mode pull-request`. Both publish settings are yours only: the coordinator's `minions control` refuses `publish.*`, and the publisher never reads the coordinator's control layer.
+
+**Credentials.** Pushes use your host git credentials: your credential helper for HTTPS remotes, your ssh-agent for SSH remotes. A launchd agent gets the macOS session's ssh-agent; a systemd user unit has none unless your login session exports one (or you run `minions auth publisher` from a shell whose `SSH_AUTH_SOCK` is a stable socket, such as 1Password's or GNOME Keyring's, which is then passed to the unit). If pushes cannot authenticate, `minions status --check` says so (`publish.auth`). You can instead give the publisher a repository-scoped deploy key with write access: `minions settings set publish.deployKey /absolute/path/to/key`.
+
+**Without a git remote** publishing is unavailable: the coordinator's request is refused with "Publishing is unavailable: this project has no git remote", setup skips the step, and work stays local (`minions pull`). Add a remote and rerun `minions setup` to enable it.
+
+**From the terminal.** `minions settings requests` lists open publish requests next to upgrade requests; `minions settings requests publish <id>` runs the same checks and publishes after you confirm in the terminal (no flag skips the question). `minions auth publisher --remove` removes the token and the service.
+
+**Why the agents cannot approve their own publish.** The publisher's bot token lives only on the host, outside every container, project secrets directory and the host runtime's sandbox; only the publisher process polls the bot, so only it sees presses. Telegram itself stamps each press with the sender's account, and the publisher acts only on presses from your id in your private chat. The buttons carry nothing but a random nonce that maps to the publisher's own record of what it showed you (project, base, exact SHA, mode); a request changed after the question cannot change what is pushed. A coordinator can only ask. See [docs/design/autonomy.md](design/autonomy.md), Decision 17.
 
 ## Permissions and capabilities
 

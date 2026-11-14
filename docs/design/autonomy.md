@@ -28,6 +28,7 @@ therefore comes from an audit trail, undo and notices, not from owner confirmati
 | 4 | Telegram: reply context end to end, threaded replies, native polls | built |
 | 5 | Thread sessions: one coordinator session per Telegram thread | built |
 | 6 | New projects: `minions setup` in an empty directory creates the repository; the coordinator does the rest | built |
+| 7 | Telegram-approved publishing: the coordinator proposes, a host publisher with its own bot pushes after the owner's tap (Decision 17) | built, not yet run live |
 
 ## Decision 1. The autopilot dispatcher
 
@@ -421,6 +422,89 @@ learn from how the work went.
 - **Left out:** a per-goal progress metric the runtime parses (measures stay text the coordinator reads), the
   coordinator editing the goals file, a separate planner role or session key, and a time-based retrospective.
 
+## Decision 17. Telegram-approved publishing (owner, 2026-11-14)
+
+Decision 8 made minions local only: approved work lands on the local base and the owner pushes it by hand
+(`minions pull && git push`). The owner pushed every batch the same way, so the team now **proposes** a publish and
+the owner approves it with one tap in Telegram. The agents still never push and never hold a push credential: a
+trusted host process does the push, out of every agent's reach.
+
+- **The coordinator proposes, never pushes.** `minions settings requests publish --summary <text> [--task <id>]...
+  [--sha <sha>]` in the runtime records a `publish` change request, a second kind next to `upgrade` (Decision 9): the
+  base branch, one exact full SHA (default: the base head; a given SHA must be on the base), the summary (stored as
+  the request's reason) and the task ids. A newer request expires the open one, as for upgrades. It is refused without
+  a git remote (`remoteUrl` in the runtime's project.json): "Publishing is unavailable: this project has no git
+  remote". The coordinator prompt (Delivery) says when: after a meaningful batch (a goal met, about five tasks `done`
+  since the last request, or a fix the owner waits for), one open request at a time, never while draining, and not
+  again right after "Not now"; supervised mode never proposes (the owner integrates and publishes). The batch size is
+  prompt text, not a setting.
+- **A trusted host process publishes.** The publisher: one process per machine (per minions home) serving every
+  registered project (src/host/registry.ts), as a launchd user agent on macOS or a systemd user unit on Linux running
+  the hidden `minions settings requests serve` (src/host/publisher-service.ts, adapted from the removed host manager's
+  service: restarted on exit, exit 75 after a CLI reinstall, a per-home lock, a 0600 heartbeat). It reads each
+  project's open requests the way the host reads upgrade requests (`settings requests --json` through the host
+  runtime's shim or `docker exec`) every minute between long polls, and reports with `settings requests mark`:
+  `confirmed` at the press, then `applied` (the detail says where it went) or `failed`; `rejected` for a refusal or
+  "Not now".
+- **Its own bot; the approval cannot be forged.** The publisher bot is separate from every coordinator bot: its token
+  is host-wide (`PUBLISHER_CREDENTIAL`: Keychain, Secret Service, or `<MINIONS_HOME>/credentials/publisher/` 0600;
+  the file store whenever a project uses the host runtime, and moved there when one starts to), referenced from
+  `<MINIONS_HOME>/publisher/credential.json`, never from a project's credentials, secrets directory, env or mounts.
+  `minions auth publisher` refuses a coordinator's bot and `minions auth telegram` refuses the publisher's. The
+  message is "Publish N commits (tasks …) to <base> at <short sha>?" with [Publish] [Not now], then the project,
+  remote, mode, full SHA, the newest subjects and the coordinator's summary quoted as its words. Commit count, base
+  and SHA come from git on the host, never from the request. A press counts only from `telegram.owner` (`minions
+  defaults`) in the owner's private chat; anything else gets no reply at all. The buttons carry only a random nonce
+  that maps to the publisher's own record (`<MINIONS_HOME>/publisher/state.json`, 0600): project, request, base, the
+  exact SHA, the mode shown. The push uses that record, never the request row again, and checks everything once more
+  at the press. `/publish <project>` asks about the agents' current base without a request; `/publish` lists the
+  projects. A prompt expires after seven days; a superseded request retires its prompt.
+- **The push.** The agents' refs are exported into the owner's checkout exactly as `minions pull` does (exportRepo:
+  refs/remotes/minions/*, never a local branch). The SHA must be on the agents' base and a fast-forward of
+  `origin/<base>` fetched just before (a remote without the branch: the push creates it). The outgoing range is
+  scanned: tracked-file names that usually hold secrets (the state backup's list), added lines shaped like private
+  keys and API tokens, and files of 5 MiB or more. A finding refuses the publish and is reported to the owner and in
+  the request by path and kind, never by value. Then `git push origin <sha>:refs/heads/<base>`: never forced, so a
+  push that raced someone else's is refused by the remote. git runs with the host hardening (hooks and fsmonitor
+  off: the commits are agent-authored) and no prompts. The owner's working tree is untouched except that a checkout
+  on the base with no tracked changes is fast-forwarded (src/host/pull.ts rules; untracked files never block).
+- **Pull-request mode.** `publish.mode: direct | pull-request` (default direct). pull-request pushes
+  `minions/publish-<sha12>` and runs `gh pr create --base <base>` in the owner's checkout with the owner's `gh`
+  login; the base and the checkout are left alone. `publish.*` (with `publish.deployKey`) is owner-only: `control`
+  refuses it (Decision 13's list), and the host reads it from the project and local config, never from the overlay.
+  The mode shown in the question is the mode used, even if the setting changes before the press.
+- **Credentials.** The owner's own by default: the credential helper for HTTPS, the ssh-agent for SSH. A launchd agent
+  gets the session's ssh-agent; a systemd user unit gets none unless the session provides one, so the install passes
+  the installing shell's `SSH_AUTH_SOCK` when it is a stable socket (not a per-boot launchd or /tmp one). The service
+  records whether it has an agent in its heartbeat, and doctor's `publish.auth` reports what the service sees, with
+  the fix. Optional repo-scoped deploy key: `publish.deployKey <absolute path>` (`GIT_SSH_COMMAND` with `-i` and
+  `IdentitiesOnly`); creating it and adding it to the repository is the owner's.
+- **Setup and surface.** `minions setup` gains a `publish` step (with a remote: keep an installed publisher's service
+  current, or offer it: the owner's Telegram id when defaults lack it, the token, the service; without a remote:
+  skipped as unavailable). No new top-level command: requests already live under `settings requests` (the same
+  lifecycle and the same host-to-runtime path as upgrade requests), so `settings requests publish` records one in
+  the runtime and, on the host, publishes `<id>` after a terminal confirmation (the same checks; no flag skips the
+  question); the token is `auth publisher`, next to the other host-held tokens; the service process is the hidden
+  `settings requests serve`. Doctor adds `publish`, `publish.service`, `publish.auth` and `publish.last`, never a
+  failure.
+- **Why an agent can neither approve nor push.** (1) The token is readable only on the host: never mounted, never in a
+  project's secrets or env, under the host runtime's sandbox read deny (the whole data root), and kept out of the
+  Keychain while the host runtime is in use. Only the publisher polls the bot, so only it sees presses; a second
+  poller gets 409 and is reported. (2) Telegram stamps the sender's account on every update; only the owner's id in
+  the owner's private chat counts, and that id lives in `defaults.json` under the denied data root. (3) What is pushed
+  is the publisher's own record behind the nonce, computed from git when it asked, re-checked at the press, and bound
+  to the SHA and mode shown; the agent-writable request row can only ask, and changing it changes nothing already
+  shown. (4) The push credential is the owner's, used only by the unsandboxed publisher with hooks off; the agents'
+  sandbox has no Unix sockets (no ssh-agent), no read of `~/.ssh`, and no write outside its workspace and state. (5)
+  The publisher's state is under the data root and its unit file in the user's LaunchAgents or systemd directory, both
+  outside anything an agent can write, so an agent can neither plant a prompt nor change what the service runs.
+- **Left out / limits.** The scan is pattern-based, not a full secret scanner; a false positive is published by hand.
+  The publisher neither merges remote changes nor rebases: a diverged remote is the owner's to integrate. A request is
+  read only while its runtime runs. Uninstalling the last project leaves the service (`minions auth publisher
+  --remove`). One bot per machine: a second machine needs its own bot. A publish of agent changes to `.minions/`
+  config or other sensitive paths is approved like any other range (those paths still need the signed merge approval
+  before they land on the base, Decision 11), and the checkout fast-forward then brings them into the owner's tree.
+
 ## Reversed decisions
 
 - telegram-decisions.md D2 (tap buttons instead of native polls): native polls are built at the owner's request.
@@ -436,6 +520,10 @@ learn from how the work went.
   item 6 (`work advance`) and the routine's runnable wakes: removed by Decision 10.
 - spec.md and bootstrap.md (three init profiles, the full init wizard, setup's opt-in local integration question):
   replaced by Decision 11.
+- Decision 8 (local only: the owner exports and pushes every batch by hand): partly reversed by Decision 17. A host
+  process pushes the base (or opens a pull request) after the owner's one-tap Telegram approval. The agents still never
+  push or hold a push credential, and the rest of Decision 8 stands (no CI awareness or CI gate, no GitHub intake, no
+  `git.push` / `pr.*` capabilities, no pre-claim sync from origin).
 
 ## Known limits (review of the build, 2026-10-31)
 
