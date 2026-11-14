@@ -15,7 +15,7 @@ import {
   ROUTINE_EVENT, routineLast, routineSettings, runRoutinePass, startRoutineClock, WAKE_EVENT,
   type CoordinatorView, type RoutinePassDeps, type RoutineSettings, type WakeInputs, type WakeReason,
 } from '../../src/runtime/routine.js';
-import { makeEnv, tmp } from './fixtures.js';
+import { makeUnitEnv, tmp } from './fixtures.js';
 import { recordOwnerMessageViaStop } from './transcript-shapes.js';
 
 const T0 = new Date('2026-10-27T12:00:00.000Z');
@@ -108,7 +108,7 @@ describe('decideWake (pure)', () => {
 
 /** A routine pass over a real DB with a fake clock and fake restarts. */
 function passEnv(over: Partial<RoutinePassDeps> = {}) {
-  const env = makeEnv((c) => { c.routine = { enabled: true }; });
+  const env = makeUnitEnv((c) => { c.routine = { enabled: true }; });
   let now = T0;
   const calls = { wake: 0, crash: 0 };
   let coordinator = running();
@@ -337,7 +337,7 @@ describe('restart paths (fake spawn)', () => {
     for (const d of ['plugin', 'secrets', 'state']) mkdirSync(join(root, d), { recursive: true });
     writeFileSync(join(root, 'plugin', 'coordinator.md'), 'You are the coordinator.');
     const paths = { ...runtimePaths({ MINIONS_WORKSPACE: join(root, 'ws'), MINIONS_STATE_DIR: join(root, 'state'), MINIONS_SECRETS_DIR: join(root, 'secrets') }), pluginDir: join(root, 'plugin'), coordinatorPrompt: join(root, 'plugin', 'coordinator.md') };
-    const cfg = makeEnv().config;
+    const cfg = makeUnitEnv().config;
     const c = await buildCoordinatorCommand(cfg, paths, { detached: true, wake: true });
     expect(c.args.slice(-4)).toEqual(['minions', 'coordinator', 'run', '--wake']);
     expect(WAKE_PROMPT).toBe('/minions:orchestrate wake');

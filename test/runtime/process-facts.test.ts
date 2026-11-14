@@ -1,7 +1,9 @@
 // macOS process facts (task-103.2, docs/design/host-runtime.md phase 1): the `ps`/`sysctl` view behind the coordinator
 // lock, signalDescendants, the Telegram poller check, the supervisor and integration locks, and the run records. No
 // real macOS here: fake `ps` and `sysctl` runners render a process table the way macOS prints it (C locale, UTC).
+import cp from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { describe, expect, it } from 'vitest';
 import {
   coordinatorPidAlive, descendantsOf, processControlFor, psProcessControl, signalDescendants, systemProcessControl, type ProcessControl,
@@ -67,9 +69,23 @@ describe('ps output parsing', () => {
   it('asks ps for one -o per field, unlimited width, one pid or all; runs with LC_ALL=C and TZ=UTC', () => {
     expect(psArgs(42)).toEqual(['-ww', '-o', 'pid=', '-o', 'ppid=', '-o', 'pgid=', '-o', 'stat=', '-o', 'lstart=', '-o', 'command=', '-p', '42']);
     expect(psArgs().at(-1)).toBe('-A');
-    const env = systemCommandRunner('/usr/bin/env', []) ?? '';
-    expect(env.split('\n')).toEqual(expect.arrayContaining(['LC_ALL=C', 'TZ=UTC']));
-    expect(systemCommandRunner('/nonexistent/ps', [])).toBeNull();
+    // The real runner, with execFileSync swapped on the builtin module (unit tier: nothing is spawned).
+    const calls: { cmd: string; args: string[]; env: NodeJS.ProcessEnv | undefined }[] = [];
+    const real = cp.execFileSync;
+    (cp as { execFileSync: unknown }).execFileSync = (cmd: string, args: string[], o: { env?: NodeJS.ProcessEnv }) => {
+      calls.push({ cmd, args, env: o.env });
+      if (cmd.startsWith('/nonexistent/')) throw Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' });
+      return 'out\n';
+    };
+    syncBuiltinESMExports();
+    try {
+      expect(systemCommandRunner('/bin/ps', ['-A'])).toBe('out\n');
+      expect(calls[0]).toMatchObject({ cmd: '/bin/ps', args: ['-A'], env: { LC_ALL: 'C', LANG: 'C', TZ: 'UTC', PATH: '/bin:/usr/bin:/usr/sbin:/sbin' } });
+      expect(systemCommandRunner('/nonexistent/ps', [])).toBeNull();
+    } finally {
+      (cp as { execFileSync: unknown }).execFileSync = real;
+      syncBuiltinESMExports();
+    }
   });
 
   it('boot id: kern.bootsessionuuid, else kern.boottime, else unknown', () => {

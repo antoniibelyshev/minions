@@ -4,7 +4,7 @@
 // (3) a process role without its harnesses.<id> block makes one `work next` entry stuck, not the whole command fail.
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { PHASE_RULES } from '../../src/config/harnesses.js';
 import { validateConfig } from '../../src/config/resolve.js';
 import { defaultMovedGates, harnessConfigIssues } from '../../src/config/roles.js';
@@ -15,6 +15,8 @@ import { RuntimeDb, SCHEMA_VERSION } from '../../src/runtime/db.js';
 import { Scheduler, leaseHarness } from '../../src/runtime/scheduler.js';
 import { defaults } from '../helpers.js';
 import { commitFile, makeDefaultEnv, result, tmp, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const CODEX = { models: { default: 'gpt-6.1-sol', allowed: ['gpt-6.1-sol', 'gpt-6.1-mini'] } };
 const gate = (over: Record<string, unknown> = {}) => ({ description: 'Second-opinion review.', promptText: 'Review the head.', contract: 'gate', ...over });

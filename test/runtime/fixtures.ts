@@ -1,4 +1,4 @@
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -170,4 +170,27 @@ export function ghBranchApi(bare: string, args: string[]): { code: number; stdou
   } catch {
     return { code: 1, stdout: '', stderr: 'gh: Branch not found (HTTP 404)' };
   }
+}
+
+/** The fixed base SHA of a unit env (makeUnitEnv): no repository exists to have a real one. */
+export const UNIT_BASE_SHA = 'b'.repeat(40);
+
+/**
+ * makeEnv / makeDefaultEnv for the unit tier (task-137.2.5): the same runtime env, but `layout.repo` is a plain
+ * directory, not a git repository, and `baseSha` is UNIT_BASE_SHA. For tests whose code path never reads git.
+ */
+export function makeUnitEnv(mutate?: (c: MinionsConfig) => void): Env {
+  return makeUnitDefaultEnv((c) => { c.workflows = { ...c.workflows, default: [...TESTER_FLOW] }; mutate?.(c); });
+}
+
+export function makeUnitDefaultEnv(mutate?: (c: MinionsConfig) => void): Env {
+  const root = tmp();
+  const layout = workspaceLayout(join(root, 'workspace'));
+  mkdirSync(layout.repo, { recursive: true });
+  const db = new RuntimeDb(join(root, 'state', 'minions.db'));
+  const backlog = new FakeBacklog();
+  const config = defaults('independent');
+  mutate?.(config);
+  const sched = new Scheduler({ db, backlog, config, layout, handoff: { briefs: join(root, 'state', 'briefs'), results: join(root, 'state', 'results') } });
+  return { root, layout, db, backlog, config, sched, baseSha: UNIT_BASE_SHA };
 }

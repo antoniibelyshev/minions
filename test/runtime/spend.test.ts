@@ -9,6 +9,8 @@ import {
   billingOf, budgetNotice, currentBudget, parseBudget, parseTokens, recordLeaseUsage, setBudget, spendReport, usdPerMTok,
 } from '../../src/runtime/spend.js';
 import { commitFile, makeEnv, result, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 const errOf = async (p: Promise<unknown>) => {
   try { await p; } catch (e) { return e as MinionsError; }

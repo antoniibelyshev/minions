@@ -3,7 +3,9 @@ import { join } from 'node:path';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { hookLog, MAX_LOG_BYTES, preAgentHook, preTelegramHook, runHook, stopHook } from '../../src/runtime/hooks.js';
 import { writeHolds, type DispatchHold } from '../../src/runtime/dispatch-state.js';
-import { makeEnv, tmp, type Env } from './fixtures.js';
+import { commitFile, makeEnv, result, tmp, type Env } from './fixtures.js';
+// Unit tier: git runs on the in-memory fake (./fake-git.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
 
 let stateDir: string;
 beforeAll(() => { stateDir = tmp('minions-hooks-'); process.env.MINIONS_STATE_DIR = stateDir; });

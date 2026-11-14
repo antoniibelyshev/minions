@@ -4,7 +4,7 @@
 // tmux, no claude, no child processes.
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { KEY_CLASSES } from '../../src/config/setting-classes.js';
 import { currentValue, parseSettingValue, settingDef, viewSetting, type SettingsContext } from '../../src/host/settings.js';
 import type { ProjectJson } from '../../src/host/project.js';
@@ -19,6 +19,9 @@ import { ROUTINE_EVENT } from '../../src/runtime/routine.js';
 import { humanBaseline, spendReport } from '../../src/runtime/spend.js';
 import { defaults } from '../helpers.js';
 import { makeEnv, tmp } from './fixtures.js';
+// Unit tier: git and (on macOS) process liveness run on fakes (./fake-git.ts, ./fake-process-facts.ts).
+vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
+vi.mock('../../src/runtime/process-facts.js', async (orig) => (await import('./fake-process-facts.js')).mockProcessFacts(await orig()));
 import { assistantLine, jsonl, recordOwnerMessageViaStop, skillBodyLine, slashCommandLine } from './transcript-shapes.js';
 
 // ---------------------------------------------------------------- the wrapper clock hook

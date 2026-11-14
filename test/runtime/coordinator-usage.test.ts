@@ -15,7 +15,7 @@ import { stopHook } from '../../src/runtime/hooks.js';
 import { RECOVERY_PROMPT } from '../../src/runtime/coordinator.js';
 import { humanBaseline, humanSpend, spendReport } from '../../src/runtime/spend.js';
 import { defaults } from '../helpers.js';
-import { makeEnv, tmp, type Env } from './fixtures.js';
+import { makeUnitEnv, tmp, type Env } from './fixtures.js';
 import { assistantLine, jsonl, ownerLine, skillBodyLine, slashCommandLine } from './transcript-shapes.js';
 // Unit tier: git runs on the in-memory fake (./fake-git.ts).
 vi.mock('../../src/core/exec.js', async (orig) => (await import('./fake-git.js')).mockExec(await orig()));
@@ -272,7 +272,7 @@ describe('Stop hook integration', () => {
   const loader = (env: Env) => () => ({ db: env.db, backlog: env.backlog, config: env.config });
 
   it('records usage on every Stop without changing the decision or defeating the no-progress guard', async () => {
-    const env = makeEnv();
+    const env = makeUnitEnv();
     env.db.acquireCoordinatorLock('coordinator', 4242, () => false);
     writeHolds(env.db, { 'task-1': { taskId: 'task-1', kind: 'blocked', message: 'stuck', leaseId: null, at: '2026-10-31T00:00:00.000Z', status: 'blocked' } });
     const file = transcriptFile(lines([asst('m1', usage(1, 100, 0, 1))]));
@@ -291,7 +291,7 @@ describe('Stop hook integration', () => {
   });
 
   it('a throwing state store never changes the Stop decision', async () => {
-    const env = makeEnv();
+    const env = makeUnitEnv();
     env.db.acquireCoordinatorLock('coordinator', 4242, () => false);
     const file = transcriptFile(lines([asst('m1', usage(1, 100, 0, 1))]));
     const db = new Proxy(env.db, {
@@ -326,7 +326,7 @@ describe('work spend and status', () => {
     track(db, 'sess-a', file);
     expect(spendReport({ db, config: cfg, billing: 'subscription' }).coordinator.tokens).toBe(20_000);
 
-    const env = makeEnv();
+    const env = makeUnitEnv();
     env.db.acquireCoordinatorLock('coordinator', 4242, () => false);
     track(env.db, 'sess-z', transcriptFile(lines([asst('m1', usage(1, 2000, 0, 3))])));
     const s = await collectStatus({ db: env.db, config: env.config, backlog: async () => env.backlog });
