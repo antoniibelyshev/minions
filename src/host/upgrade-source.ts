@@ -22,6 +22,7 @@ import { MinionsError } from '../core/errors.js';
 import { run, type RunResult } from '../core/exec.js';
 import { backupInstalledCli } from './cli-backup.js';
 import { HOST_GIT } from './discovery.js';
+import { inTheWayList, TRACKED_STATUS, untrackedInTheWay } from './pull.js';
 import type { Runner } from './docker.js';
 import { shellQuote } from './setup.js';
 import type { ExportResult } from './transfer.js';
@@ -107,13 +108,23 @@ async function fastForwardHost(git: HostGit, o: { repo: string; branch: string; 
     if (line.startsWith('worktree ')) current = line.slice('worktree '.length);
     else if (line === `branch refs/heads/${branch}` && current) { worktree = current; break; }
   }
-  // Clean trees only: the repository's own worktree always, and the one that has the branch.
+  // Clean trees only (no tracked change): the repository's own worktree always, and the one that has the branch.
+  // Untracked files do not block, as they do not block `git merge --ff-only` (src/host/pull.ts), unless the range
+  // adds a path one of them occupies in the worktree that is merged.
   for (const dir of [...new Set([o.repo, ...(worktree ? [worktree] : [])])]) {
     const dirty = await dirtyEntries(git, dir, label);
     if (dirty.length) {
       throw new MinionsError('PRECONDITION',
-        `${label}: the working tree at ${dir} has uncommitted or untracked changes (${dirty.length}: ${dirty.slice(0, 5).map((l) => l.trim()).join(', ')}${dirty.length > 5 ? ', ...' : ''}); refusing to move ${branch}.`,
+        `${label}: the working tree at ${dir} has uncommitted changes to tracked files (${dirty.length}: ${dirty.slice(0, 5).map((l) => l.trim()).join(', ')}${dirty.length > 5 ? ', ...' : ''}); refusing to move ${branch}.`,
         `Nothing was changed. Commit or stash the changes yourself, then rerun \`${o.rerun}\`.`);
+    }
+  }
+  if (worktree) {
+    const inTheWay = await untrackedInTheWay((args) => git(args, worktree!), worktree, from, to);
+    if (inTheWay.length) {
+      throw new MinionsError('PRECONDITION',
+        `${label}: ${target} adds ${inTheWayList(inTheWay)}, which an untracked file in the working tree at ${worktree} occupies; refusing to move ${branch}.`,
+        `Nothing was changed. Move the file(s) away (or commit them), then rerun \`${o.rerun}\`.`);
     }
   }
   const method = worktree ? 'merge --ff-only' as const : 'update-ref' as const;
@@ -132,7 +143,7 @@ async function fastForwardHost(git: HostGit, o: { repo: string; branch: string; 
 }
 
 async function dirtyEntries(git: HostGit, dir: string, label: string): Promise<string[]> {
-  const st = await git(['status', '--porcelain'], dir);
+  const st = await git(TRACKED_STATUS, dir);
   if (st.code !== 0) throw new MinionsError('PRECONDITION', `${label}: git status failed in ${dir}: ${(st.stderr || st.stdout).trim().slice(0, 300)}`);
   return st.stdout.split('\n').filter(Boolean);
 }

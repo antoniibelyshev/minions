@@ -46,7 +46,8 @@ describe('pull: base fast-forward decision', () => {
   });
 
   it('never moves a dirty tree, another checked-out branch, a detached HEAD or a diverged base', () => {
-    expect(ffDecision(facts({ dirty: 3 }))).toMatchObject({ action: 'skipped', reason: expect.stringMatching(/3 uncommitted or untracked/) });
+    expect(ffDecision(facts({ dirty: 3 }))).toMatchObject({ action: 'skipped', reason: expect.stringMatching(/3 uncommitted change\(s\) to tracked files/) });
+    expect(ffDecision(facts({ inTheWay: ['.minions/goals.md'] }))).toMatchObject({ action: 'skipped', reason: expect.stringMatching(/adds \.minions\/goals\.md, which an untracked file/) });
     expect(ffDecision(facts({ current: 'feature' }))).toMatchObject({ action: 'skipped', reason: expect.stringMatching(/on feature, not main/) });
     expect(ffDecision(facts({ current: null }))).toMatchObject({ action: 'skipped', reason: expect.stringMatching(/detached HEAD/) });
     expect(ffDecision(facts({ canFastForward: false }))).toMatchObject({ action: 'skipped', reason: expect.stringMatching(/diverged/) });

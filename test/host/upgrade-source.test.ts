@@ -59,18 +59,33 @@ describe('--from-container sync', () => {
     const e = await reason(syncFromContainer({ repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo }));
     expect(e).toBeInstanceOf(MinionsError);
     expect(e.code).toBe('PRECONDITION');
-    expect(e.message).toMatch(/uncommitted or untracked changes.*README\.md.*refusing to move main/);
+    expect(e.message).toMatch(/uncommitted changes to tracked files.*README\.md.*refusing to move main/);
     expect(head(s.repo)).toBe(s.base);
     expect(readFileSync(join(s.repo, 'README.md'), 'utf8')).toBe('# local edit\n');
   });
 
-  it('refuses on untracked files too', async () => {
+  it('fast-forwards past untracked files (a shared install\'s own .minions/) and keeps them', async () => {
     const s = syncRepo();
     writeFileSync(join(s.repo, 'notes.txt'), 'mine\n');
-    const e = await reason(syncFromContainer({ repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo }));
-    expect(e.message).toContain('notes.txt');
+    mkdirSync(join(s.repo, '.minions'));
+    writeFileSync(join(s.repo, '.minions', 'config.json'), '{}\n');
+    const r = await syncFromContainer({ repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo });
+    expect(r).toMatchObject({ action: 'fast-forward', method: 'merge --ff-only', applied: true });
+    expect(head(s.repo)).toBe(s.ahead);
+    expect(readFileSync(join(s.repo, 'notes.txt'), 'utf8')).toBe('mine\n');
+    expect(readFileSync(join(s.repo, '.minions', 'config.json'), 'utf8')).toBe('{}\n');
+  });
+
+  it('refuses when the range adds a path an untracked file occupies, and names it (also on --dry-run)', async () => {
+    const s = syncRepo();
+    writeFileSync(join(s.repo, 'feature.txt'), 'my own\n');
+    for (const dryRun of [true, false]) {
+      const e = await reason(syncFromContainer({ repo: s.repo, branch: 'main', baseBranch: 'main', exportRepo: s.exportRepo, dryRun }));
+      expect(e.code).toBe('PRECONDITION');
+      expect(e.message).toMatch(/adds feature\.txt, which an untracked file .* occupies; refusing to move main/);
+    }
     expect(head(s.repo)).toBe(s.base);
-    expect(existsSync(join(s.repo, 'notes.txt'))).toBe(true);
+    expect(readFileSync(join(s.repo, 'feature.txt'), 'utf8')).toBe('my own\n');
   });
 
   it('does not count gitignored build output (dist/, node_modules/, *.tgz, .env) as dirty', async () => {
