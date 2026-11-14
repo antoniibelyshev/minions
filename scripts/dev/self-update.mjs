@@ -195,9 +195,10 @@ async function gatherFacts(repoArg) {
     const branch = await git(repo, ['symbolic-ref', '--short', '-q', 'HEAD']);
     if (branch !== project.baseBranch) refusals.push(`the checkout is on ${branch ? `branch ${branch}` : 'a detached HEAD'}, not the base branch ${project.baseBranch}`);
   }
-  const status = await git(repo, ['status', '--porcelain']);
+  // Untracked files do not count: `minions upgrade` refuses only when an incoming path collides with one.
+  const status = await git(repo, ['status', '--porcelain', '--untracked-files=no']);
   if (status === null) refusals.push('`git status` failed in the checkout');
-  else if (status) refusals.push(`the checkout has uncommitted or untracked changes (${status.split('\n').length} path(s)); commit or remove them first`);
+  else if (status) refusals.push(`the checkout has uncommitted changes to tracked files (${status.split('\n').length} path(s)); commit or stash them first`);
   return { repo, home, cli, project, delivery, sensitivePaths, refusals };
 }
 
