@@ -198,6 +198,23 @@ Tokens are stored only on
 the host (Keychain or a 0600 file) and copied into the runtime's read-only secrets mount at start and
 on `minions upgrade`; they never enter the state volume or a state backup.
 
+## Publishing: no question in Telegram, or a refused or failed publish
+
+The publisher ([guide](guide.md#publishing)) is one service per Mac. Start with:
+
+```sh
+minions status --check          # the publish, publish.service, publish.auth and publish.last checks
+minions settings requests --all # the coordinator's publish requests and the publisher's outcome per request
+```
+
+- **No question arrives.** `publish` names what is missing: no git remote (publishing is unavailable; add `origin` and rerun `minions setup`), no publisher token (`minions auth publisher`), or no owner id (`minions defaults set telegram.owner <id>`; until then the publisher accepts no one). Send `/start` to the publisher bot once from your account: a bot cannot message you before that. `publish.service` not running: rerun `minions auth publisher` (it reinstalls and restarts the service). Its log is `<MINIONS_HOME>/publisher/publisher.log` on macOS and `journalctl --user -u minions-publisher` on Linux. The runtime must be running for its requests to be read (`minions start --no-attach`).
+- **"another process polls the publisher bot" (409).** Only one process may poll a bot: another minions home, another Mac, or a coordinator wrongly given this token. `minions auth publisher` refuses a coordinator bot, and `minions auth telegram` refuses the publisher bot, but a bot reused elsewhere cannot be detected. Stop the other poller or create a new bot.
+- **"not asking ... the outgoing range has N finding(s)".** The scan found a secret-like file, a secret-shaped added line or a file of 5 MiB or more in the commits to publish. Nothing was pushed and the request is `rejected`. The finding names the path and the kind, never the value. The fix belongs in a task (remove the file from history before it is ever published, or keep large assets out of the repository); if you are sure it is a false positive, publish by hand: `minions pull`, then `git push origin <base>`.
+- **"origin/<base> moved ... not a fast-forward".** Someone pushed to the remote since the agents last integrated. Merge the remote into the team's base: `minions pull` (your base to the agents'), `git pull --no-rebase origin <base>` (merge the remote's commits on top), `minions import` (the team's base fast-forwards to your merge); then send `/publish <project>` or let the coordinator propose again. The publisher never merges, rebases or forces.
+- **The push failed: authentication.** `publish.auth` shows what the service sees. SSH remotes need an ssh-agent with your key in the service's session (launchd agents on macOS get the session's agent; a systemd user unit usually has none), or a repo-scoped deploy key with write access: `minions settings set publish.deployKey /absolute/path`. HTTPS remotes need a credential helper that answers without a prompt. The request is `failed`; the coordinator reports it and can propose again once it is fixed.
+- **Pull-request mode: "`gh pr create` failed".** Install the GitHub CLI and run `gh auth login` on the host. The branch `minions/publish-<sha>` is already pushed, so you can also open the pull request by hand.
+- **The question disappeared or a button says "expired".** A newer request superseded it (the coordinator proposed a later commit), or it was older than seven days. Nothing was pushed; answer the newer question, or send `/publish <project>`.
+
 ## A failed or interrupted upgrade
 
 ```sh
@@ -250,7 +267,7 @@ integration gate (and QA sweeps) run the integration tier or the full suite. Nob
 base branch for a baseline. `minions work record` refuses a `complete` engineer result that reports a
 failing check, a skipped verification command, or no passing test run.
 
-The integration tier is kept small (task-137): on 2026-11-14 it was 60 files, 736 tests and 147 s of summed
+The integration tier is kept small (task-137): on 2026-11-14 it was 61 files (the publisher's push tests against a bare remote, test/host/publish-git.test.ts, joined it), 736 tests and 147 s of summed
 test time, down from 162 files, 3246 tests and 736 s on 2026-10-30. What stays there runs real processes
 end to end: the Docker image and container, the built CLI and its git-URL install, the real Backlog.md CLI,
 host setup, upgrade and the host runtime's processes, the coordinator lock and permission mode, the

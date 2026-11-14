@@ -186,8 +186,11 @@ export interface ControlDeps {
   now?: () => Date;
 }
 
-/** Keys only the owner changes (docs/design/autonomy.md Decision 13): the coordinator never raises its own spend caps. */
-export const OWNER_ONLY_KEYS = ['budgets', 'coordinator.sshHosts', 'coordinator.unsandboxedCommands', 'coordinator.allowedDomains'];
+/**
+ * Keys only the owner changes (docs/design/autonomy.md Decision 13): the coordinator never raises its own spend caps.
+ * `publish` (Decision 17): how approved work leaves the machine; the host never reads it from the overlay anyway.
+ */
+export const OWNER_ONLY_KEYS = ['budgets', 'coordinator.sshHosts', 'coordinator.unsandboxedCommands', 'coordinator.allowedDomains', 'publish'];
 export const ownerOnlyKey = (key: string) => OWNER_ONLY_KEYS.some((k) => key === k || key.startsWith(k + '.'));
 
 function checkReason(reason: string): string {
@@ -206,7 +209,7 @@ async function commit(d: ControlDeps, op: ControlOp, reason: string, change: (cu
     const keys = changedKeys(cur.config, next);
     if (!keys.length) return { revision: cur.revision, op, keys: [], message: `No change (control revision ${cur.revision}).` };
     const owned = d.owner ? [] : keys.filter(ownerOnlyKey);
-    if (owned.length) throw new MinionsError('POLICY_DENIED', `Only the owner changes ${owned.join(', ')}.`, 'The owner sets the spend caps with /budget in Telegram; leave them out of the change.');
+    if (owned.length) throw new MinionsError('POLICY_DENIED', `Only the owner changes ${owned.join(', ')}.`, 'The owner sets these on the host with `minions settings set` (the spend caps also with /budget in Telegram); leave them out of the change.');
     // Validate against the real base: an invalid overlay is never written.
     applyControl(d.base, next, `control ${op} (${keys.slice(0, 3).join(', ')}${keys.length > 3 ? ', ...' : ''})`);
     const at = (d.now ?? (() => new Date()))().toISOString();

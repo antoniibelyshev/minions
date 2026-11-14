@@ -312,7 +312,7 @@ const collect = (v: string, prev: string[] = []) => [...prev, v];
  * so host credential subcommands (telegram, codex) join the same group. `confirm` prints the plan and asks (TTY only).
  */
 export function registerAuth(program: Command, confirm: (plan: string) => Promise<boolean>, io: Pick<AuthDeps, 'readHeadlessToken' | 'applySecrets'> = {}): Command {
-  const auth = program.command('auth').description('Claude authorization (show/set/refresh) and host-held Telegram/Codex credentials for this project');
+  const auth = program.command('auth').description('Claude authorization (show/set/refresh), host-held Telegram/Codex credentials for this project, and the host-wide publisher bot');
 
   auth.command('show')
     .description('Show the method, source, container env (masked) and secret file status; never the key')

@@ -144,6 +144,11 @@ const DECLARED: readonly DeclaredSetting[] = [
   { key: 'delivery.merge', group: 'Delivery', label: 'Merge mode', type: 'enum', choices: ['disabled', 'auto-when-eligible'], apply: 'prompt',
     description: 'whether the runtime merges approved work: never (the coordinator or you merge), or automatically: the local integrator merges the approved head into the base after its own verification (base.merge policy)',
     loosens: (_f, t) => (t === 'auto-when-eligible' ? 'approved branches that pass verification are merged into the base without asking' : null) },
+  { key: 'publish.mode', group: 'Delivery', label: 'Publish mode', type: 'enum', choices: ['direct', 'pull-request'], optional: true, apply: 'live',
+    description: 'what an approved publish request does (docs/design/autonomy.md Decision 17): direct (default) pushes the approved commit to origin/<base>; pull-request pushes a branch and opens a PR with gh',
+    loosens: (f, t) => (f === 'pull-request' && t !== 'pull-request' ? 'approved publishes push straight to the base branch on origin instead of opening a pull request' : null) },
+  { key: 'publish.deployKey', group: 'Delivery', label: 'Publish deploy key', type: 'text', optional: true, apply: 'live',
+    description: 'absolute path of a repo-scoped SSH deploy key the host publisher pushes with (default: your own git credentials)' },
   // ---- Verification
   // Shell commands may contain commas: entries are separated with ';' (task-136: the runtime can request them).
   { key: 'verification.commands', group: 'Verification', label: 'Verification commands', type: 'list', separator: ';', apply: 'live',

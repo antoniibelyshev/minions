@@ -100,7 +100,7 @@ describe('minions setup', () => {
 
     expect(r.steps.map((s) => [s.id, s.status])).toEqual([
       ['init', 'done'],
-      ['telegram', 'done'], ['harness', 'skipped'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
+      ['telegram', 'done'], ['publish', 'skipped'], ['harness', 'skipped'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
     ]);
     expect(rt.calls).toEqual(['running?', 'start', 'repo?', 'import', 'coordinator']);
     expect(r.ready).toBe(true);
@@ -264,7 +264,7 @@ describe('minions setup', () => {
     const r = await runSetup({ mode: 'independent', path: repo, yes: true, runtime: rt.runtime, dockerProbe: dockerUp });
     expect(r.steps.map((s) => [s.id, s.status])).toEqual([
       ['init', 'done'],
-      ['telegram', 'skipped'], ['harness', 'skipped'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
+      ['telegram', 'skipped'], ['publish', 'skipped'], ['harness', 'skipped'], ['container', 'done'], ['import', 'done'], ['coordinator', 'done'],
     ]);
     expect((await loadEffectiveConfig(await loadProjectJson(r.projectId))).config.delivery.merge).toBe('auto-when-eligible');
   });

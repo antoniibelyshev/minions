@@ -20,7 +20,7 @@ import { run } from '../core/exec.js';
 import { atomicWrite, ensureDir, readJsonIfExists, writeJson } from '../core/fsutil.js';
 import { prepareSecretsDir, probeSecretsAccess, secretFileMode, secretGid, type SecretsAccess } from './secrets-access.js';
 import { redact } from '../core/output.js';
-import { CLAUDE_HEADLESS_TOKEN_FILE, credentialStoreDir, credentialStoreFile, defaultsPath, projectPaths } from '../core/paths.js';
+import { CLAUDE_HEADLESS_TOKEN_FILE, credentialStoreDir, credentialStoreFile, defaultsPath, projectPaths, publisherPaths } from '../core/paths.js';
 import { BOTFATHER_URL, checkTelegramTokenFormat } from '../telegram/token.js';
 import { loadRegistry } from './registry.js';
 
@@ -166,6 +166,18 @@ export const CLAUDE_HEADLESS_CREDENTIAL: CredentialKind = {
   fileName: CLAUDE_HEADLESS_TOKEN_FILE, check: (raw) => checkClaudeTokenFormat(raw).token, command: 'minions auth set login --headless-token',
 };
 export const CREDENTIAL_KINDS = [TELEGRAM_CREDENTIAL, CODEX_CREDENTIAL, CLAUDE_HEADLESS_CREDENTIAL] as const;
+/** Store account of the host-wide publisher bot token (never a project UUID, so it cannot collide with one). */
+export const PUBLISHER_ACCOUNT = 'publisher';
+/**
+ * The host publisher's own Telegram bot token (docs/design/autonomy.md Decision 17). Host-wide, not per project:
+ * Keychain service `minions.publisher` / Secret Service `service=minions.publisher account=publisher` /
+ * `<MINIONS_HOME>/credentials/publisher/publisher-bot-token` (0600). Never materialized into a secrets directory,
+ * never referenced from a project's credentials.json; only the publisher process reads it.
+ */
+export const PUBLISHER_CREDENTIAL: StoreKind = {
+  label: 'publisher bot token', keychainService: 'minions.publisher', keychainLabel: 'minions-publisher-bot-token',
+  fileName: 'publisher-bot-token', check: (raw) => checkTelegramTokenFormat(raw).token, command: 'minions auth publisher',
+};
 /** Materialized copies of removed kinds (the GitHub token): deleted from the secrets directory, never written. */
 const LEGACY_SECRET_FILES = ['github-token'];
 
@@ -306,9 +318,9 @@ async function privateDir(dir: string): Promise<void> {
   await chmod(dir, 0o700);
 }
 
-/** A store account is a project UUID. */
+/** A store account is a project UUID, or the host-wide publisher account. */
 const assertAccount = (id: string) => {
-  if (!z.uuid().safeParse(id).success) throw new MinionsError('INTERNAL', 'invalid project id');
+  if (id !== PUBLISHER_ACCOUNT && !z.uuid().safeParse(id).success) throw new MinionsError('INTERNAL', 'invalid project id');
 };
 
 export interface StoreOptions { runner?: Runner; platform?: NodeJS.Platform; env?: NodeJS.ProcessEnv; hostRuntime?: boolean }
@@ -354,8 +366,8 @@ export async function selectStore(opts: StoreOptions & { kind: StoreKind }): Pro
 export const storeFor = (backend: Backend, runner: Runner, kind: StoreKind): SecretStore =>
   (backend === 'keychain' ? new KeychainStore(runner, kind) : backend === 'secret-service' ? new SecretServiceStore(runner, kind) : new FileStore(kind));
 
-/** A moved token: a project's. */
-export type MovedToken = { projectId: string; kind: CredentialKind['name'] };
+/** A moved token: a project's, or the host-wide publisher bot token (projectId null). */
+export type MovedToken = { projectId: string; kind: CredentialKind['name'] } | { projectId: null; kind: 'publisher' };
 
 /**
  * Host runtime: moves every registered project's tokens from the macOS Keychain
@@ -386,6 +398,23 @@ export async function moveKeychainTokensToFileStore(runner: Runner = run): Promi
       } catch (e) {
         warnings.push(`The ${kind.label} of project ${projectId} is still in ${backendLabel(ref.backend)} (${redact((e as Error).message).split('\n')[0]}); agents of a host-runtime project could read it with ${ref.backend === 'keychain' ? '/usr/bin/security' : 'secret-tool'}. Re-provision it with \`${kind.command}\`.`);
       }
+    }
+  }
+  // The publisher bot token: its reference is <MINIONS_HOME>/publisher/credential.json, not a project's credentials.json.
+  const pub = await loadPublisherCredentialRef().catch(() => null);
+  if (pub && pub.backend !== 'file') {
+    try {
+      const keychain = storeFor(pub.backend, runner, PUBLISHER_CREDENTIAL);
+      const token = await keychain.get(PUBLISHER_ACCOUNT);
+      if (token) {
+        const file = new FileStore(PUBLISHER_CREDENTIAL);
+        await file.set(PUBLISHER_ACCOUNT, token);
+        await savePublisherCredentialRef({ ...pub, backend: 'file', ref: file.ref(PUBLISHER_ACCOUNT), updatedAt: new Date().toISOString() });
+        await keychain.delete(PUBLISHER_ACCOUNT);
+        moved.push({ projectId: null, kind: 'publisher' });
+      }
+    } catch (e) {
+      warnings.push(`The publisher bot token is still in ${backendLabel(pub.backend)} (${redact((e as Error).message).split('\n')[0]}); agents of a host-runtime project could read it with ${pub.backend === 'keychain' ? '/usr/bin/security' : 'secret-tool'}. Store it again with \`${PUBLISHER_CREDENTIAL.command}\`.`);
     }
   }
   return { moved, warnings };
@@ -517,6 +546,10 @@ export async function provisionTelegramToken(opts: TelegramProvisionOptions): Pr
   const runner = opts.runner ?? run;
   const { token, botId } = checkTelegramTokenFormat(opts.token);
   assertOutsideRepo(opts.projectId, opts.repoPath);
+  // The publisher's bot must never become a coordinator bot: a coordinator's token is readable in its runtime.
+  if ((await loadPublisherCredentialRef().catch(() => null))?.botId === botId) {
+    throw new MinionsError('CONFLICT', `Bot ${botId} is the host publisher's bot; a coordinator needs a bot of its own.`, `Create a separate bot (${BOTFATHER_URL}, /newbot) for this project.`);
+  }
   const warnings: string[] = [];
   let verification: Verification | null = null;
   if (opts.verify) {
@@ -728,4 +761,91 @@ export async function clearStaleSecrets(projectId: string, containerRunning: boo
 /** Runs `compose.up()`; if it fails, the freshly materialized plaintext copies are removed before rethrowing. */
 export async function upClearingSecretsOnFailure(compose: { up(): Promise<void> }, projectId: string): Promise<void> {
   try { await compose.up(); } catch (e) { await clearSecrets(projectId).catch(() => undefined); throw e; }
+}
+
+// ---------------------------------------------------------------- publisher bot token (host-wide)
+
+// One token per host (PUBLISHER_CREDENTIAL, store account "publisher"; docs/design/autonomy.md Decision 17). Its
+// non-secret reference lives in <MINIONS_HOME>/publisher/credential.json (0600: backend, locator, bot id), never in a
+// project's credentials.json, so it is never materialized into a secrets directory or mounted. selectStore picks the
+// file store while any project uses the host runtime (sandboxed agents can reach the Keychain service), and
+// moveKeychainTokensToFileStore moves it there when a project switches to the host runtime later.
+
+export const PublisherCredentialRefSchema = z.object({
+  version: z.literal(1),
+  backend: z.enum(BACKENDS),
+  ref: z.string().min(1),
+  botId: z.string().regex(/^\d{6,12}$/),
+  updatedAt: z.string(),
+}).strict();
+export type PublisherCredentialRef = z.infer<typeof PublisherCredentialRefSchema>;
+
+/** The publisher token's reference, or null when none is stored. An unreadable file is an error (INVALID_CONFIG). */
+export async function loadPublisherCredentialRef(): Promise<PublisherCredentialRef | null> {
+  return (await readJsonIfExists(publisherPaths().credentialJson, PublisherCredentialRefSchema)) ?? null;
+}
+
+async function savePublisherCredentialRef(ref: PublisherCredentialRef): Promise<void> {
+  await privateDir(publisherPaths().dir);
+  await writeJson(publisherPaths().credentialJson, ref, { mode: 0o600 });
+}
+
+export interface PublisherProvisionOptions extends StoreOptions {
+  token: string;
+  /** Bot API getMe check; only with the user's explicit consent (default off). */
+  verify?: boolean;
+  fetch?: Fetch;
+  store?: SecretStore;
+}
+export interface PublisherProvisionResult { backend: Backend; ref: string; botId: string; verification: Verification | null; warnings: string[] }
+
+/**
+ * Validates the format, refuses a bot that is any project's coordinator bot (CONFLICT: that token is readable in a
+ * runtime, so an agent could poll the bot and see or answer its updates), optionally verifies with getMe (an invalid
+ * token is not stored), stores the token and records its bot id.
+ */
+export async function provisionPublisherToken(opts: PublisherProvisionOptions): Promise<PublisherProvisionResult> {
+  const runner = opts.runner ?? run;
+  const { token, botId } = checkTelegramTokenFormat(opts.token);
+  const coordinators = await projectsUsingBot(botId);
+  if (coordinators.length) {
+    throw new MinionsError('CONFLICT', `Bot ${botId} is the coordinator bot of project(s) ${coordinators.join(', ')}; the publisher needs a bot of its own.`,
+      `Create a separate bot (${BOTFATHER_URL}, /newbot): a coordinator's token is readable in its runtime, the publisher's never is.`);
+  }
+  const warnings: string[] = [];
+  let verification: Verification | null = null;
+  if (opts.verify) {
+    verification = await verifyTelegramToken(token, { fetch: opts.fetch });
+    if (verification.status === 'invalid') {
+      throw new MinionsError('AUTH_REQUIRED', `Publisher bot token not stored: ${verification.detail}.`, `Copy the token again from ${BOTFATHER_URL} (/mybots -> API Token).`);
+    }
+    if (verification.status === 'unverified') warnings.push(`Token stored without verification: ${verification.detail}.`);
+  }
+  const store = opts.store ?? await selectStore({ ...opts, runner, kind: PUBLISHER_CREDENTIAL });
+  const prev = await loadPublisherCredentialRef().catch(() => null);
+  await store.set(PUBLISHER_ACCOUNT, token);
+  if (prev && prev.backend !== store.backend) await storeFor(prev.backend, runner, PUBLISHER_CREDENTIAL).delete(PUBLISHER_ACCOUNT);
+  const ref: PublisherCredentialRef = { version: 1, backend: store.backend, ref: store.ref(PUBLISHER_ACCOUNT), botId, updatedAt: new Date().toISOString() };
+  await savePublisherCredentialRef(ref);
+  return { backend: ref.backend, ref: ref.ref, botId, verification, warnings };
+}
+
+/** Reads the publisher token (host only: the publisher process). Null when none is stored. */
+export async function readPublisherToken(runner: Runner = run): Promise<{ token: string; botId: string } | null> {
+  const ref = await loadPublisherCredentialRef();
+  if (!ref) return null;
+  const token = await storeFor(ref.backend, runner, PUBLISHER_CREDENTIAL).get(PUBLISHER_ACCOUNT);
+  if (!token) return null;
+  if (checkTelegramTokenFormat(token).botId !== ref.botId) {
+    throw new MinionsError('INVALID_CONFIG', `The stored publisher bot token does not match the recorded bot ${ref.botId}.`, `Store it again with \`${PUBLISHER_CREDENTIAL.command}\`.`);
+  }
+  return { token, botId: ref.botId };
+}
+
+/** Deletes the stored publisher token and its reference. */
+export async function removePublisherToken(runner: Runner = run): Promise<{ removed: boolean; backend: Backend | null }> {
+  const ref = await loadPublisherCredentialRef().catch(() => null);
+  if (ref) await storeFor(ref.backend, runner, PUBLISHER_CREDENTIAL).delete(PUBLISHER_ACCOUNT);
+  await rm(publisherPaths().credentialJson, { force: true });
+  return { removed: !!ref, backend: ref?.backend ?? null };
 }

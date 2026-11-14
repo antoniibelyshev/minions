@@ -35,6 +35,11 @@ describe('control overlay', () => {
     expect(resolveWorkflow(cfg, "research")!.stages.map((s) => s.role)).toEqual(['researcher', 'reviewer']);
   });
 
+  it('publish.* is owner-only (Decision 17): the coordinator cannot switch a PR flow to direct pushes', async () => {
+    await expect(controlSet(deps(), 'publish.mode', 'direct', 'faster')).rejects.toMatchObject({ code: 'POLICY_DENIED', message: expect.stringMatching(/publish\.mode/) });
+    await expect(controlApply(deps(), { publish: { deployKey: '/tmp/k' } }, 'key')).rejects.toMatchObject({ code: 'POLICY_DENIED' });
+  });
+
   it('budgets.* are owner-only: the coordinator\'s set, apply or undo touching them is refused', async () => {
     await expect(controlSet(deps(), 'budgets.dailyUsd', 500, 'more room')).rejects.toMatchObject({ code: 'POLICY_DENIED' });
     await expect(controlApply(deps(), { budgets: { taskUsd: null } }, 'uncap')).rejects.toMatchObject({ code: 'POLICY_DENIED' });
