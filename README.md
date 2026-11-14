@@ -10,7 +10,7 @@ Everything the model controls runs inside one Docker container per project. Your
 
 | Project | What the team built |
 | - | - |
-| [minions-chess-bot](https://github.com/antoniibelyshev/minions-chess-bot) | A chess engine in Rust (bitboards, alpha-beta search, NNUE evaluation), a self-play reinforcement-learning loop that trains the net in PyTorch, a benchmarking and Elo-testing harness, and a React web UI to play against it. 32 tasks and 80 commits from 31 Oct to 10 Nov 2026, about 84M tokens on a Claude subscription. |
+| [minions-chess-bot](https://github.com/antoniibelyshev/minions-chess-bot) | A chess engine in Rust (bitboards, alpha-beta search, NNUE evaluation), a self-play reinforcement-learning loop that trains the net in PyTorch, a benchmarking and Elo-testing harness, and a React web UI to play against it. Its best net plays at about 2600 Elo against a Stockfish `UCI_Elo` ladder (10+0.1, 800 games per bot; approximate). 35 tasks and 97 commits from 31 Oct to 14 Nov 2026, about 89M tokens on a Claude subscription; since 14 Nov the team plans its own next steps from [standing goals](docs/guide.md#task-lifecycle). |
 
 ## How it works
 
